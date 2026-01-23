@@ -1,5 +1,5 @@
 # AgenticSciML for Abaqus
-![Agentic4Abaqus Framework](./image/AgenticSciML4Abaqus_framework.png)
+<img src="./image/AgenticSciML4Abaqus_framework.png" alt="Agentic4Abaqus Framework" width="600">
 
 ## Framework Overview: AgenticSciML for Autonomous FEA Dataset Generation
 
