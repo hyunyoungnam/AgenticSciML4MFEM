@@ -6,13 +6,17 @@ For unmodified sections, uses original raw text; for modified sections,
 formats data according to Abaqus standard spacing and keyword rules.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from pathlib import Path
 
 from parser import AbaqusParser
 from manager import AbaqusManager
-from schema import Nodes, Elements, Material, BoundaryCondition, Step
+from schema import Nodes, Elements, Material, BoundaryCondition, Step, NodeSet, ElementSet
+
+# Standard output file names for the pipeline
+OUTPUT_PARSED_INP = "OutputInp2D_parsed.inp"
+OUTPUT_MORPHED_INP = "OutputInp2D_morphed.inp"
 
 
 class AbaqusWriter:
@@ -59,7 +63,13 @@ class AbaqusWriter:
             keyword = chunk_info['keyword']
             chunk = chunk_info['chunk']
             
-            if keyword in self.manager.modified_sections:
+            if keyword == 'NSET':
+                # Strategy A: always generate NSET from schema (mesh is source of truth)
+                self._write_nset_from_schema(chunk)
+            elif keyword == 'ELSET':
+                # Strategy A: always generate ELSET from schema (mesh is source of truth)
+                self._write_elset_from_schema(chunk)
+            elif keyword in self.manager.modified_sections:
                 # Reconstruct modified section
                 self._write_modified_section(keyword, chunk)
             else:
@@ -103,6 +113,59 @@ class AbaqusWriter:
     def _write_original_section(self, chunk: Dict):
         """Write original section text."""
         self.output_lines.append(chunk['raw_text'])
+    
+    # Strategy A: NSET/ELSET are generated from schema (mesh is source of truth)
+    IDS_PER_LINE = 16  # Abaqus-style line wrap for set data
+    
+    def _write_nset_from_schema(self, chunk: Dict):
+        """Write *Nset section from manager.node_sets (generated output)."""
+        name = chunk['params'].get('nset', '')
+        if not name or name not in self.manager.node_sets:
+            self._write_original_section(chunk)
+            return
+        set_obj = self.manager.node_sets[name]
+        # Keyword line: *Nset, nset=name [, generate] [, other params]
+        param_parts = [f"nset={name}"]
+        if 'generate' in set_obj.data:
+            param_parts.append("generate")
+        for k, v in chunk['params'].items():
+            if k != 'nset' and v:
+                param_parts.append(f"{k}={v}")
+        self.output_lines.append("*Nset, " + ", ".join(param_parts))
+        # Data lines
+        if 'generate' in set_obj.data:
+            start, end, step = set_obj.data['generate']
+            self.output_lines.append(f"   {start},   {end},    {step}")
+        else:
+            ids = set_obj.data.get('node_ids', [])
+            for i in range(0, len(ids), self.IDS_PER_LINE):
+                line = ", ".join(f"{x:>5}" for x in ids[i : i + self.IDS_PER_LINE])
+                self.output_lines.append(" " + line.strip())
+    
+    def _write_elset_from_schema(self, chunk: Dict):
+        """Write *Elset section from manager.element_sets (generated output)."""
+        name = chunk['params'].get('elset', '')
+        if not name or name not in self.manager.element_sets:
+            self._write_original_section(chunk)
+            return
+        set_obj = self.manager.element_sets[name]
+        # Keyword line: *Elset, elset=name [, generate] [, other params]
+        param_parts = [f"elset={name}"]
+        if 'generate' in set_obj.data:
+            param_parts.append("generate")
+        for k, v in chunk['params'].items():
+            if k != 'elset' and v:
+                param_parts.append(f"{k}={v}")
+        self.output_lines.append("*Elset, " + ", ".join(param_parts))
+        # Data lines
+        if 'generate' in set_obj.data:
+            start, end, step = set_obj.data['generate']
+            self.output_lines.append(f"   {start},   {end},    {step}")
+        else:
+            ids = set_obj.data.get('element_ids', [])
+            for i in range(0, len(ids), self.IDS_PER_LINE):
+                line = ", ".join(f"{x:>5}" for x in ids[i : i + self.IDS_PER_LINE])
+                self.output_lines.append(" " + line.strip())
     
     def _write_modified_section(self, keyword: str, chunk: Dict):
         """Write modified section with proper formatting."""
@@ -287,16 +350,54 @@ class AbaqusWriter:
 def write_inp_file(manager: AbaqusManager, output_path: str) -> str:
     """
     Convenience function to write an .inp file from a manager.
-    
+
     Args:
         manager: AbaqusManager instance
         output_path: Path to write the output file
-        
+
     Returns:
         Path to the written file
     """
     writer = AbaqusWriter(manager)
     return writer.write_file(output_path)
+
+
+def write_inp_and_vtu(manager: AbaqusManager, output_inp_path: str) -> Tuple[str, str]:
+    """
+    Write the manager's mesh to both .inp and .vtu (same stem).
+    E.g. output_inp_path="outputs/OutputInp2D_morphed.inp" -> writes that and outputs/OutputInp2D_morphed.vtu.
+
+    Args:
+        manager: AbaqusManager instance
+        output_inp_path: Path for the .inp file (e.g. outputs/OutputInp2D_morphed.inp)
+
+    Returns:
+        (inp_path, vtu_path) as strings
+    """
+    from vtu_export import write_vtu
+    path = Path(output_inp_path)
+    w = AbaqusWriter(manager)
+    inp_path = w.write_file(str(path))
+    vtu_path = path.with_suffix(".vtu")
+    write_vtu(manager, str(vtu_path))
+    return inp_path, str(vtu_path)
+
+
+def write_parsed_output(manager: AbaqusManager, output_dir: Union[str, Path]) -> Tuple[str, str]:
+    """
+    Write parsed (non-morphed) mesh to OutputInp2D_parsed.inp and OutputInp2D_parsed.vtu in output_dir.
+
+    Args:
+        manager: AbaqusManager instance (e.g. after loading BaseInp2D.inp).
+        output_dir: Directory for output files (e.g. outputs/).
+
+    Returns:
+        (inp_path, vtu_path) as strings
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    inp_path = str(output_dir / OUTPUT_PARSED_INP)
+    return write_inp_and_vtu(manager, inp_path)
 
 
 if __name__ == "__main__":

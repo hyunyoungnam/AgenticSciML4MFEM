@@ -34,25 +34,13 @@ def base_inp_file():
 @pytest.fixture
 def output_file_path(base_inp_file):
     """
-    Fixture that generates output file path based on input file name.
-    
-    For BaseInp2D.inp, generates outputs/BaseInp2D_output.inp
-    
-    Args:
-        base_inp_file: Path to the input .inp file
-        
-    Returns:
-        Path: Path to the output file in outputs folder
+    Fixture that generates output file path using standard name OutputInp2D_parsed.inp.
     """
+    from writer import OUTPUT_PARSED_INP
     project_root = Path(__file__).parent.parent
     outputs_dir = project_root / "outputs"
     outputs_dir.mkdir(exist_ok=True)
-    
-    # Get base name without extension
-    base_name = base_inp_file.stem
-    output_file = outputs_dir / f"{base_name}_output.inp"
-    
-    return output_file
+    return outputs_dir / OUTPUT_PARSED_INP
 
 
 class TestParserKeywordIdentification:
@@ -362,8 +350,8 @@ class TestParserConvenienceFunction:
         assert output_file_path.exists(), f"Output file should be created at {output_file_path}"
         
         # Verify output file name follows convention
-        assert output_file_path.name == "BaseInp2D_output.inp", \
-            f"Output file should be named BaseInp2D_output.inp, got {output_file_path.name}"
+        assert output_file_path.name == "OutputInp2D_parsed.inp", \
+            f"Output file should be named OutputInp2D_parsed.inp, got {output_file_path.name}"
         
         # Re-parse output file to verify it's valid
         output_parser = AbaqusParser()

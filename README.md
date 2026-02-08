@@ -1,6 +1,17 @@
 # AgenticSciML for Abaqus
 <img src="./image/AgenticSciML4Abaqus_framework.png" alt="Agentic4Abaqus Framework" width="600">
 
+## System pipeline
+
+The codebase implements a fixed pipeline for reading, morphing, and writing Abaqus `.inp` files:
+
+1. **Parser** (`parser.py`) — Reads the `.inp` and splits it into keyword chunks (e.g. *Node, *Element, *Nset, *Elset). Comment lines starting with `**` are skipped.
+2. **Manager** (`manager.py`) — Builds an in-memory model from the parsed chunks (nodes, elements, node/element sets, materials, BCs, steps) and exposes the API for reading and updating the model.
+3. **Morphing** (`morphing.py`) — **Required.** Applies region-based morphing using a markdown config: assigns node roles (moving / anchor / morphing) from geometric rules, then runs IDW to update nodal coordinates. Uses configs (e.g. `configs/quarter_plate_with_hole_morphing.md`) to define regions and per-region behaviour. Mesh topology (element connectivity, set membership by ID) is preserved; only coordinates change.
+4. **Writer** (`writer.py`) — Writes the modified model back to an `.inp` file. NSET/ELSET are always regenerated from the manager (Strategy A); NODE/ELEMENT and other sections are written from the manager when modified or from the original chunk text otherwise.
+
+End-to-end: **input .inp → Parser → Manager → Morphing → Writer → output .inp.** Morphing is a necessary step in the pipeline, not optional.
+
 ## Framework Overview: AgenticSciML for Autonomous FEA Dataset Generation
 
 ### Phase 1: Analysis & Evaluation Contract

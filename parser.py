@@ -102,6 +102,11 @@ class AbaqusParser:
             line = self.lines[i]
             stripped = line.strip()
             
+            # Skip comment lines (Abaqus comments start with **)
+            if stripped.startswith('**'):
+                i += 1
+                continue
+            
             # Check if this line is a keyword
             keyword_match = self.KEYWORD_WITH_PARAMS.match(line)
             
@@ -183,24 +188,31 @@ class AbaqusParser:
     
     def _parse_params(self, param_string: str) -> Dict[str, str]:
         """
-        Parse parameter string (e.g., "name=Material-1, type=ELASTIC").
+        Parse parameter string (e.g., "name=Material-1, type=ELASTIC" or "nset=Set-1, generate").
+        Captures both key=value pairs and standalone flags (e.g. generate, internal).
         
         Args:
             param_string: String containing parameters
             
         Returns:
-            Dictionary of parameter name-value pairs
+            Dictionary of parameter name to value; flags get value '' so "flag" in params works.
         """
         params = {}
         if not param_string:
             return params
         
-        # Find all parameter matches
-        matches = self.PARAM_PATTERN.findall(param_string)
-        for name, value in matches:
-            # Clean up value (remove quotes if present)
-            clean_value = value.strip('"\'')
-            params[name.lower()] = clean_value
+        for part in param_string.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if '=' in part:
+                match = self.PARAM_PATTERN.match(part)
+                if match:
+                    name, value = match.groups()
+                    params[name.lower()] = value.strip('"\'')
+            else:
+                # Standalone flag (e.g. generate, internal)
+                params[part.lower()] = ''
         
         return params
     
