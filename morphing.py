@@ -105,6 +105,16 @@ def load_morphing_config(md_path: Union[str, Path]) -> Dict[str, Any]:
     reassign = config.get("reassignment", {})
     config["_min_anchor_distance"] = float(reassign.get("min_anchor_distance_from_hole", 0.5))
 
+    # Parse symmetry constraints
+    symmetry = config.get("symmetry", {})
+    config["_symmetry"] = []
+    for key, val in symmetry.items():
+        if isinstance(val, dict) and "axis" in val:
+            config["_symmetry"].append({
+                "axis": int(val["axis"]),
+                "tolerance": float(val.get("tolerance", 1e-6)),
+            })
+
     return config
 
 
@@ -228,6 +238,39 @@ def compute_moving_displacements(
     return disp
 
 
+def apply_symmetry_constraints(
+    coords: np.ndarray,
+    disp: np.ndarray,
+    symmetry_constraints: List[Dict[str, Any]],
+) -> np.ndarray:
+    """
+    Apply symmetry constraints to displacements.
+
+    For nodes on a symmetry axis (e.g., x=0), zero out the displacement
+    component perpendicular to that axis (e.g., dx=0 for x=0 symmetry).
+
+    Args:
+        coords: (N, 2) or (N, 3) node coordinates.
+        disp: (N, 2) or (N, 3) displacement vectors.
+        symmetry_constraints: List of {"axis": int, "tolerance": float}.
+            axis=0 means x=0 symmetry (nodes with |x| < tol have dx=0)
+            axis=1 means y=0 symmetry (nodes with |y| < tol have dy=0)
+
+    Returns:
+        Modified displacement array with symmetry enforced.
+    """
+    disp = disp.copy()
+    for constraint in symmetry_constraints:
+        axis = constraint["axis"]
+        tol = constraint["tolerance"]
+        if axis < coords.shape[1]:
+            # Find nodes on this symmetry axis
+            on_axis = np.abs(coords[:, axis]) < tol
+            # Zero out displacement in the axis direction for these nodes
+            disp[on_axis, axis] = 0.0
+    return disp
+
+
 def idw_displacements(
     coords: np.ndarray,
     moving_mask: np.ndarray,
@@ -346,6 +389,11 @@ def run_morphing(
         p_per_node,
         p_default=2.0,
     )
+
+    # Apply symmetry constraints (e.g., for quarter-plate models)
+    symmetry_constraints = config.get("_symmetry", [])
+    if symmetry_constraints:
+        disp = apply_symmetry_constraints(coords, disp, symmetry_constraints)
 
     new_coords = coords + disp
     manager.update_nodes(new_coords)

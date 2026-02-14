@@ -47,6 +47,7 @@ ENV/
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
@@ -54,8 +55,10 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+nul
 
 # Project specific
 outputs/
+Paper/
 *.inp.bak
 *.log

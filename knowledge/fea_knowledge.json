@@ -1,0 +1,279 @@
+{
+  "entries": [
+    {
+      "id": "mesh_001",
+      "title": "Jacobian Ratio Quality",
+      "category": "mesh_quality",
+      "content": "The Jacobian ratio measures element distortion. A ratio close to 1.0 indicates a well-shaped element. Values below 0.1 indicate severe distortion and may cause solver failures. For quadrilateral elements, maintain Jacobian > 0.3 for reliable results.",
+      "keywords": ["jacobian", "distortion", "element quality", "mesh quality"],
+      "applicable_to": ["2D_hole", "plate", "all"],
+      "severity": "critical",
+      "examples": ["Negative Jacobian in hole boundary after large delta_R", "Collapsed elements near stress concentrations"],
+      "references": ["Abaqus Analysis User's Guide Section 2.1.5"]
+    },
+    {
+      "id": "mesh_002",
+      "title": "Element Aspect Ratio",
+      "category": "mesh_quality",
+      "content": "Aspect ratio is the ratio of longest to shortest element edge. Keep aspect ratio below 10:1 for accuracy. High aspect ratios (>50:1) can cause numerical issues and poor stress predictions, especially near boundaries.",
+      "keywords": ["aspect ratio", "element shape", "mesh quality", "edge length"],
+      "applicable_to": ["all"],
+      "severity": "warning",
+      "examples": ["Stretched elements in transition zones", "High AR near morphing boundaries"],
+      "references": []
+    },
+    {
+      "id": "mesh_003",
+      "title": "Mesh Transition Zones",
+      "category": "mesh_quality",
+      "content": "When mesh density changes, use gradual transitions. Element size should not change by more than 2:1 between adjacent elements. Abrupt transitions cause stress concentrations and accuracy loss.",
+      "keywords": ["transition", "mesh density", "refinement", "gradual"],
+      "applicable_to": ["all"],
+      "severity": "warning",
+      "examples": ["Transition from fine hole boundary to coarse far field"],
+      "references": []
+    },
+    {
+      "id": "mesh_004",
+      "title": "Hole Boundary Mesh Density",
+      "category": "mesh_quality",
+      "content": "Stress concentrations at holes require fine meshes. Use at least 8 elements around a circular hole for adequate stress resolution. For accuracy in stress concentration factors, use 16+ elements.",
+      "keywords": ["hole", "stress concentration", "refinement", "circular"],
+      "applicable_to": ["2D_hole", "plate_with_hole"],
+      "severity": "info",
+      "examples": ["Underestimated stress due to coarse hole mesh"],
+      "references": []
+    },
+    {
+      "id": "mesh_005",
+      "title": "Morphing Displacement Limits",
+      "category": "mesh_quality",
+      "content": "Mesh morphing should not displace nodes more than 50% of the smallest adjacent element edge length. Larger displacements risk element inversion. For hole radius changes, limit delta_R to maintain positive Jacobian.",
+      "keywords": ["morphing", "displacement", "delta_R", "IDW", "inversion"],
+      "applicable_to": ["2D_hole", "morphing"],
+      "severity": "critical",
+      "examples": ["Element collapse at delta_R > 1.5 for initial R=2.5"],
+      "references": []
+    },
+    {
+      "id": "mat_001",
+      "title": "Linear Elastic Properties",
+      "category": "material",
+      "content": "For linear elastic materials, Young's modulus E must be positive and Poisson's ratio nu must satisfy 0 <= nu < 0.5. Steel: E~200 GPa, nu~0.3. Aluminum: E~70 GPa, nu~0.33.",
+      "keywords": ["elastic", "modulus", "poisson", "steel", "aluminum"],
+      "applicable_to": ["all"],
+      "severity": "critical",
+      "examples": ["Invalid nu=0.5 causes incompressibility issues"],
+      "references": []
+    },
+    {
+      "id": "mat_002",
+      "title": "Material Unit Consistency",
+      "category": "material",
+      "content": "Ensure consistent units: SI (Pa, m, kg) or mm-based (MPa, mm, tonne). Mixed units cause orders-of-magnitude errors. Check E, density, and geometry units match.",
+      "keywords": ["units", "consistency", "SI", "MPa", "Pa"],
+      "applicable_to": ["all"],
+      "severity": "critical",
+      "examples": ["E in Pa with geometry in mm gives wrong stresses"],
+      "references": []
+    },
+    {
+      "id": "conv_001",
+      "title": "Newton-Raphson Convergence",
+      "category": "convergence",
+      "content": "Abaqus uses Newton-Raphson iteration. Convergence requires both residual force and displacement corrections to be small. Non-convergence often indicates excessive loading or mesh issues.",
+      "keywords": ["newton", "convergence", "iteration", "residual"],
+      "applicable_to": ["all"],
+      "severity": "info",
+      "examples": ["Too many iterations in nonlinear analysis"],
+      "references": []
+    },
+    {
+      "id": "conv_002",
+      "title": "Increment Cutback Handling",
+      "category": "convergence",
+      "content": "When solver cuts back increment size, it indicates difficulty converging. Multiple cutbacks suggest model problems. Check boundary conditions, contact, and mesh quality when cutbacks occur.",
+      "keywords": ["cutback", "increment", "convergence", "step"],
+      "applicable_to": ["all"],
+      "severity": "warning",
+      "examples": ["5 consecutive cutbacks before failure"],
+      "references": []
+    },
+    {
+      "id": "conv_003",
+      "title": "Step Size Settings",
+      "category": "convergence",
+      "content": "Use initial increment 0.1-0.2 for linear problems. For nonlinear: start with 0.01. Min increment ~1e-6, max increment 0.2. Smaller initial increments help establish equilibrium.",
+      "keywords": ["step", "increment", "initial", "nonlinear"],
+      "applicable_to": ["all"],
+      "severity": "info",
+      "examples": ["Initial=1.0 causes immediate divergence in nonlinear"],
+      "references": []
+    },
+    {
+      "id": "bc_001",
+      "title": "Boundary Condition Consistency",
+      "category": "boundary_conditions",
+      "content": "All DOFs must be properly constrained to prevent rigid body motion. For 2D plane stress: fix at least 3 DOFs (2 translations + 1 rotation equivalent). Over-constraint causes stress locking.",
+      "keywords": ["boundary", "constraint", "rigid body", "DOF"],
+      "applicable_to": ["all"],
+      "severity": "critical",
+      "examples": ["Singular stiffness from insufficient constraints"],
+      "references": []
+    },
+    {
+      "id": "bc_002",
+      "title": "Symmetry Boundary Conditions",
+      "category": "boundary_conditions",
+      "content": "For symmetric models, apply symmetry BC: fix normal displacement, free tangential. Reduces model size by 2x (half-symmetry) or 4x (quarter). Must verify symmetry in geometry and loading.",
+      "keywords": ["symmetry", "half", "quarter", "boundary"],
+      "applicable_to": ["2D_hole", "plate"],
+      "severity": "info",
+      "examples": ["Quarter model of plate with central hole"],
+      "references": []
+    },
+    {
+      "id": "bc_003",
+      "title": "Load Application Points",
+      "category": "boundary_conditions",
+      "content": "Avoid point loads - they cause singularities. Distribute loads over areas or edges. Use coupling constraints to distribute loads realistically.",
+      "keywords": ["load", "point", "distributed", "singularity"],
+      "applicable_to": ["all"],
+      "severity": "warning",
+      "examples": ["Infinite stress at point load location"],
+      "references": []
+    },
+    {
+      "id": "elem_001",
+      "title": "CPS4 vs CPS8 Elements",
+      "category": "element_types",
+      "content": "CPS4: 4-node bilinear, efficient but may lock in bending. CPS8: 8-node quadratic, more accurate for stress gradients but computationally expensive. Use CPS8 near holes and stress concentrations.",
+      "keywords": ["CPS4", "CPS8", "quadrilateral", "plane stress"],
+      "applicable_to": ["2D_hole", "plate"],
+      "severity": "info",
+      "examples": ["CPS4 underestimates stress concentration by 15%"],
+      "references": []
+    },
+    {
+      "id": "elem_002",
+      "title": "Reduced Integration Warning",
+      "category": "element_types",
+      "content": "Reduced integration (CPS4R) is faster but can exhibit hourglassing (zero-energy modes). Use hourglass control or full integration for better accuracy.",
+      "keywords": ["reduced", "integration", "hourglass", "CPS4R"],
+      "applicable_to": ["all"],
+      "severity": "warning",
+      "examples": ["Hourglass modes in uniform stress field"],
+      "references": []
+    },
+    {
+      "id": "bp_001",
+      "title": "Mesh Independence Study",
+      "category": "best_practices",
+      "content": "Always perform mesh convergence study. Refine mesh until results change by <5% with further refinement. Focus refinement on high gradient regions.",
+      "keywords": ["convergence", "refinement", "independence", "study"],
+      "applicable_to": ["all"],
+      "severity": "info",
+      "examples": ["Stress changes 20% from coarse to fine mesh"],
+      "references": []
+    },
+    {
+      "id": "bp_002",
+      "title": "Result Verification",
+      "category": "best_practices",
+      "content": "Verify results against analytical solutions when available. For plate with hole: SCF ~3 for infinite plate. Check equilibrium: sum of reaction forces = applied loads.",
+      "keywords": ["verification", "validation", "analytical", "equilibrium"],
+      "applicable_to": ["all"],
+      "severity": "info",
+      "examples": ["SCF=2.8 indicates good mesh quality"],
+      "references": []
+    },
+    {
+      "id": "bp_003",
+      "title": "Incremental Morphing Strategy",
+      "category": "best_practices",
+      "content": "For large geometry changes, use incremental morphing. Start with small delta_R (~10% of radius) and gradually increase. Validate mesh quality at each step.",
+      "keywords": ["morphing", "incremental", "gradual", "strategy"],
+      "applicable_to": ["2D_hole", "morphing"],
+      "severity": "info",
+      "examples": ["delta_R=0.5 succeeds where delta_R=1.5 fails"],
+      "references": []
+    },
+    {
+      "id": "err_001",
+      "title": "Negative Jacobian Error",
+      "category": "common_errors",
+      "content": "Error: ELEMENT X HAS NEGATIVE JACOBIAN. Cause: element is inverted (nodes crossed over). Fix: reduce morphing displacement, refine mesh, or adjust anchor positions.",
+      "keywords": ["negative", "jacobian", "inverted", "error"],
+      "applicable_to": ["all"],
+      "severity": "critical",
+      "examples": ["Hole expansion inverted inner elements"],
+      "references": []
+    },
+    {
+      "id": "err_002",
+      "title": "Too Many Attempts Error",
+      "category": "common_errors",
+      "content": "Error: TOO MANY ATTEMPTS MADE FOR THIS INCREMENT. Cause: solver cannot find equilibrium. Fix: reduce step size, check BCs, improve mesh, or add stabilization.",
+      "keywords": ["attempts", "increment", "convergence", "error"],
+      "applicable_to": ["all"],
+      "severity": "critical",
+      "examples": ["Contact problem with insufficient mesh density"],
+      "references": []
+    },
+    {
+      "id": "err_003",
+      "title": "Excessive Distortion Warning",
+      "category": "common_errors",
+      "content": "Warning: EXCESSIVE DISTORTION AT N INTEGRATION POINTS. Elements are severely deformed. May still complete but results unreliable. Check deformed shape for element collapse.",
+      "keywords": ["distortion", "excessive", "integration", "warning"],
+      "applicable_to": ["all"],
+      "severity": "warning",
+      "examples": ["Large deformation near hole boundary"],
+      "references": []
+    },
+    {
+      "id": "err_004",
+      "title": "Numerical Singularity",
+      "category": "common_errors",
+      "content": "Error: NUMERICAL SINGULARITY. Stiffness matrix is singular. Causes: insufficient constraints, disconnected regions, or zero stiffness elements. Check BCs and mesh connectivity.",
+      "keywords": ["singularity", "singular", "stiffness", "constraint"],
+      "applicable_to": ["all"],
+      "severity": "critical",
+      "examples": ["Free-floating region without constraints"],
+      "references": []
+    },
+    {
+      "id": "morph_001",
+      "title": "IDW Morphing Parameters",
+      "category": "mesh_quality",
+      "content": "IDW (Inverse Distance Weighting) morphing: p parameter controls influence decay. p=2 (default) works for most cases. Higher p localizes deformation. For transition zones, p=2.5 provides smoother transitions.",
+      "keywords": ["IDW", "morphing", "parameter", "weight", "transition"],
+      "applicable_to": ["2D_hole", "morphing"],
+      "severity": "info",
+      "examples": ["p=3 prevents far-field distortion"],
+      "references": []
+    },
+    {
+      "id": "morph_002",
+      "title": "Anchor Node Selection",
+      "category": "mesh_quality",
+      "content": "Anchor nodes should be far from moving boundaries. Minimum distance: 2-3x the morphing displacement. Anchors too close to moving region cause mesh collapse.",
+      "keywords": ["anchor", "moving", "morphing", "distance"],
+      "applicable_to": ["2D_hole", "morphing"],
+      "severity": "warning",
+      "examples": ["Anchor reassignment for delta_R > 1.0"],
+      "references": []
+    },
+    {
+      "id": "morph_003",
+      "title": "Safe delta_R Range",
+      "category": "mesh_quality",
+      "content": "For hole expansion with initial radius R0, typical safe range is delta_R in [-0.5*R0, 0.8*R0]. Larger expansions require anchor reassignment or remeshing. Contractions limited by element collapse.",
+      "keywords": ["delta_R", "range", "safe", "limit", "expansion"],
+      "applicable_to": ["2D_hole", "morphing"],
+      "severity": "critical",
+      "examples": ["R0=2.5: safe delta_R is approximately [-1.0, 2.0]"],
+      "references": []
+    }
+  ]
+}

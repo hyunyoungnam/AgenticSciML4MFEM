@@ -1,0 +1,100 @@
+# AgenticSciML Agent Configuration
+# Configuration for all agents in the multi-agent system
+
+agents:
+  # Evaluator Agent - Creates Guideline.md + Evaluate.py
+  evaluator:
+    model: "claude-3-opus-20240229"
+    temperature: 0.2
+    max_tokens: 8192
+    role: "evaluator"
+    description: "Analyzes base models and generates evaluation criteria"
+
+  # Proposer Agent - Suggests mutations
+  proposer:
+    model: "gpt-4-turbo"
+    temperature: 0.7
+    max_tokens: 4096
+    role: "proposer"
+    description: "Proposes intelligent mutations guided by knowledge"
+
+  # Critic Agent - Pre-flight validation
+  critic:
+    model: "claude-3-opus-20240229"
+    temperature: 0.2
+    max_tokens: 4096
+    role: "critic"
+    description: "Validates proposals through structured debate"
+
+  # Engineer Agent - Implementation
+  engineer:
+    model: "gpt-4-turbo"
+    temperature: 0.1
+    max_tokens: 4096
+    role: "engineer"
+    description: "Implements approved mutations using manager/morphing APIs"
+
+  # Debugger Agent - Error fixing
+  debugger:
+    model: "claude-3-opus-20240229"
+    temperature: 0.3
+    max_tokens: 4096
+    role: "debugger"
+    description: "Diagnoses errors and provides actionable fixes"
+
+  # Result Analyst Agent - Post-simulation analysis
+  result_analyst:
+    model: "gpt-4-turbo"
+    temperature: 0.4
+    max_tokens: 4096
+    role: "result_analyst"
+    description: "Analyzes simulation results and extracts metrics"
+
+  # Retriever Agent - Knowledge base search
+  retriever:
+    model: "gpt-4-turbo"
+    temperature: 0.0
+    max_tokens: 2048
+    role: "retriever"
+    description: "Searches knowledge base for relevant FEA techniques"
+
+  # Selector Agent - Ensemble voting
+  selector:
+    model: "gpt-4-turbo"
+    temperature: 0.1
+    max_tokens: 2048
+    role: "selector"
+    description: "Performs ensemble voting for parent selection"
+
+# Debate Configuration
+debate:
+  num_rounds: 4
+  consensus_threshold: 0.7
+  early_termination: true
+  max_objections_per_round: 5
+
+# LLM Provider Settings
+providers:
+  openai:
+    api_key_env: "OPENAI_API_KEY"
+    organization_env: "OPENAI_ORG_ID"
+    default_model: "gpt-4-turbo"
+    timeout: 120
+
+  anthropic:
+    api_key_env: "ANTHROPIC_API_KEY"
+    default_model: "claude-3-opus-20240229"
+    timeout: 120
+
+# Retry Settings
+retry:
+  max_retries: 3
+  initial_delay: 1.0
+  max_delay: 30.0
+  exponential_base: 2.0
+
+# Logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/agents.log"

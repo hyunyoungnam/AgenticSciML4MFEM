@@ -24,6 +24,17 @@ geometry:
   # Tolerance for classifying hole boundary: nodes with d in [R0 - tol, R0 + tol].
   tolerance: 0.15
 
+# Symmetry constraints for quarter-plate model
+symmetry:
+  # Nodes on x=0 axis can only move in Y direction
+  x_symmetry:
+    axis: 0
+    tolerance: 1.0e-6
+  # Nodes on y=0 axis can only move in X direction
+  y_symmetry:
+    axis: 1
+    tolerance: 1.0e-6
+
 reassignment:
   # Anchors closer than this to the hole boundary (distance R0) are reassigned to morphing.
   min_anchor_distance_from_hole: 0.5

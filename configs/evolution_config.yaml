@@ -1,0 +1,78 @@
+# AgenticSciML Evolution Configuration
+# Configuration for evolutionary tree search
+
+evolution:
+  # Generation settings
+  max_generations: 20
+  population_size: 10
+  num_parents: 3
+
+  # Termination criteria
+  termination:
+    max_consecutive_failures: 5
+    min_improvement_threshold: 0.01
+    stagnation_generations: 5
+
+  # Mutation settings
+  mutation:
+    delta_R_range: [-1.0, 2.0]
+    delta_R_step: 0.1
+    material_variation: 0.1  # 10% variation in material properties
+
+  # Selection strategy
+  selection:
+    method: "ensemble"  # tournament, roulette, elitist, diversity, ensemble
+    tournament_size: 3
+    diversity_weight: 0.3
+    elitism_count: 1  # Always keep best solution
+
+  # Diversity maintenance
+  diversity:
+    min_genome_distance: 0.1
+    max_similar_solutions: 3
+    promote_exploration_after: 5  # generations
+
+# Evaluation Pipeline
+evaluation:
+  # Pre-flight settings
+  preflight:
+    min_jacobian: 0.1
+    max_aspect_ratio: 10.0
+    min_node_distance: 1.0e-10
+
+  # Solver settings
+  solver:
+    run_solver: false
+    abaqus_command: "abaqus"
+    timeout: 3600  # seconds
+
+  # Scoring weights
+  scoring:
+    preflight_weight: 0.3
+    mesh_quality_weight: 0.3
+    convergence_weight: 0.4
+
+# Knowledge Base
+knowledge:
+  path: "knowledge/fea_knowledge.json"
+  max_entries_per_query: 10
+  relevance_threshold: 0.1
+
+# Failure Memory
+failure_memory:
+  max_entries: 1000
+  safe_margin: 0.2
+
+# Output Settings
+output:
+  dir: "outputs"
+  save_all_solutions: true
+  save_failed_solutions: false
+  save_tree_frequency: 5  # Save tree every N generations
+
+# Paths
+paths:
+  base_inp_dir: "inputs"
+  morphing_configs_dir: "configs"
+  output_dir: "outputs"
+  logs_dir: "logs"
