@@ -57,6 +57,14 @@ Required packages:
 - `pyyaml` - Configuration parsing
 - `aiohttp` - Async HTTP
 
+Optional packages:
+- `pyvista` - Debug visualization of morphing roles in ParaView
+
+```bash
+# Install optional visualization support
+pip install pyvista
+```
+
 ---
 
 ## How It Works
@@ -94,7 +102,7 @@ Required packages:
 
 2. **Multi-Agent Debate**: Before implementing any change, a Proposer agent suggests mutations and a Critic agent validates them through 4 rounds of debate.
 
-3. **Mesh Morphing**: The system changes hole sizes, geometries, etc. using IDW (Inverse Distance Weighting) while preserving mesh topology and quality.
+3. **Mesh Morphing**: The system changes hole sizes, geometries, etc. using IDW (Inverse Distance Weighting) while preserving mesh topology and quality. Node roles (moving/anchor/morphing) are classified dynamically based on `delta_R`.
 
 4. **Knowledge-Guided**: Agents use a curated FEA knowledge base to make intelligent decisions and avoid known failure patterns.
 
@@ -397,7 +405,8 @@ AgenticSciML4Abaqus/
 └── outputs/                    # Generated outputs
     ├── gen_0/                  # Generation 0 solutions
     │   ├── <solution-id>.inp
-    │   └── <solution-id>.vtu
+    │   ├── <solution-id>.vtu
+    │   └── <solution-id>_debug.vtu  # Debug VTU (with --debug)
     ├── solution_tree.json
     └── run_summary.json
 ```
@@ -482,9 +491,45 @@ Builds in-memory model with API for reading/updating:
 
 ### 3. Morphing (`morphing.py`)
 Applies IDW-based mesh morphing:
-- **Moving nodes**: Hole boundary, displaced by delta_R
-- **Anchor nodes**: Far field, stay fixed
-- **Morphing nodes**: Transition zone, interpolated via IDW
+- **Moving nodes** (role=0): Hole boundary, displaced by delta_R
+- **Anchor nodes** (role=1): Far field, stay fixed
+- **Morphing nodes** (role=2): Transition zone, interpolated via IDW
+
+Node classification is computed dynamically based on `delta_R` and stored in a `MorphingContext` object for internal use (never written to INP).
+
+#### Standalone Morphing Usage
+
+```bash
+# Basic morphing
+python morphing.py inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5
+
+# With debug VTU for ParaView visualization
+python morphing.py inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5 --debug
+
+# With interactive PyVista preview
+python morphing.py inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5 --preview
+```
+
+#### Debug VTU Visualization (ParaView)
+
+When using `--debug`, a `*_debug.vtu` file is generated with PointData fields:
+
+| Field | Description |
+|-------|-------------|
+| `MorphingRole` | 0=moving, 1=anchor, 2=morphing |
+| `NodeID` | Original node ID from INP |
+
+To visualize in ParaView:
+1. Open `outputs/OutputInp2D_morphed_debug.vtu`
+2. Set **Coloring** to `MorphingRole`
+3. Use **Selection Display Inspector** to hover and inspect node values
+
+#### PyVista Dependency
+
+For debug visualization, install PyVista:
+```bash
+pip install pyvista
+```
 
 ### 4. Writer (`writer.py`)
 Writes modified model back to `.inp` format with:
