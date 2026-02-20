@@ -1,16 +1,22 @@
 """
-Knowledge management for FEA domain expertise.
+Knowledge management for AgenticSciML.
 
-Provides curated FEA knowledge entries and dynamic failure memory
-to guide agent decision-making.
+Note: Static FEA knowledge base (KnowledgeBase, fea_knowledge.json) is deprecated.
+Modern LLMs like Claude and GPT-4 have comprehensive FEA domain knowledge built-in.
+
+FailureMemory is still used for runtime-specific learning from failed attempts.
 """
 
-from knowledge.base import KnowledgeEntry, KnowledgeBase
 from knowledge.failure_memory import FailureMemory, FailureEntry
 
+# Deprecated - kept for backward compatibility
+from knowledge.base import KnowledgeEntry, KnowledgeBase
+
 __all__ = [
-    "KnowledgeEntry",
-    "KnowledgeBase",
+    # Active components
     "FailureMemory",
     "FailureEntry",
+    # Deprecated - LLMs have FEA knowledge built-in
+    "KnowledgeEntry",
+    "KnowledgeBase",
 ]

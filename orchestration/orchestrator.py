@@ -19,6 +19,8 @@ from agents.roles.critic import CriticAgent
 from agents.roles.engineer import EngineerAgent
 from agents.roles.debugger import DebuggerAgent
 from agents.roles.result_analyst import ResultAnalystAgent
+from agents.roles.claude_code_engineer import ClaudeCodeEngineer, ClaudeCodeEngineerConfig
+from agents.roles.claude_code_debugger import ClaudeCodeDebugger, ClaudeCodeDebuggerConfig
 from orchestration.phases import (
     Phase1AnalysisController,
     Phase2KnowledgeController,
@@ -33,7 +35,6 @@ from evolution.selection import ParentSelector, EnsembleSelector
 from evaluation.pipeline import EvaluationPipeline
 from evaluation.preflight import PreflightChecker
 from evaluation.metrics import MetricsCalculator
-from knowledge.base import KnowledgeBase
 from knowledge.failure_memory import FailureMemory
 
 
@@ -58,9 +59,14 @@ class OrchestrationConfig:
     openai_model: str = "gpt-4-turbo"
     anthropic_model: str = "claude-3-opus-20240229"
 
+    # Claude Code settings
+    use_claude_code: bool = True  # Use Claude Code for Engineer and Debugger
+    claude_code_model: str = "sonnet"  # sonnet, opus, or haiku
+    claude_code_max_turns: int = 25
+    claude_code_timeout: int = 300
+
     # Paths
     output_dir: str = "outputs"
-    knowledge_path: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -74,8 +80,11 @@ class OrchestrationConfig:
             "solver_timeout": self.solver_timeout,
             "openai_model": self.openai_model,
             "anthropic_model": self.anthropic_model,
+            "use_claude_code": self.use_claude_code,
+            "claude_code_model": self.claude_code_model,
+            "claude_code_max_turns": self.claude_code_max_turns,
+            "claude_code_timeout": self.claude_code_timeout,
             "output_dir": self.output_dir,
-            "knowledge_path": self.knowledge_path,
         }
 
 
@@ -139,18 +148,11 @@ class AgenticOrchestrator:
         self.solution_tree = SolutionTree(max_generations=self.config.max_generations)
         self.parent_selector = EnsembleSelector()
 
-        # Initialize knowledge components
-        self.knowledge_base = KnowledgeBase()
+        # Initialize failure memory (runtime-specific learning)
+        # Note: Static FEA knowledge base removed - LLMs have this built-in
         self.failure_memory = FailureMemory()
 
-        # Load knowledge if path provided
-        if self.config.knowledge_path:
-            try:
-                self.knowledge_base.load_from_json(self.config.knowledge_path)
-            except FileNotFoundError:
-                pass
-
-        # Initialize phase controllers (after knowledge components)
+        # Initialize phase controllers
         self._init_phases()
 
         # Session state
@@ -168,25 +170,44 @@ class AgenticOrchestrator:
         self.critic = CriticAgent(model=self.config.anthropic_model)
         self.critic.set_llm_provider(self.anthropic_provider)
 
-        self.debugger = DebuggerAgent(model=self.config.anthropic_model)
-        self.debugger.set_llm_provider(self.anthropic_provider)
-
         # Agents using OpenAI (GPT-4)
         self.proposer = ProposerAgent(model=self.config.openai_model)
         self.proposer.set_llm_provider(self.openai_provider)
 
-        self.engineer = EngineerAgent(model=self.config.openai_model)
-        self.engineer.set_llm_provider(self.openai_provider)
-
         self.result_analyst = ResultAnalystAgent(model=self.config.openai_model)
         self.result_analyst.set_llm_provider(self.openai_provider)
+
+        # Engineer and Debugger: Use Claude Code or hand-coded agents
+        if self.config.use_claude_code:
+            # Use Claude Code-powered agents
+            engineer_config = ClaudeCodeEngineerConfig(
+                model=self.config.claude_code_model,
+                max_turns=self.config.claude_code_max_turns,
+                timeout=self.config.claude_code_timeout,
+                working_dir=str(Path.cwd()),
+            )
+            self.engineer = ClaudeCodeEngineer(config=engineer_config)
+
+            debugger_config = ClaudeCodeDebuggerConfig(
+                model=self.config.claude_code_model,
+                max_turns=self.config.claude_code_max_turns,
+                timeout=self.config.claude_code_timeout,
+                working_dir=str(Path.cwd()),
+            )
+            self.debugger = ClaudeCodeDebugger(config=debugger_config)
+        else:
+            # Use traditional hand-coded agents
+            self.debugger = DebuggerAgent(model=self.config.anthropic_model)
+            self.debugger.set_llm_provider(self.anthropic_provider)
+
+            self.engineer = EngineerAgent(model=self.config.openai_model)
+            self.engineer.set_llm_provider(self.openai_provider)
 
     def _init_phases(self) -> None:
         """Initialize phase controllers."""
         self.phase1 = Phase1AnalysisController(self.evaluator)
 
         self.phase2 = Phase2KnowledgeController(
-            knowledge_base=self.knowledge_base,
             failure_memory=self.failure_memory,
         )
 

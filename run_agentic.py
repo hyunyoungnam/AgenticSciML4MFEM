@@ -133,13 +133,6 @@ Examples:
     )
 
     parser.add_argument(
-        "--knowledge",
-        type=str,
-        default="knowledge/fea_knowledge.json",
-        help="Path to knowledge base JSON",
-    )
-
-    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -213,8 +206,8 @@ async def main() -> int:
 
     # Create configuration from YAML + CLI overrides
     solver_cfg = evaluation_cfg.get("solver", {})
-    knowledge_cfg = yaml_config.get("knowledge", {})
     debate_cfg = yaml_config.get("debate", {})
+    claude_code_cfg = yaml_config.get("claude_code", {})
 
     config = OrchestrationConfig(
         max_generations=generations,
@@ -227,8 +220,12 @@ async def main() -> int:
         solver_timeout=solver_cfg.get("timeout", 3600),
         openai_model=providers_cfg.get("openai", {}).get("default_model", "gpt-4-turbo"),
         anthropic_model=providers_cfg.get("anthropic", {}).get("default_model", "claude-3-opus-20240229"),
+        # Claude Code settings (for Engineer and Debugger agents)
+        use_claude_code=claude_code_cfg.get("enabled", True),
+        claude_code_model=claude_code_cfg.get("model", "sonnet"),
+        claude_code_max_turns=claude_code_cfg.get("max_turns", 25),
+        claude_code_timeout=claude_code_cfg.get("timeout", 300),
         output_dir=output_dir,
-        knowledge_path=knowledge_cfg.get("path") if Path(knowledge_cfg.get("path", "")).exists() else None,
     )
 
     logger.info(f"Config: debate_rounds={config.num_debate_rounds}, consensus={config.consensus_threshold}")

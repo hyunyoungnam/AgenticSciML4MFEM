@@ -101,14 +101,10 @@ class CriticAgent(BaseAgent[Critique]):
             raise ValueError(f"Unknown task: {task}")
 
     def _build_critique_prompt(self, context: AgentContext, kwargs: Dict) -> str:
-        # Format knowledge context
-        knowledge_str = ""
-        for entry in context.knowledge_context[:5]:
-            knowledge_str += f"- {entry.get('title', '')}: {entry.get('content', '')[:200]}...\n"
-        if not knowledge_str:
-            knowledge_str = "No specific knowledge retrieved."
+        # Note: Static knowledge base removed - LLMs have FEA domain knowledge built-in
+        knowledge_str = "Use your built-in FEA domain knowledge for validation."
 
-        # Format failure history
+        # Format failure history (runtime-specific, still useful)
         failure_str = ""
         for failure in context.failure_history[-5:]:
             failure_str += f"- delta_R={failure.get('delta_R', 'N/A')}: {failure.get('error', 'Unknown')}\n"

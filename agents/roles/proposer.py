@@ -94,16 +94,10 @@ class ProposerAgent(BaseAgent[MutationProposal]):
         # Get parent mutations summary
         parent_mutations = kwargs.get("parent_mutations", "Base model (no mutations)")
 
-        # Format knowledge context
-        knowledge = context.knowledge_context
-        knowledge_str = ""
-        if knowledge:
-            for entry in knowledge[:5]:  # Limit to 5 entries
-                knowledge_str += f"- {entry.get('title', '')}: {entry.get('content', '')[:200]}...\n"
-        if not knowledge_str:
-            knowledge_str = "No specific knowledge retrieved."
+        # Note: Static knowledge base removed - LLMs have FEA domain knowledge built-in
+        knowledge_str = "Use your built-in FEA domain knowledge for best practices."
 
-        # Format failure history
+        # Format failure history (runtime-specific, still useful)
         failure_str = ""
         for failure in context.failure_history[-5:]:  # Last 5 failures
             failure_str += f"- delta_R={failure.get('delta_R', 'N/A')}: {failure.get('error', 'Unknown error')}\n"
@@ -124,11 +118,8 @@ class ProposerAgent(BaseAgent[MutationProposal]):
         )
 
     def _build_initial_prompt(self, context: AgentContext, kwargs: Dict) -> str:
-        knowledge_str = ""
-        for entry in context.knowledge_context[:5]:
-            knowledge_str += f"- {entry.get('title', '')}: {entry.get('content', '')[:200]}...\n"
-        if not knowledge_str:
-            knowledge_str = "No specific knowledge retrieved."
+        # Note: Static knowledge base removed - LLMs have FEA domain knowledge built-in
+        knowledge_str = "Use your built-in FEA domain knowledge for best practices."
 
         guidelines = context.evaluation_criteria.get("guidelines", "No guidelines available.")
 

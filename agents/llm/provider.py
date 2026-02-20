@@ -180,7 +180,7 @@ def create_provider(
     Factory function to create an LLM provider.
 
     Args:
-        provider_name: Name of the provider ('openai', 'anthropic')
+        provider_name: Name of the provider ('openai', 'anthropic', 'claude-code')
         api_key: API key (optional, can use env vars)
         **kwargs: Additional provider-specific configuration
 
@@ -200,10 +200,14 @@ def create_provider(
         from agents.llm.anthropic_provider import AnthropicProvider
         return AnthropicProvider(api_key=api_key, **kwargs)
 
+    elif provider_name_lower == "claude-code":
+        from agents.llm.claude_code_provider import ClaudeCodeProvider
+        return ClaudeCodeProvider(api_key=api_key, **kwargs)
+
     else:
         raise ValueError(
             f"Unknown provider: {provider_name}. "
-            f"Supported providers: openai, anthropic"
+            f"Supported providers: openai, anthropic, claude-code"
         )
 
 

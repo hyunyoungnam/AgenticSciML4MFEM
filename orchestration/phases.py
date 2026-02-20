@@ -15,12 +15,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agents.base import AgentContext
+from typing import Union
 from agents.roles.evaluator import EvaluatorAgent, EvaluationCriteria
 from agents.roles.proposer import ProposerAgent, MutationProposal
 from agents.roles.critic import CriticAgent
 from agents.roles.engineer import EngineerAgent, ImplementationResult
 from agents.roles.debugger import DebuggerAgent, DebugAnalysis
 from agents.roles.result_analyst import ResultAnalystAgent, ResultAnalysis
+from agents.roles.claude_code_engineer import ClaudeCodeEngineer
+from agents.roles.claude_code_debugger import ClaudeCodeDebugger
+
+# Type aliases for agents that can be either hand-coded or Claude Code powered
+EngineerAgentType = Union[EngineerAgent, ClaudeCodeEngineer]
+DebuggerAgentType = Union[DebuggerAgent, ClaudeCodeDebugger]
 from agents.debate.controller import DebateController, DebateResult, DebateOutcome
 from evolution.solution import Solution, SolutionStatus, SolutionGenome
 from evaluation.pipeline import EvaluationPipeline, EvaluationResult
@@ -125,19 +132,20 @@ class Phase1AnalysisController:
 
 class Phase2KnowledgeController:
     """
-    Phase 2: Knowledge Funnel.
+    Phase 2: Context Preparation.
 
-    1. Retriever searches knowledge base for relevant FEA techniques
-    2. Loads failure memory from previous runs
-    3. Builds context for Proposer
+    Prepares context for the Proposer agent:
+    1. Loads failure memory from previous runs (runtime-specific)
+    2. Sets up context for Proposer
+
+    Note: Static FEA knowledge base is no longer needed as modern LLMs
+    (Claude, GPT-4) already have comprehensive FEA domain knowledge built-in.
     """
 
     def __init__(
         self,
-        knowledge_base=None,
         failure_memory=None,
     ):
-        self.knowledge_base = knowledge_base
         self.failure_memory = failure_memory
 
     async def execute(
@@ -151,35 +159,24 @@ class Phase2KnowledgeController:
 
         Args:
             context: Agent context
-            query: Search query for knowledge base
-            problem_type: Problem type for filtering
+            query: Unused (kept for API compatibility)
+            problem_type: Unused (kept for API compatibility)
 
         Returns:
-            PhaseResult with retrieved knowledge
+            PhaseResult with context preparation status
         """
         result = PhaseResult(
-            phase_name="phase2_knowledge",
+            phase_name="phase2_context",
             status=PhaseStatus.RUNNING,
             started_at=datetime.now(),
         )
 
         try:
-            # Search knowledge base
-            if self.knowledge_base:
-                if query:
-                    entries = self.knowledge_base.search(query, top_k=10)
-                elif problem_type:
-                    entries = self.knowledge_base.search_by_problem_type(problem_type)
-                else:
-                    # Get general best practices
-                    entries = self.knowledge_base.get_by_category("best_practices")
+            # No static knowledge base needed - LLMs have FEA knowledge built-in
+            context.knowledge_context = []
+            result.data["knowledge_entries"] = 0
 
-                context.knowledge_context = [e.to_dict() for e in entries]
-                result.data["knowledge_entries"] = len(entries)
-            else:
-                result.data["knowledge_entries"] = 0
-
-            # Load failure memory
+            # Load failure memory (runtime-specific, still useful)
             if self.failure_memory:
                 failures = self.failure_memory.get_recent_failures(limit=20)
                 context.failure_history = failures
@@ -298,12 +295,15 @@ class Phase4ExecutionController:
     3. Executes Abaqus solver (optional)
     4. If error: Debugger diagnoses, Engineer retries (max 3 attempts)
     5. Result Analyst extracts metrics and success traits
+
+    Supports both hand-coded agents (EngineerAgent, DebuggerAgent) and
+    Claude Code-powered agents (ClaudeCodeEngineer, ClaudeCodeDebugger).
     """
 
     def __init__(
         self,
-        engineer: EngineerAgent,
-        debugger: DebuggerAgent,
+        engineer: EngineerAgentType,
+        debugger: DebuggerAgentType,
         result_analyst: ResultAnalystAgent,
         evaluation_pipeline: EvaluationPipeline,
         max_attempts: int = 3,
@@ -313,6 +313,9 @@ class Phase4ExecutionController:
         self.result_analyst = result_analyst
         self.evaluation_pipeline = evaluation_pipeline
         self.max_attempts = max_attempts
+
+        # Detect if using Claude Code agents
+        self.use_claude_code = isinstance(engineer, ClaudeCodeEngineer)
 
     async def execute(
         self,
@@ -362,12 +365,23 @@ class Phase4ExecutionController:
                     bc_changes=solution.genome.boundary_condition_changes,
                 )
 
-                implementation_result = self.engineer.implement_mutation(
-                    proposal=proposal,
-                    base_inp_path=base_inp_path,
-                    output_path=output_path,
-                    config_path=config_path,
-                )
+                # Handle both Claude Code and hand-coded engineers
+                if self.use_claude_code:
+                    # ClaudeCodeEngineer.implement_mutation is async
+                    implementation_result = await self.engineer.implement_mutation(
+                        proposal=proposal,
+                        base_inp_path=base_inp_path,
+                        output_path=output_path,
+                        config_path=config_path,
+                    )
+                else:
+                    # EngineerAgent.implement_mutation is sync
+                    implementation_result = self.engineer.implement_mutation(
+                        proposal=proposal,
+                        base_inp_path=base_inp_path,
+                        output_path=output_path,
+                        config_path=config_path,
+                    )
 
                 result.data[f"attempt_{attempt}"]["implementation"] = implementation_result.to_dict()
 
