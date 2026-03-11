@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "inpforge"
+name = "meshforge"
 version = "0.1.0"
-description = "Automated Abaqus .inp file generation for AI/ML training datasets using multi-agent systems"
+description = "Automated MFEM mesh generation for AI/ML training datasets using multi-agent systems"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
@@ -13,8 +13,8 @@ authors = [
     {name = "Q. Jiang"}
 ]
 keywords = [
-    "abaqus",
-    "inp",
+    "mfem",
+    "mesh",
     "fea",
     "finite-element-analysis",
     "mesh-morphing",
@@ -53,22 +53,25 @@ dev = [
 viz = [
     "pyvista>=0.40.0",
 ]
+mfem = [
+    "mfem>=4.6",
+]
 
 [project.scripts]
-inpforge = "inpforge.cli:main"
+meshforge = "meshforge.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/qjiang/inpforge"
-Repository = "https://github.com/qjiang/inpforge"
-Documentation = "https://github.com/qjiang/inpforge#readme"
-Issues = "https://github.com/qjiang/inpforge/issues"
+Homepage = "https://github.com/qjiang/meshforge"
+Repository = "https://github.com/qjiang/meshforge"
+Documentation = "https://github.com/qjiang/meshforge#readme"
+Issues = "https://github.com/qjiang/meshforge/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["inpforge*"]
+include = ["meshforge*"]
 
 [tool.setuptools.package-data]
-inpforge = ["configs/*.yaml", "configs/*.md", "knowledge/*.json"]
+meshforge = ["configs/*.yaml", "configs/*.md", "knowledge/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

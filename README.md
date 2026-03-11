@@ -1,8 +1,8 @@
-# inpforge
+# meshforge
 
-**inpforge** is a multi-agent AI system for autonomous Abaqus FEA dataset generation. It uses evolutionary tree search with structured debate between AI agents to generate diverse, validated `.inp` files through intelligent mesh morphing.
+**meshforge** is a multi-agent AI system for autonomous MFEM mesh generation for AI/ML training datasets. It uses evolutionary tree search with structured debate between AI agents to generate diverse, validated mesh files through intelligent mesh morphing.
 
-Stop wasting time manually creating `.inp` files for your ML training datasets.
+Stop wasting time manually creating mesh files for your ML training datasets.
 
 ---
 
@@ -23,15 +23,15 @@ Stop wasting time manually creating `.inp` files for your ML training datasets.
 ## Quick Start
 
 ```bash
-# 1. Install inpforge
-pip install inpforge
+# 1. Install meshforge
+pip install meshforge
 
 # 2. Set API keys (for real LLM usage)
 export OPENAI_API_KEY="your-openai-key"
 export ANTHROPIC_API_KEY="your-anthropic-key"
 
 # 3. Run with test mode (no API calls needed)
-inpforge inputs/BaseInp2D.inp --test --config configs/quarter_plate_with_hole_morphing.md
+meshforge inputs/beam-quad.mesh --test --config configs/quarter_plate_with_hole_morphing.md
 
 # 4. Check outputs
 ls outputs/gen_0/
@@ -44,29 +44,29 @@ ls outputs/gen_0/
 ### From PyPI (Recommended)
 
 ```bash
-pip install inpforge
+pip install meshforge
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/qjiang/inpforge.git
-cd inpforge
+git clone https://github.com/qjiang/meshforge.git
+cd meshforge
 pip install -e .
 ```
 
 ### Prerequisites
 - Python 3.9+
-- (Optional) Abaqus installation for solver execution
+- (Optional) PyMFEM for MFEM solver execution
 
 ### Optional Dependencies
 
 ```bash
 # Install with visualization support
-pip install inpforge[viz]
+pip install meshforge[viz]
 
 # Install with development tools
-pip install inpforge[dev]
+pip install meshforge[dev]
 ```
 
 ---
@@ -87,7 +87,7 @@ pip install inpforge[dev]
 │        │         Evaluator creates                     │                     │
 │        │         Guideline.md &                        ▼                     │
 │        │         Evaluate.py            ┌─────────────────────────┐         │
-│        │                                │   Generated .inp files   │         │
+│        │                                │   Generated .mesh files  │         │
 │        │                                │   with morphed meshes    │         │
 │        │                                └─────────────────────────┘         │
 │        │                                               │                     │
@@ -178,7 +178,7 @@ Human User                    Evaluator Agent
 ```
 
 **Knowledge Sources**:
-- `knowledge/fea_knowledge.json`: Curated FEA best practices
+- LLM built-in knowledge: FEA best practices (no static knowledge base needed)
 - `failure_memory.json`: Dynamically updated with past failures
 
 ---
@@ -245,7 +245,7 @@ Round 4: Final Vote
 │              ┌──────────┐          ┌──────────┐               ││
 │              │ SUCCESS  │          │  FAILED  │               ││
 │              │          │          │          │               ││
-│              │ .inp     │          │ Debugger │               ││
+│              │ .mesh    │          │ Debugger │               ││
 │              │ .vtu     │          │ attempts │               ││
 │              │ generated│          │ fix (x3) │               ││
 │              └──────────┘          └──────────┘               ││
@@ -263,7 +263,7 @@ Round 4: Final Vote
 ```
 
 **Outputs**:
-- Morphed `.inp` files
+- Morphed `.mesh` files
 - `.vtu` files for visualization
 - Metrics (Jacobian, aspect ratio, convergence)
 
@@ -306,7 +306,7 @@ evaluation:
     min_jacobian: 0.1      # Minimum acceptable Jacobian
     max_aspect_ratio: 10.0 # Maximum acceptable aspect ratio
   solver:
-    run_solver: false      # Run Abaqus solver?
+    run_solver: false      # Run MFEM solver?
     timeout: 3600          # Solver timeout (seconds)
 ```
 
@@ -358,15 +358,20 @@ regions:
 ## Directory Structure
 
 ```
-inpforge/
-├── inpforge/                   # Main package
+meshforge/
+├── meshforge/                   # Main package
 │   ├── __init__.py             # Public API
 │   ├── cli.py                  # CLI entry point
-│   ├── manager.py              # Abaqus model manager
 │   ├── morphing.py             # IDW mesh morphing
-│   ├── parser.py               # .inp file parser
-│   ├── writer.py               # .inp file writer
-│   ├── validator.py            # Mesh validation
+│   ├── schema.py               # Data structure definitions
+│   │
+│   ├── mesh/                   # Mesh format handlers
+│   │   ├── base.py             # Abstract MeshManager
+│   │   └── mfem_manager.py     # MFEM mesh implementation
+│   │
+│   ├── solvers/                # Solver interfaces
+│   │   ├── base.py             # Abstract SolverInterface
+│   │   └── mfem_solver.py      # MFEM solver implementation
 │   │
 │   ├── agents/                 # AI Agent implementations
 │   │   ├── base.py             # BaseAgent class
@@ -381,7 +386,7 @@ inpforge/
 │   ├── knowledge/              # Knowledge base
 │   └── configs/                # Configuration files
 │
-├── inputs/                     # Example input .inp files
+├── inputs/                     # Example input .mesh files
 ├── tests/                      # Test suite
 ├── pyproject.toml              # Package configuration
 ├── LICENSE                     # MIT License
@@ -396,7 +401,7 @@ inpforge/
 
 ```bash
 # Uses mock LLM providers (no API keys needed)
-inpforge inputs/BaseInp2D.inp --test \
+meshforge inputs/beam-quad.mesh --test \
     --config configs/quarter_plate_with_hole_morphing.md
 ```
 
@@ -408,7 +413,7 @@ export OPENAI_API_KEY="sk-..."
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # Run 5 generations with population of 5
-inpforge inputs/BaseInp2D.inp \
+meshforge inputs/beam-quad.mesh \
     --config configs/quarter_plate_with_hole_morphing.md \
     --generations 5 \
     --population 5 \
@@ -419,14 +424,14 @@ inpforge inputs/BaseInp2D.inp \
 
 ```bash
 # Just run Phase 1 to generate Guideline.md and Evaluate.py
-inpforge inputs/BaseInp2D.inp --test --dry-run
+meshforge inputs/beam-quad.mesh --test --dry-run
 ```
 
-### Run with Abaqus Solver
+### Run with MFEM Solver
 
 ```bash
-# Actually run Abaqus solver on generated .inp files
-inpforge inputs/BaseInp2D.inp \
+# Actually run MFEM solver on generated .mesh files
+meshforge inputs/beam-quad.mesh \
     --config configs/quarter_plate_with_hole_morphing.md \
     --run-solver
 ```
@@ -441,8 +446,8 @@ inpforge inputs/BaseInp2D.inp \
 | `--output`, `-o` | Output directory | `outputs` |
 | `--test` | Use mock LLM providers | False |
 | `--dry-run` | Initialize only | False |
-| `--run-solver` | Run Abaqus solver | False |
-| `--knowledge` | Knowledge base path | `knowledge/fea_knowledge.json` |
+| `--run-solver` | Run MFEM solver | False |
+| `--knowledge` | Knowledge base path | (built-in LLM knowledge) |
 | `--log-level` | Logging level | `INFO` |
 
 ---
@@ -452,53 +457,55 @@ inpforge inputs/BaseInp2D.inp \
 The low-level mesh processing pipeline:
 
 ```
-input.inp → Parser → Manager → Morphing → Writer → output.inp
+input.mesh → MFEMManager → Morphing → MFEMManager.save() → output.mesh
 ```
 
-### 1. Parser (`parser.py`)
-Reads `.inp` file and splits into keyword chunks (*Node, *Element, *Nset, etc.)
+### 1. MeshManager (`mesh/base.py`)
+Abstract base class defining the mesh interface:
+- Load/save mesh files
+- Access nodes and coordinates
+- Access elements and connectivity
+- Get bounding box and dimensions
 
-### 2. Manager (`manager.py`)
-Builds in-memory model with API for reading/updating:
-- Nodes and coordinates
-- Elements and connectivity
-- Node/element sets
-- Materials and properties
-- Boundary conditions
+### 2. MFEMManager (`mesh/mfem_manager.py`)
+MFEM implementation using PyMFEM:
+- Reads MFEM `.mesh` format
+- Supports 2D and 3D meshes
+- Handles various element types (triangles, quads, tets, hexes)
+- Provides mesh refinement capabilities
 
 ### 3. Morphing (`morphing.py`)
 Applies IDW-based mesh morphing:
 - **Moving nodes** (role=0): Hole boundary, displaced by delta_R
-- **Anchor nodes** (role=1): Far field, stay fixed
-- **Morphing nodes** (role=2): Transition zone, interpolated via IDW
+- **Anchor nodes** (role=2): Far field, stay fixed
+- **Morphing nodes** (role=1): Transition zone, interpolated via IDW
 
-Node classification is computed dynamically based on `delta_R` and stored in a `MorphingContext` object for internal use (never written to INP).
+Node classification is computed dynamically based on `delta_R` and stored in a `MorphingContext` object for internal use.
 
 #### Standalone Morphing Usage
 
 ```bash
 # Basic morphing
-python -m inpforge.morphing inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5
+python -m meshforge.morphing inputs/beam-quad.mesh configs/quarter_plate_with_hole_morphing.md 0.5
 
 # With debug VTU for ParaView visualization
-python -m inpforge.morphing inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5 --debug
+python -m meshforge.morphing inputs/beam-quad.mesh configs/quarter_plate_with_hole_morphing.md 0.5 --debug
 
 # With interactive PyVista preview
-python -m inpforge.morphing inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5 --preview
+python -m meshforge.morphing inputs/beam-quad.mesh configs/quarter_plate_with_hole_morphing.md 0.5 --preview
 ```
 
 #### Python API
 
 ```python
-from inpforge import AbaqusManager, apply_morphing, export_to_vtu
+from meshforge import MFEMManager, apply_morphing
 
 # Load and modify a model
-manager = AbaqusManager("model.inp")
+manager = MFEMManager("model.mesh")
 apply_morphing(manager, config_path="morphing.md", delta_r=0.5)
 
-# Export
-manager.write("output.inp")
-export_to_vtu(manager, "output.vtu")
+# Save morphed mesh
+manager.save("output.mesh")
 ```
 
 #### Debug VTU Visualization (ParaView)
@@ -507,11 +514,11 @@ When using `--debug`, a `*_debug.vtu` file is generated with PointData fields:
 
 | Field | Description |
 |-------|-------------|
-| `MorphingRole` | 0=moving, 1=anchor, 2=morphing |
-| `NodeID` | Original node ID from INP |
+| `MorphingRole` | 0=moving, 1=morphing, 2=anchor |
+| `NodeID` | Original node ID from mesh |
 
 To visualize in ParaView:
-1. Open `outputs/OutputInp2D_morphed_debug.vtu`
+1. Open `outputs/beam-quad_morphed_debug.vtu`
 2. Set **Coloring** to `MorphingRole`
 3. Use **Selection Display Inspector** to hover and inspect node values
 
@@ -522,11 +529,11 @@ For debug visualization, install PyVista:
 pip install pyvista
 ```
 
-### 4. Writer (`writer.py`)
-Writes modified model back to `.inp` format with:
-- Updated node coordinates
-- Preserved element connectivity
-- Regenerated sets
+### 4. Solver Integration (`solvers/mfem_solver.py`)
+Run MFEM finite element analysis:
+- Linear elasticity
+- Heat transfer
+- Returns solver results with metrics
 
 ---
 
@@ -534,14 +541,14 @@ Writes modified model back to `.inp` format with:
 
 After running:
 ```bash
-python run_agentic.py inputs/BaseInp2D.inp --test --config configs/quarter_plate_with_hole_morphing.md
+meshforge inputs/beam-quad.mesh --test --config configs/quarter_plate_with_hole_morphing.md
 ```
 
 You get:
 ```
 outputs/
 ├── gen_0/
-│   ├── a1b2c3d4-....inp    # Morphed mesh (hole radius +30%)
+│   ├── a1b2c3d4-....mesh   # Morphed mesh (hole radius +30%)
 │   └── a1b2c3d4-....vtu    # Visualization file
 ├── Guideline.md            # Generated quality guidelines
 ├── Evaluate.py             # Generated scoring script
@@ -586,7 +593,7 @@ export ANTHROPIC_API_KEY="your-key"
 ### "Morphing config not found"
 ```bash
 # Make sure to specify the morphing config
-inpforge inputs/BaseInp2D.inp --config configs/quarter_plate_with_hole_morphing.md
+meshforge inputs/beam-quad.mesh --config configs/quarter_plate_with_hole_morphing.md
 ```
 
 ### "delta_R not applied"
@@ -598,5 +605,5 @@ inpforge inputs/BaseInp2D.inp --config configs/quarter_plate_with_hole_morphing.
 ## References
 
 - Q.Jiang & G.Karniadakis (2025): AgenticSciML Framework
-- Abaqus Documentation: Element types, mesh quality metrics
+- [MFEM Documentation](https://mfem.org/): Finite Element Methods Library
 - IDW Morphing: Inverse Distance Weighting for mesh deformation
