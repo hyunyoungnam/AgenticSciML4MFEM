@@ -13,14 +13,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from manager import AbaqusManager
-from morphing import (
+from inpforge.manager import AbaqusManager
+from inpforge.morphing import (
     load_morphing_config,
     run_morphing,
     morph_and_write,
     assign_regions_from_geometry,
 )
-from parser import AbaqusParser
+from inpforge.parser import AbaqusParser
 
 
 @pytest.fixture

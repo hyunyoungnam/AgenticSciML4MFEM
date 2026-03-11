@@ -1,8 +1,8 @@
-# AgenticSciML for Abaqus
+# inpforge
 
-<img src="./image/AgenticSciML4Abaqus_framework.png" alt="Agentic4Abaqus Framework" width="700">
+**inpforge** is a multi-agent AI system for autonomous Abaqus FEA dataset generation. It uses evolutionary tree search with structured debate between AI agents to generate diverse, validated `.inp` files through intelligent mesh morphing.
 
-**AgenticSciML** is a multi-agent AI system for autonomous Abaqus FEA dataset generation. It uses evolutionary tree search with structured debate between AI agents to generate diverse, validated `.inp` files through intelligent mesh morphing.
+Stop wasting time manually creating `.inp` files for your ML training datasets.
 
 ---
 
@@ -23,15 +23,15 @@
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+# 1. Install inpforge
+pip install inpforge
 
 # 2. Set API keys (for real LLM usage)
 export OPENAI_API_KEY="your-openai-key"
 export ANTHROPIC_API_KEY="your-anthropic-key"
 
 # 3. Run with test mode (no API calls needed)
-python run_agentic.py inputs/BaseInp2D.inp --test --config configs/quarter_plate_with_hole_morphing.md
+inpforge inputs/BaseInp2D.inp --test --config configs/quarter_plate_with_hole_morphing.md
 
 # 4. Check outputs
 ls outputs/gen_0/
@@ -41,28 +41,32 @@ ls outputs/gen_0/
 
 ## Installation
 
+### From PyPI (Recommended)
+
+```bash
+pip install inpforge
+```
+
+### From Source
+
+```bash
+git clone https://github.com/qjiang/inpforge.git
+cd inpforge
+pip install -e .
+```
+
 ### Prerequisites
 - Python 3.9+
 - (Optional) Abaqus installation for solver execution
 
-### Install Dependencies
+### Optional Dependencies
 
 ```bash
-pip install -r requirements.txt
-```
+# Install with visualization support
+pip install inpforge[viz]
 
-Required packages:
-- `numpy`, `scipy` - Numerical computation
-- `openai`, `anthropic` - LLM providers
-- `pyyaml` - Configuration parsing
-- `aiohttp` - Async HTTP
-
-Optional packages:
-- `pyvista` - Debug visualization of morphing roles in ParaView
-
-```bash
-# Install optional visualization support
-pip install pyvista
+# Install with development tools
+pip install inpforge[dev]
 ```
 
 ---
@@ -354,61 +358,34 @@ regions:
 ## Directory Structure
 
 ```
-AgenticSciML4Abaqus/
-├── run_agentic.py              # Main entry point
-├── manager.py                  # Abaqus model manager
-├── morphing.py                 # IDW mesh morphing
-├── parser.py                   # .inp file parser
-├── writer.py                   # .inp file writer
-├── validator.py                # Mesh validation
+inpforge/
+├── inpforge/                   # Main package
+│   ├── __init__.py             # Public API
+│   ├── cli.py                  # CLI entry point
+│   ├── manager.py              # Abaqus model manager
+│   ├── morphing.py             # IDW mesh morphing
+│   ├── parser.py               # .inp file parser
+│   ├── writer.py               # .inp file writer
+│   ├── validator.py            # Mesh validation
+│   │
+│   ├── agents/                 # AI Agent implementations
+│   │   ├── base.py             # BaseAgent class
+│   │   ├── llm/                # LLM providers (OpenAI, Anthropic)
+│   │   ├── roles/              # Agent implementations
+│   │   ├── prompts/            # Agent prompts
+│   │   └── debate/             # Debate controller
+│   │
+│   ├── orchestration/          # Workflow management
+│   ├── evolution/              # Evolutionary search
+│   ├── evaluation/             # Solution evaluation
+│   ├── knowledge/              # Knowledge base
+│   └── configs/                # Configuration files
 │
-├── agents/                     # AI Agent implementations
-│   ├── base.py                 # BaseAgent class
-│   ├── llm/                    # LLM providers (OpenAI, Anthropic)
-│   ├── roles/                  # Agent implementations
-│   │   ├── evaluator.py
-│   │   ├── proposer.py
-│   │   ├── critic.py
-│   │   ├── engineer.py
-│   │   ├── debugger.py
-│   │   └── result_analyst.py
-│   ├── prompts/                # Agent prompts
-│   └── debate/                 # Debate controller
-│
-├── orchestration/              # Workflow management
-│   ├── orchestrator.py         # Main coordinator
-│   └── phases.py               # Phase controllers
-│
-├── evolution/                  # Evolutionary search
-│   ├── solution.py             # Solution data model
-│   ├── tree.py                 # Solution tree
-│   └── selection.py            # Parent selection
-│
-├── evaluation/                 # Solution evaluation
-│   ├── pipeline.py
-│   ├── preflight.py
-│   └── metrics.py
-│
-├── knowledge/                  # Knowledge base
-│   ├── base.py
-│   ├── fea_knowledge.json      # FEA best practices
-│   └── failure_memory.py
-│
-├── configs/                    # Configuration files
-│   ├── evolution_config.yaml
-│   ├── agent_config.yaml
-│   └── quarter_plate_with_hole_morphing.md
-│
-├── inputs/                     # Input .inp files
-│   └── BaseInp2D.inp
-│
-└── outputs/                    # Generated outputs
-    ├── gen_0/                  # Generation 0 solutions
-    │   ├── <solution-id>.inp
-    │   ├── <solution-id>.vtu
-    │   └── <solution-id>_debug.vtu  # Debug VTU (with --debug)
-    ├── solution_tree.json
-    └── run_summary.json
+├── inputs/                     # Example input .inp files
+├── tests/                      # Test suite
+├── pyproject.toml              # Package configuration
+├── LICENSE                     # MIT License
+└── README.md
 ```
 
 ---
@@ -419,7 +396,7 @@ AgenticSciML4Abaqus/
 
 ```bash
 # Uses mock LLM providers (no API keys needed)
-python run_agentic.py inputs/BaseInp2D.inp --test \
+inpforge inputs/BaseInp2D.inp --test \
     --config configs/quarter_plate_with_hole_morphing.md
 ```
 
@@ -431,7 +408,7 @@ export OPENAI_API_KEY="sk-..."
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # Run 5 generations with population of 5
-python run_agentic.py inputs/BaseInp2D.inp \
+inpforge inputs/BaseInp2D.inp \
     --config configs/quarter_plate_with_hole_morphing.md \
     --generations 5 \
     --population 5 \
@@ -442,14 +419,14 @@ python run_agentic.py inputs/BaseInp2D.inp \
 
 ```bash
 # Just run Phase 1 to generate Guideline.md and Evaluate.py
-python run_agentic.py inputs/BaseInp2D.inp --test --dry-run
+inpforge inputs/BaseInp2D.inp --test --dry-run
 ```
 
 ### Run with Abaqus Solver
 
 ```bash
 # Actually run Abaqus solver on generated .inp files
-python run_agentic.py inputs/BaseInp2D.inp \
+inpforge inputs/BaseInp2D.inp \
     --config configs/quarter_plate_with_hole_morphing.md \
     --run-solver
 ```
@@ -501,13 +478,27 @@ Node classification is computed dynamically based on `delta_R` and stored in a `
 
 ```bash
 # Basic morphing
-python morphing.py inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5
+python -m inpforge.morphing inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5
 
 # With debug VTU for ParaView visualization
-python morphing.py inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5 --debug
+python -m inpforge.morphing inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5 --debug
 
 # With interactive PyVista preview
-python morphing.py inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5 --preview
+python -m inpforge.morphing inputs/BaseInp2D.inp configs/quarter_plate_with_hole_morphing.md 0.5 --preview
+```
+
+#### Python API
+
+```python
+from inpforge import AbaqusManager, apply_morphing, export_to_vtu
+
+# Load and modify a model
+manager = AbaqusManager("model.inp")
+apply_morphing(manager, config_path="morphing.md", delta_r=0.5)
+
+# Export
+manager.write("output.inp")
+export_to_vtu(manager, "output.vtu")
 ```
 
 #### Debug VTU Visualization (ParaView)
@@ -595,7 +586,7 @@ export ANTHROPIC_API_KEY="your-key"
 ### "Morphing config not found"
 ```bash
 # Make sure to specify the morphing config
-python run_agentic.py inputs/BaseInp2D.inp --config configs/quarter_plate_with_hole_morphing.md
+inpforge inputs/BaseInp2D.inp --config configs/quarter_plate_with_hole_morphing.md
 ```
 
 ### "delta_R not applied"

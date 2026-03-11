@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inpforge"
+version = "0.1.0"
+description = "Automated Abaqus .inp file generation for AI/ML training datasets using multi-agent systems"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Q. Jiang"}
+]
+keywords = [
+    "abaqus",
+    "inp",
+    "fea",
+    "finite-element-analysis",
+    "mesh-morphing",
+    "dataset-generation",
+    "machine-learning",
+    "multi-agent",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "PyYAML>=6.0",
+    "openai>=1.0.0",
+    "anthropic>=0.18.0",
+    "aiohttp>=3.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+viz = [
+    "pyvista>=0.40.0",
+]
+
+[project.scripts]
+inpforge = "inpforge.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/qjiang/inpforge"
+Repository = "https://github.com/qjiang/inpforge"
+Documentation = "https://github.com/qjiang/inpforge#readme"
+Issues = "https://github.com/qjiang/inpforge/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["inpforge*"]
+
+[tool.setuptools.package-data]
+inpforge = ["configs/*.yaml", "configs/*.md", "knowledge/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

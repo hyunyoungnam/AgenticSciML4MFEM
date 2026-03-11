@@ -1,0 +1,4 @@
+include LICENSE
+include README.md
+recursive-include inpforge/configs *.yaml *.md
+recursive-include inpforge/knowledge *.json
