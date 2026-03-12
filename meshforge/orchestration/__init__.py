@@ -1,22 +1,17 @@
 """
-Main workflow orchestration for AgenticSciML.
+Workflow orchestration for adaptive surrogate model training.
 
-Coordinates the four-phase workflow: Analysis, Knowledge Funnel,
-Proposer-Critic Debate, and Engineer-Debugger execution.
+Provides surrogate-guided adaptive learning for efficient FEM data generation.
 """
 
-from meshforge.orchestration.orchestrator import AgenticOrchestrator
-from meshforge.orchestration.phases import (
-    Phase1AnalysisController,
-    Phase2KnowledgeController,
-    Phase3DebateController,
-    Phase4ExecutionController,
+from meshforge.orchestration.adaptive import (
+    AdaptiveConfig,
+    AdaptiveOrchestrator,
+    AdaptiveResult,
 )
 
 __all__ = [
-    "AgenticOrchestrator",
-    "Phase1AnalysisController",
-    "Phase2KnowledgeController",
-    "Phase3DebateController",
-    "Phase4ExecutionController",
+    "AdaptiveConfig",
+    "AdaptiveOrchestrator",
+    "AdaptiveResult",
 ]

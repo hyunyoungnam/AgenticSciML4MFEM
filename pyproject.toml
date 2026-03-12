@@ -7,9 +7,10 @@ name = "meshforge"
 version = "0.1.0"
 description = "Automated MFEM mesh generation for AI/ML training datasets using multi-agent systems"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "BSD-3-Clause"}
 requires-python = ">=3.9"
 authors = [
+    {name = "H.-Y. Nam"},
     {name = "Q. Jiang"}
 ]
 keywords = [
@@ -29,7 +30,7 @@ classifiers = [
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Physics",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -55,6 +56,16 @@ viz = [
 ]
 mfem = [
     "mfem>=4.6",
+]
+surrogate = [
+    "deepxde>=1.11.0",
+    "tensorflow>=2.10.0",  # or torch>=2.0.0 as alternative backend
+]
+all = [
+    "mfem>=4.6",
+    "deepxde>=1.11.0",
+    "tensorflow>=2.10.0",
+    "pyvista>=0.40.0",
 ]
 
 [project.scripts]
