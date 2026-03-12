@@ -23,7 +23,7 @@ Generate high-quality training data for scientific machine learning with minimal
 
 - **Adaptive Sampling**: Automatically identifies regions in parameter space where the surrogate model has high error or uncertainty
 - **DeepONet Integration**: Uses DeepXDE for operator learning (DeepONet) surrogate models
-- **MFEM Native**: Works directly with MFEM mesh format - no Abaqus INP conversion needed
+- **MFEM Native**: Works directly with MFEM mesh format 
 - **Efficient**: Reduces the number of expensive FEM simulations by 50-80% compared to uniform sampling
 - **Extensible**: Modular design for custom physics, mesh types, and surrogate architectures
 
