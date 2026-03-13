@@ -442,6 +442,123 @@ class DeepONetEnsemble(SurrogateModel):
             }
         )
 
+    def predict_with_epistemic_uncertainty(
+        self,
+        branch_input: np.ndarray,
+        trunk_input: np.ndarray
+    ) -> PredictionResult:
+        """
+        Make predictions with detailed epistemic uncertainty analysis.
+
+        Epistemic uncertainty represents model uncertainty due to
+        limited training data - this is what active learning targets.
+
+        Returns:
+            PredictionResult with detailed uncertainty metrics
+        """
+        if not self._is_trained:
+            raise RuntimeError("Ensemble not trained.")
+
+        # Get predictions from each ensemble member
+        predictions = []
+        for model in self._models:
+            result = model.predict(branch_input, trunk_input)
+            predictions.append(result.values)
+
+        predictions = np.stack(predictions, axis=0)  # (n_models, n_samples, n_points, dim)
+
+        # Mean prediction
+        mean_pred = np.mean(predictions, axis=0)
+
+        # Epistemic uncertainty (model disagreement)
+        epistemic_std = np.std(predictions, axis=0)
+
+        # Variance decomposition
+        # Total variance = mean of variances + variance of means
+        # Epistemic = variance of means (what we reduce with more data)
+        variance_of_means = np.var(predictions, axis=0)
+
+        # Coefficient of variation (relative uncertainty)
+        cv = epistemic_std / (np.abs(mean_pred) + 1e-10)
+
+        # Prediction intervals (approximate 95% CI)
+        lower_bound = np.percentile(predictions, 2.5, axis=0)
+        upper_bound = np.percentile(predictions, 97.5, axis=0)
+
+        return PredictionResult(
+            values=mean_pred,
+            uncertainty=epistemic_std,
+            coordinates=trunk_input,
+            metadata={
+                "n_ensemble": self.n_models,
+                "uncertainty_method": "epistemic",
+                "epistemic_variance": float(np.mean(variance_of_means)),
+                "mean_cv": float(np.mean(cv)),
+                "lower_95": lower_bound,
+                "upper_95": upper_bound,
+            }
+        )
+
+    def get_ensemble_predictions(
+        self,
+        branch_input: np.ndarray,
+        trunk_input: np.ndarray
+    ) -> np.ndarray:
+        """
+        Get raw predictions from all ensemble members.
+
+        Useful for detailed uncertainty analysis or custom
+        acquisition functions.
+
+        Args:
+            branch_input: Input parameters
+            trunk_input: Query coordinates
+
+        Returns:
+            Array of shape (n_models, n_samples, n_points, dim)
+        """
+        if not self._is_trained:
+            raise RuntimeError("Ensemble not trained.")
+
+        predictions = []
+        for model in self._models:
+            result = model.predict(branch_input, trunk_input)
+            predictions.append(result.values)
+
+        return np.stack(predictions, axis=0)
+
+    def compute_disagreement(
+        self,
+        branch_input: np.ndarray,
+        trunk_input: np.ndarray,
+        metric: str = "std"
+    ) -> np.ndarray:
+        """
+        Compute ensemble disagreement (for Query-by-Committee).
+
+        Args:
+            branch_input: Input parameters
+            trunk_input: Query coordinates
+            metric: Disagreement metric ("std", "range", "entropy")
+
+        Returns:
+            Disagreement values per sample/point
+        """
+        predictions = self.get_ensemble_predictions(branch_input, trunk_input)
+
+        if metric == "std":
+            disagreement = np.std(predictions, axis=0)
+        elif metric == "range":
+            disagreement = np.ptp(predictions, axis=0)
+        elif metric == "cv":
+            mean_pred = np.mean(predictions, axis=0)
+            std_pred = np.std(predictions, axis=0)
+            disagreement = std_pred / (np.abs(mean_pred) + 1e-10)
+        else:
+            disagreement = np.std(predictions, axis=0)
+
+        return disagreement
+
     def save(self, path: Union[str, Path]) -> None:
         """Save all ensemble models."""
         path = Path(path)

@@ -1,18 +1,26 @@
 """
 Adaptive learning orchestrator.
 
-Implements the adaptive learning loop:
-1. Generate initial FEM simulations
-2. Train surrogate model (DeepONet)
-3. Identify weak regions (high error/uncertainty)
-4. Generate targeted new simulations
-5. Repeat until convergence
+Implements an autonomous active learning loop for efficient FEM dataset generation:
+1. Generate initial FEM simulations (Latin Hypercube Sampling)
+2. Train surrogate model (DeepONet ensemble)
+3. Evaluate surrogate and identify high-error/high-uncertainty regions
+4. Select new samples using acquisition functions (informative sampling)
+5. Repeat until convergence criteria are met
+
+The key innovation is "informative sampling" - using acquisition functions
+to prioritize samples that maximize information gain about the underlying
+physics, rather than sampling uniformly.
+
+Reference:
+    Settles (2009): "Active Learning Literature Survey"
 """
 
 import logging
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -32,14 +40,31 @@ from ..surrogate.base import SurrogateConfig
 from ..surrogate.deeponet import DeepONetEnsemble
 from ..surrogate.evaluator import SurrogateEvaluator, UncertaintyAnalysis, WeakRegion
 from ..surrogate.trainer import SurrogateTrainer, TrainingConfig, TrainingResult
+from ..surrogate.acquisition import (
+    AcquisitionFunction,
+    AcquisitionType,
+    get_acquisition_function,
+)
+from .metrics import ActiveLearningMetrics, ConvergenceMonitor
 
 logger = logging.getLogger(__name__)
+
+
+class StoppingCriterion(Enum):
+    """Reasons for stopping the active learning loop."""
+    CONVERGED = auto()  # Error below threshold
+    PATIENCE_EXHAUSTED = auto()  # No improvement for N iterations
+    BUDGET_EXHAUSTED = auto()  # Maximum samples reached
+    MAX_ITERATIONS = auto()  # Maximum iterations reached
+    LOW_UNCERTAINTY = auto()  # Uncertainty below threshold
+    DIMINISHING_RETURNS = auto()  # Efficiency dropped below threshold
+    USER_INTERRUPTED = auto()  # User requested stop
 
 
 @dataclass
 class AdaptiveConfig:
     """
-    Configuration for adaptive learning.
+    Configuration for adaptive active learning.
 
     Attributes:
         base_mesh_path: Path to base mesh file
@@ -52,6 +77,15 @@ class AdaptiveConfig:
         convergence_threshold: Error threshold for convergence
         surrogate_config: Configuration for surrogate model
         physics_config: Physics configuration for simulations
+
+    Active Learning Parameters:
+        acquisition_strategy: Acquisition function for sample selection
+        adaptive_budget: Dynamically adjust samples_per_iteration
+        convergence_patience: Iterations without improvement before stopping
+        min_improvement: Minimum error reduction to count as improvement
+        max_samples: Hard budget limit on total samples
+        diversity_weight: Weight for diversity in sample selection (0-1)
+        n_candidates: Number of candidate samples to consider per iteration
     """
     base_mesh_path: Path
     output_dir: Path
@@ -69,6 +103,16 @@ class AdaptiveConfig:
     n_ensemble: int = 5
     random_seed: int = 42
 
+    # Active learning parameters
+    acquisition_strategy: str = "uncertainty"  # "uncertainty", "ei", "qbc", "ucb", "hybrid"
+    adaptive_budget: bool = True  # Dynamically adjust samples_per_iteration
+    convergence_patience: int = 3  # Stop after N iterations without improvement
+    min_improvement: float = 0.01  # Minimum error reduction to count as improvement
+    max_samples: int = 500  # Hard budget limit
+    diversity_weight: float = 0.1  # Weight for spatial diversity in selection
+    n_candidates: int = 1000  # Number of candidates to consider per iteration
+    uncertainty_threshold: float = 0.05  # Uncertainty threshold for stopping
+
     def __post_init__(self):
         self.output_dir = Path(self.output_dir)
         self.base_mesh_path = Path(self.base_mesh_path)
@@ -77,38 +121,53 @@ class AdaptiveConfig:
 @dataclass
 class AdaptiveResult:
     """
-    Result of adaptive learning run.
+    Result of adaptive active learning run.
 
     Attributes:
-        success: Whether learning converged
+        success: Whether learning converged successfully
         n_iterations: Number of iterations completed
         final_error: Final surrogate error
         total_samples: Total samples generated
         dataset_path: Path to final dataset
         surrogate_path: Path to trained surrogate
         history: Training history per iteration
+        stopping_criterion: Why the loop stopped
+        sample_efficiency: Error reduction per sample
+        metrics_path: Path to saved metrics
     """
     success: bool
     n_iterations: int = 0
     final_error: float = float('inf')
+    initial_error: float = float('inf')
     total_samples: int = 0
     dataset_path: Optional[Path] = None
     surrogate_path: Optional[Path] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     error_message: Optional[str] = None
+    stopping_criterion: Optional[StoppingCriterion] = None
+    sample_efficiency: float = 0.0
+    error_reduction_percent: float = 0.0
+    metrics_path: Optional[Path] = None
 
 
 class AdaptiveOrchestrator:
     """
-    Orchestrates adaptive learning for surrogate model training.
+    Orchestrates autonomous active learning for surrogate model training.
+
+    Implements an informative sampling strategy using acquisition functions
+    to prioritize FEM simulations that maximize model improvement.
 
     Workflow:
-    1. Generate initial samples with uniform parameter sampling
+    1. Generate initial samples with Latin Hypercube Sampling
     2. Run FEM simulations to get ground truth
-    3. Train surrogate model on current dataset
-    4. Evaluate surrogate, identify weak regions
-    5. Generate new samples in weak regions
-    6. Repeat until convergence or max iterations
+    3. Train surrogate model (DeepONet ensemble)
+    4. Evaluate surrogate and compute acquisition scores
+    5. Select new samples using acquisition function (informative sampling)
+    6. Repeat until convergence criteria are met
+
+    The key difference from uniform sampling is that new samples are
+    selected to maximize information gain, focusing computational
+    resources on regions where the model is weak.
     """
 
     def __init__(self, config: AdaptiveConfig):
@@ -124,6 +183,19 @@ class AdaptiveOrchestrator:
         self.trainer: Optional[SurrogateTrainer] = None
         self.evaluator: Optional[SurrogateEvaluator] = None
 
+        # Active learning components
+        self.metrics = ActiveLearningMetrics()
+        self.convergence_monitor = ConvergenceMonitor(
+            target_error=config.convergence_threshold,
+            patience=config.convergence_patience,
+            min_improvement=config.min_improvement,
+            max_samples=config.max_samples,
+        )
+        self._acquisition_fn: Optional[AcquisitionFunction] = None
+        self._coordinates: Optional[np.ndarray] = None
+        self._best_error: float = float('inf')
+        self._no_improvement_count: int = 0
+
         # Setup output directories
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self.meshes_dir = self.config.output_dir / "meshes"
@@ -132,6 +204,8 @@ class AdaptiveOrchestrator:
         self.dataset_dir.mkdir(exist_ok=True)
         self.surrogate_dir = self.config.output_dir / "surrogate"
         self.surrogate_dir.mkdir(exist_ok=True)
+        self.metrics_dir = self.config.output_dir / "metrics"
+        self.metrics_dir.mkdir(exist_ok=True)
 
         # Initialize dataset
         dataset_config = DatasetConfig(
@@ -144,38 +218,58 @@ class AdaptiveOrchestrator:
         )
         self.dataset = FEMDataset(dataset_config)
 
+        # Initialize acquisition function
+        self._acquisition_fn = get_acquisition_function(config.acquisition_strategy)
+
         # Setup RNG
         np.random.seed(config.random_seed)
 
-        logger.info(f"Initialized AdaptiveOrchestrator with config: {config}")
+        logger.info(f"Initialized AdaptiveOrchestrator with active learning config")
+        logger.info(f"  Acquisition strategy: {config.acquisition_strategy}")
+        logger.info(f"  Convergence threshold: {config.convergence_threshold}")
+        logger.info(f"  Patience: {config.convergence_patience}")
+        logger.info(f"  Max samples: {config.max_samples}")
 
     def run(
         self,
         callback: Optional[Callable[[int, Dict[str, Any]], None]] = None
     ) -> AdaptiveResult:
         """
-        Run the adaptive learning loop.
+        Run the autonomous active learning loop.
+
+        This method implements the core active learning algorithm:
+        1. Initialize with diverse samples (LHS)
+        2. Train surrogate and evaluate
+        3. Use acquisition function to select informative samples
+        4. Repeat until convergence criteria met
 
         Args:
             callback: Optional callback(iteration, metrics) for progress reporting
 
         Returns:
-            AdaptiveResult with final metrics and paths
+            AdaptiveResult with final metrics, paths, and efficiency statistics
         """
         history = []
+        stopping_criterion = None
+        initial_error = float('inf')
 
         try:
-            # Phase 1: Generate initial samples
-            logger.info("Phase 1: Generating initial samples")
+            # Phase 1: Generate initial samples using Latin Hypercube Sampling
+            logger.info("="*60)
+            logger.info("PHASE 1: Initial Sampling (Latin Hypercube)")
+            logger.info("="*60)
             initial_params = self._generate_initial_parameters()
             self._run_simulations(initial_params)
 
-            # Main adaptive loop
+            # Main active learning loop
             for iteration in range(self.config.max_iterations):
-                logger.info(f"=== Iteration {iteration + 1}/{self.config.max_iterations} ===")
+                logger.info("")
+                logger.info("="*60)
+                logger.info(f"ITERATION {iteration + 1}/{self.config.max_iterations}")
+                logger.info("="*60)
 
                 # Phase 2: Train surrogate
-                logger.info("Training surrogate model")
+                logger.info("Phase 2: Training surrogate model...")
                 train_result = self._train_surrogate()
 
                 if not train_result.success:
@@ -185,72 +279,252 @@ class AdaptiveOrchestrator:
                         error_message=train_result.error_message,
                         n_iterations=iteration + 1,
                         total_samples=len(self.dataset),
+                        stopping_criterion=StoppingCriterion.USER_INTERRUPTED,
                     )
 
-                # Phase 3: Evaluate and identify weak regions
-                logger.info("Evaluating surrogate model")
+                # Phase 3: Evaluate surrogate and compute uncertainty
+                logger.info("Phase 3: Evaluating surrogate model...")
                 analysis = self._evaluate_surrogate()
+                uncertainty_stats = self._compute_uncertainty_stats()
 
-                # Record iteration metrics
+                # Get current error metrics
+                test_error = train_result.metrics.get("relative_l2", float('inf'))
+                if iteration == 0:
+                    initial_error = test_error
+
+                # Log metrics
                 iteration_metrics = {
                     "iteration": iteration + 1,
                     "n_samples": len(self.dataset),
                     "train_loss": train_result.train_loss,
                     "test_loss": train_result.test_loss,
+                    "test_error": test_error,
                     "n_weak_regions": len(analysis.weak_regions),
-                    "overall_uncertainty": analysis.overall_uncertainty,
-                    "test_error": train_result.metrics.get("rmse", float('inf')),
+                    "mean_uncertainty": uncertainty_stats.get("mean_uncertainty", 0),
+                    "max_uncertainty": uncertainty_stats.get("max_uncertainty", 0),
                 }
                 history.append(iteration_metrics)
+
+                # Update metrics tracker
+                self.metrics.log_iteration(
+                    iteration=iteration + 1,
+                    n_samples_total=len(self.dataset),
+                    n_samples_new=self.config.samples_per_iteration if iteration > 0 else self.config.initial_samples,
+                    train_error=train_result.train_loss,
+                    test_error=test_error,
+                    mean_uncertainty=uncertainty_stats.get("mean_uncertainty", 0),
+                    max_uncertainty=uncertainty_stats.get("max_uncertainty", 0),
+                    n_weak_regions=len(analysis.weak_regions),
+                )
 
                 if callback:
                     callback(iteration + 1, iteration_metrics)
 
-                logger.info(f"Iteration metrics: {iteration_metrics}")
+                logger.info(f"  Test error: {test_error:.6f}")
+                logger.info(f"  Mean uncertainty: {uncertainty_stats.get('mean_uncertainty', 0):.6f}")
+                logger.info(f"  Weak regions: {len(analysis.weak_regions)}")
 
-                # Check convergence
-                test_error = train_result.metrics.get("relative_l2", float('inf'))
-                if test_error < self.config.convergence_threshold:
-                    logger.info(f"Converged! Error {test_error:.4f} < {self.config.convergence_threshold}")
+                # Check convergence criteria
+                stopping_criterion = self._check_convergence(
+                    test_error=test_error,
+                    n_samples=len(self.dataset),
+                    n_weak_regions=len(analysis.weak_regions),
+                    mean_uncertainty=uncertainty_stats.get("mean_uncertainty", 0),
+                    iteration=iteration,
+                )
+
+                if stopping_criterion is not None:
+                    logger.info(f"Stopping: {stopping_criterion.name}")
                     break
 
-                # Phase 4: Generate new samples in weak regions
-                if analysis.weak_regions:
-                    logger.info(f"Generating {self.config.samples_per_iteration} new samples in weak regions")
-                    new_params = self._suggest_new_parameters(analysis)
-                    self._run_simulations(new_params)
-                else:
-                    logger.info("No weak regions identified, generating random samples")
-                    random_params = self._generate_random_parameters(
-                        self.config.samples_per_iteration
-                    )
-                    self._run_simulations(random_params)
+                # Phase 4: Select new samples using acquisition function
+                logger.info("Phase 4: Selecting informative samples...")
+                n_new_samples = self._compute_adaptive_budget(test_error)
+                new_params = self._select_informative_samples(n_new_samples)
 
-            # Save final dataset and surrogate
+                logger.info(f"  Selected {len(new_params)} new samples using {self.config.acquisition_strategy}")
+
+                # Phase 5: Run simulations for new samples
+                logger.info("Phase 5: Running FEM simulations...")
+                self._run_simulations(new_params)
+
+            # Final stopping criterion if loop completed
+            if stopping_criterion is None:
+                stopping_criterion = StoppingCriterion.MAX_ITERATIONS
+
+            # Save final artifacts
+            logger.info("")
+            logger.info("="*60)
+            logger.info("SAVING RESULTS")
+            logger.info("="*60)
+
             dataset_path = self.dataset.save()
             surrogate_path = self.surrogate_dir / "final_model"
             if self.surrogate:
                 self.surrogate.save(surrogate_path)
 
+            # Save metrics
+            metrics_path = self.metrics_dir / "active_learning_metrics.json"
+            self.metrics.save(metrics_path)
+
+            # Compute final statistics
+            final_error = history[-1]["test_error"] if history else float('inf')
+            error_reduction = initial_error - final_error
+            sample_efficiency = self.metrics.compute_efficiency()
+            error_reduction_percent = (error_reduction / initial_error * 100) if initial_error > 0 else 0
+
+            logger.info(f"Final error: {final_error:.6f}")
+            logger.info(f"Error reduction: {error_reduction:.6f} ({error_reduction_percent:.1f}%)")
+            logger.info(f"Sample efficiency: {sample_efficiency:.6f}")
+            logger.info(f"Total samples: {len(self.dataset)}")
+            logger.info(self.metrics.summary())
+
             return AdaptiveResult(
                 success=True,
                 n_iterations=len(history),
-                final_error=history[-1]["test_error"] if history else float('inf'),
+                final_error=final_error,
+                initial_error=initial_error,
                 total_samples=len(self.dataset),
                 dataset_path=dataset_path,
                 surrogate_path=surrogate_path,
                 history=history,
+                stopping_criterion=stopping_criterion,
+                sample_efficiency=sample_efficiency,
+                error_reduction_percent=error_reduction_percent,
+                metrics_path=metrics_path,
             )
 
         except Exception as e:
-            logger.exception("Adaptive learning failed")
+            logger.exception("Active learning failed")
             return AdaptiveResult(
                 success=False,
                 error_message=str(e),
                 n_iterations=len(history),
                 total_samples=len(self.dataset) if self.dataset else 0,
                 history=history,
+                stopping_criterion=StoppingCriterion.USER_INTERRUPTED,
             )
+
+    def _check_convergence(
+        self,
+        test_error: float,
+        n_samples: int,
+        n_weak_regions: int,
+        mean_uncertainty: float,
+        iteration: int
+    ) -> Optional[StoppingCriterion]:
+        """
+        Check all convergence criteria.
+
+        Returns StoppingCriterion if should stop, None otherwise.
+        """
+        # Check target error
+        if test_error <= self.config.convergence_threshold:
+            return StoppingCriterion.CONVERGED
+
+        # Check sample budget
+        if n_samples >= self.config.max_samples:
+            return StoppingCriterion.BUDGET_EXHAUSTED
+
+        # Check improvement (patience)
+        improvement = self._best_error - test_error
+        if improvement > self.config.min_improvement:
+            self._best_error = test_error
+            self._no_improvement_count = 0
+        else:
+            self._no_improvement_count += 1
+
+        if self._no_improvement_count >= self.config.convergence_patience:
+            return StoppingCriterion.PATIENCE_EXHAUSTED
+
+        # Check uncertainty
+        if mean_uncertainty < self.config.uncertainty_threshold:
+            return StoppingCriterion.LOW_UNCERTAINTY
+
+        # Check diminishing returns
+        if self.metrics.detect_diminishing_returns(
+            window=self.config.convergence_patience,
+            threshold=self.config.min_improvement
+        ):
+            return StoppingCriterion.DIMINISHING_RETURNS
+
+        return None
+
+    def _compute_adaptive_budget(self, current_error: float) -> int:
+        """
+        Dynamically compute number of samples for next iteration.
+
+        Uses more samples when error is high, fewer as we converge.
+        """
+        if not self.config.adaptive_budget:
+            return self.config.samples_per_iteration
+
+        # Scale budget based on how far from convergence
+        error_ratio = current_error / self.config.convergence_threshold
+
+        if error_ratio > 5:
+            # Far from convergence - use more samples
+            scale = 1.5
+        elif error_ratio > 2:
+            # Moderate distance - standard budget
+            scale = 1.0
+        elif error_ratio > 1:
+            # Close to convergence - use fewer, more targeted samples
+            scale = 0.7
+        else:
+            # Very close - minimal samples
+            scale = 0.5
+
+        budget = int(self.config.samples_per_iteration * scale)
+        budget = max(3, min(budget, self.config.samples_per_iteration * 2))
+
+        return budget
+
+    def _select_informative_samples(
+        self,
+        n_samples: int
+    ) -> List[Dict[str, float]]:
+        """
+        Select new samples using acquisition-based active learning.
+
+        This is the core active learning step - using the acquisition
+        function to identify the most informative parameter configurations.
+        """
+        if self.evaluator is None or self._coordinates is None:
+            return self._generate_random_parameters(n_samples)
+
+        # Get existing samples to avoid
+        existing_samples = None
+        try:
+            params, _, _ = self.dataset.prepare_training_data(
+                output_field="displacement",
+                valid_only=True
+            )
+            existing_samples = params
+        except ValueError:
+            pass
+
+        # Use acquisition-based selection
+        new_params = self.evaluator.suggest_samples_active(
+            budget=n_samples,
+            coordinates=self._coordinates,
+            acquisition_type=self.config.acquisition_strategy,
+            n_candidates=self.config.n_candidates,
+            diversity_weight=self.config.diversity_weight,
+            existing_samples=existing_samples,
+        )
+
+        return new_params
+
+    def _compute_uncertainty_stats(self) -> Dict[str, float]:
+        """Compute uncertainty statistics across parameter space."""
+        if self.evaluator is None or self._coordinates is None:
+            return {"mean_uncertainty": 0.0, "max_uncertainty": 0.0}
+
+        return self.evaluator.estimate_remaining_uncertainty(
+            coordinates=self._coordinates,
+            n_probe_samples=100
+        )
 
     def _generate_initial_parameters(self) -> List[Dict[str, float]]:
         """Generate initial parameter samples using Latin Hypercube Sampling."""
@@ -463,6 +737,9 @@ class AdaptiveOrchestrator:
             )
         except ValueError as e:
             return TrainingResult(success=False, error_message=str(e))
+
+        # Store coordinates for acquisition function evaluation
+        self._coordinates = coordinates
 
         # Train
         result = self.trainer.train(parameters, coordinates, outputs)

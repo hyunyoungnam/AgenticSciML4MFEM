@@ -3,15 +3,25 @@ Surrogate model evaluator.
 
 Analyzes surrogate model performance and identifies regions
 where the model has high error or uncertainty, guiding
-adaptive data generation.
+adaptive data generation through active learning.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
 from .base import PredictionResult, SurrogateModel
+from .acquisition import (
+    AcquisitionFunction,
+    AcquisitionType,
+    UncertaintySampling,
+    ExpectedImprovement,
+    QueryByCommittee,
+    UpperConfidenceBound,
+    HybridAcquisition,
+    get_acquisition_function,
+)
 
 
 @dataclass
@@ -439,3 +449,286 @@ class SurrogateEvaluator:
             remaining_budget -= n_samples
 
         return suggestions[:budget]
+
+    def suggest_samples_active(
+        self,
+        budget: int,
+        coordinates: np.ndarray,
+        acquisition_type: Union[str, AcquisitionType] = "uncertainty",
+        n_candidates: int = 1000,
+        diversity_weight: float = 0.1,
+        existing_samples: Optional[np.ndarray] = None,
+        **acquisition_kwargs
+    ) -> List[Dict[str, float]]:
+        """
+        Select samples using active learning acquisition functions.
+
+        This is the primary method for informative sampling. It generates
+        candidate parameter configurations, scores them using an acquisition
+        function, and selects the most informative ones.
+
+        Args:
+            budget: Number of samples to select
+            coordinates: Query coordinates for model prediction
+            acquisition_type: Type of acquisition function to use
+            n_candidates: Number of candidate samples to consider
+            diversity_weight: Weight for spatial diversity (0-1)
+            existing_samples: Existing samples to avoid (N, n_params)
+            **acquisition_kwargs: Additional arguments for acquisition function
+
+        Returns:
+            List of parameter dictionaries for new simulations
+        """
+        # Generate candidate pool
+        candidates = self._generate_candidate_pool(n_candidates, existing_samples)
+
+        if len(candidates) == 0:
+            return self._generate_probe_samples(budget)
+
+        candidates_array = np.array([
+            [c[name] for name in self.parameter_names]
+            for c in candidates
+        ])
+
+        # Get acquisition function
+        acquisition_fn = get_acquisition_function(acquisition_type, **acquisition_kwargs)
+
+        # Score candidates and select batch
+        result = acquisition_fn.select_batch(
+            candidates=candidates_array,
+            model=self.model,
+            coordinates=coordinates,
+            batch_size=budget,
+            diversity_weight=diversity_weight,
+            **acquisition_kwargs
+        )
+
+        # Convert selected indices back to parameter dicts
+        selected = []
+        for idx in result.best_indices:
+            selected.append(candidates[idx])
+
+        return selected
+
+    def _generate_candidate_pool(
+        self,
+        n_candidates: int,
+        existing_samples: Optional[np.ndarray] = None,
+        min_distance: float = 0.05
+    ) -> List[Dict[str, float]]:
+        """
+        Generate diverse candidate parameter samples.
+
+        Uses Latin Hypercube Sampling for better coverage, then filters
+        candidates that are too close to existing samples.
+
+        Args:
+            n_candidates: Number of candidates to generate
+            existing_samples: Existing samples to avoid
+            min_distance: Minimum normalized distance from existing samples
+
+        Returns:
+            List of candidate parameter dictionaries
+        """
+        candidates = []
+        n_params = len(self.parameter_names)
+
+        # Latin Hypercube Sampling for diverse coverage
+        lhs_samples = self._latin_hypercube_sample(n_candidates, n_params)
+
+        for i in range(n_candidates):
+            sample = {}
+            for j, name in enumerate(self.parameter_names):
+                min_val, max_val = self.parameter_bounds[name]
+                sample[name] = min_val + lhs_samples[i, j] * (max_val - min_val)
+            candidates.append(sample)
+
+        # Filter candidates too close to existing samples
+        if existing_samples is not None and len(existing_samples) > 0:
+            candidates = self._filter_nearby_candidates(
+                candidates, existing_samples, min_distance
+            )
+
+        return candidates
+
+    def _latin_hypercube_sample(
+        self,
+        n_samples: int,
+        n_dims: int
+    ) -> np.ndarray:
+        """
+        Generate Latin Hypercube samples in [0, 1]^n_dims.
+
+        Args:
+            n_samples: Number of samples
+            n_dims: Number of dimensions
+
+        Returns:
+            Array of shape (n_samples, n_dims) with values in [0, 1]
+        """
+        samples = np.zeros((n_samples, n_dims))
+
+        for j in range(n_dims):
+            # Create intervals
+            edges = np.linspace(0, 1, n_samples + 1)
+            # Sample uniformly within each interval
+            points = np.random.uniform(edges[:-1], edges[1:])
+            # Shuffle to randomize
+            np.random.shuffle(points)
+            samples[:, j] = points
+
+        return samples
+
+    def _filter_nearby_candidates(
+        self,
+        candidates: List[Dict[str, float]],
+        existing_samples: np.ndarray,
+        min_distance: float
+    ) -> List[Dict[str, float]]:
+        """
+        Filter out candidates too close to existing samples.
+
+        Args:
+            candidates: List of candidate parameter dicts
+            existing_samples: Existing samples array (N, n_params)
+            min_distance: Minimum normalized distance
+
+        Returns:
+            Filtered list of candidates
+        """
+        if len(candidates) == 0:
+            return candidates
+
+        # Normalize parameter bounds
+        bounds_array = np.array([
+            self.parameter_bounds[name] for name in self.parameter_names
+        ])
+        ranges = bounds_array[:, 1] - bounds_array[:, 0]
+        ranges = np.where(ranges < 1e-10, 1.0, ranges)
+
+        # Normalize existing samples
+        existing_norm = (existing_samples - bounds_array[:, 0]) / ranges
+
+        filtered = []
+        for candidate in candidates:
+            candidate_array = np.array([candidate[name] for name in self.parameter_names])
+            candidate_norm = (candidate_array - bounds_array[:, 0]) / ranges
+
+            # Compute minimum distance to any existing sample
+            distances = np.linalg.norm(existing_norm - candidate_norm, axis=1)
+            min_dist = np.min(distances) if len(distances) > 0 else float('inf')
+
+            if min_dist >= min_distance:
+                filtered.append(candidate)
+
+        return filtered
+
+    def compute_acquisition_scores(
+        self,
+        candidates: List[Dict[str, float]],
+        coordinates: np.ndarray,
+        acquisition_type: Union[str, AcquisitionType] = "uncertainty",
+        **kwargs
+    ) -> np.ndarray:
+        """
+        Compute acquisition scores for given candidates.
+
+        Useful for analyzing the informativeness of specific parameter
+        configurations without selecting them.
+
+        Args:
+            candidates: List of parameter dictionaries
+            coordinates: Query coordinates
+            acquisition_type: Type of acquisition function
+            **kwargs: Additional arguments for acquisition function
+
+        Returns:
+            Array of acquisition scores
+        """
+        if not candidates:
+            return np.array([])
+
+        candidates_array = np.array([
+            [c[name] for name in self.parameter_names]
+            for c in candidates
+        ])
+
+        acquisition_fn = get_acquisition_function(acquisition_type, **kwargs)
+        scores = acquisition_fn.compute(candidates_array, self.model, coordinates, **kwargs)
+
+        return scores
+
+    def rank_samples_by_informativeness(
+        self,
+        parameters: np.ndarray,
+        coordinates: np.ndarray,
+        acquisition_type: Union[str, AcquisitionType] = "uncertainty"
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Rank existing samples by their current informativeness.
+
+        Useful for understanding which samples contributed most
+        to model training.
+
+        Args:
+            parameters: Parameter values (N, n_params)
+            coordinates: Query coordinates
+            acquisition_type: Acquisition function to use
+
+        Returns:
+            Tuple of (ranked_indices, scores) sorted by informativeness
+        """
+        acquisition_fn = get_acquisition_function(acquisition_type)
+        scores = acquisition_fn.compute(parameters, self.model, coordinates)
+
+        ranked_indices = np.argsort(scores)[::-1]  # Highest first
+        ranked_scores = scores[ranked_indices]
+
+        return ranked_indices, ranked_scores
+
+    def estimate_remaining_uncertainty(
+        self,
+        coordinates: np.ndarray,
+        n_probe_samples: int = 100
+    ) -> Dict[str, float]:
+        """
+        Estimate remaining uncertainty across parameter space.
+
+        Samples the parameter space and computes aggregate uncertainty
+        statistics. Useful for determining if more samples are needed.
+
+        Args:
+            coordinates: Query coordinates
+            n_probe_samples: Number of probe samples
+
+        Returns:
+            Dictionary of uncertainty statistics
+        """
+        probe_params = self._generate_probe_samples(n_probe_samples)
+
+        uncertainties = []
+        for params in probe_params:
+            param_array = np.array([[params[name] for name in self.parameter_names]])
+            result = self.model.predict(param_array, coordinates)
+
+            if result.uncertainty is not None:
+                uncertainties.append(np.mean(result.uncertainty))
+
+        if not uncertainties:
+            return {
+                "mean_uncertainty": 0.0,
+                "max_uncertainty": 0.0,
+                "std_uncertainty": 0.0,
+                "high_uncertainty_fraction": 0.0,
+            }
+
+        uncertainties = np.array(uncertainties)
+        threshold = np.percentile(uncertainties, 75)
+
+        return {
+            "mean_uncertainty": float(np.mean(uncertainties)),
+            "max_uncertainty": float(np.max(uncertainties)),
+            "std_uncertainty": float(np.std(uncertainties)),
+            "median_uncertainty": float(np.median(uncertainties)),
+            "high_uncertainty_fraction": float(np.mean(uncertainties > threshold)),
+        }
