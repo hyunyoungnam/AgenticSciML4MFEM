@@ -19,10 +19,14 @@ keywords = [
     "fea",
     "finite-element-analysis",
     "mesh-morphing",
+    "tmop",
+    "mesh-optimization",
     "dataset-generation",
     "machine-learning",
+    "active-learning",
     "multi-agent",
     "llm",
+    "deeponet",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -44,6 +48,7 @@ dependencies = [
     "openai>=1.0.0",
     "anthropic>=0.18.0",
     "aiohttp>=3.9.0",
+    "mfem>=4.6",  # Required for TMOP mesh morphing
 ]
 
 [project.optional-dependencies]
@@ -82,7 +87,7 @@ where = ["."]
 include = ["meshforge*"]
 
 [tool.setuptools.package-data]
-meshforge = ["configs/*.yaml", "configs/*.md", "knowledge/*.json"]
+meshforge = ["configs/*.yaml", "configs/*.md", "knowledge/*.json", "morphing/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

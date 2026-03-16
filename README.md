@@ -16,6 +16,7 @@ Generate high-quality training data for scientific machine learning with minimal
 - [Acquisition Functions](#acquisition-functions)
 - [Usage Examples](#usage-examples)
 - [Architecture](#architecture)
+- [R-Adaptivity](#r-adaptivity-error-driven-mesh-adaptation)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
 
@@ -25,9 +26,10 @@ Generate high-quality training data for scientific machine learning with minimal
 
 - **Active Learning Loop**: Autonomous iteration between data generation and model training with intelligent stopping criteria
 - **Informative Sampling**: Acquisition functions (Uncertainty, Expected Improvement, Query-by-Committee) prioritize samples that maximize model improvement
+- **R-Adaptivity**: Error-driven mesh adaptation using TMOP - nodes cluster in high-error regions to improve surrogate accuracy
 - **DeepONet Integration**: Ensemble-based operator learning with epistemic uncertainty quantification
 - **Adaptive Budget**: Dynamically adjusts sampling rate based on convergence progress
-- **MFEM Native**: Works directly with MFEM mesh format
+- **MFEM Native**: Works directly with MFEM mesh format and TMOP optimization
 - **Efficient**: Reduces FEM simulations by 50-80% compared to uniform sampling
 - **Convergence Monitoring**: Multiple stopping criteria (error threshold, patience, budget, diminishing returns)
 
@@ -389,7 +391,10 @@ meshforge/
 │   ├── base.py             # SolverInterface
 │   └── mfem_solver.py      # MFEM solver
 │
-├── morphing.py              # IDW mesh morphing
+├── morphing/                # R-adaptivity (error-driven mesh adaptation)
+│   ├── __init__.py         # Public API
+│   └── r_adaptivity.py     # TMOPAdaptivity implementation
+│
 ├── evaluation/              # Mesh quality metrics
 └── agents/                  # LLM-based agents (optional)
 ```
@@ -417,6 +422,63 @@ meshforge/
 │              │  Uncertainty Estimates
 └──────────────┘
 ```
+
+---
+
+## R-Adaptivity (Error-Driven Mesh Adaptation)
+
+Meshforge uses MFEM's **TMOP (Target-Matrix Optimization Paradigm)** for r-adaptivity - redistributing mesh nodes to cluster in regions where the surrogate model has high prediction error.
+
+### How It Works
+
+1. **Error Field**: The surrogate model provides pointwise prediction errors at each mesh node
+2. **Target Size**: High-error regions get smaller target element sizes (attract nodes)
+3. **TMOP Optimization**: Nodes are relocated while maintaining mesh validity
+4. **Barrier Functions**: Prevent element inversion during adaptation
+
+### Usage
+
+```python
+from meshforge.morphing import TMOPAdaptivity, AdaptivityConfig
+from meshforge.mesh.mfem_manager import MFEMManager
+
+# Load mesh
+manager = MFEMManager("mesh.mesh")
+coords = manager.get_nodes()
+
+# Get error field from surrogate model
+predictions = surrogate.predict(params, coords)
+error_field = np.abs(predictions - ground_truth)
+
+# Configure adaptivity
+config = AdaptivityConfig(
+    size_scale_min=0.3,  # Small elements in high-error regions
+    size_scale_max=2.0,  # Large elements in low-error regions
+    max_iterations=200,
+)
+
+# Adapt mesh
+adaptivity = TMOPAdaptivity(config)
+result = adaptivity.adapt(manager, error_field)
+
+if result.success:
+    print(f"Quality: {result.quality_before['min_quality']:.3f} → "
+          f"{result.quality_after['min_quality']:.3f}")
+```
+
+### Configuration Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `size_scale_min` | 0.3 | Target size in high-error regions (attracts nodes) |
+| `size_scale_max` | 2.0 | Target size in low-error regions (repels nodes) |
+| `barrier_type` | "shifted" | Barrier function ("shifted" or "pseudo") |
+| `max_iterations` | 200 | Maximum Newton iterations |
+| `fix_boundary` | True | Keep boundary nodes fixed |
+
+### Requirements
+
+- PyMFEM with TMOP support (`pip install mfem`)
 
 ---
 
@@ -495,6 +557,14 @@ from meshforge.surrogate.acquisition import (
 )
 from meshforge.surrogate.error_analysis import SpatialErrorAnalyzer, ErrorDecomposer
 from meshforge.orchestration.metrics import ActiveLearningMetrics, ConvergenceMonitor
+
+# R-Adaptivity (Error-driven mesh adaptation)
+from meshforge.morphing import (
+    TMOPAdaptivity,
+    AdaptivityConfig,
+    AdaptivityResult,
+    is_tmop_available,
+)
 ```
 
 ### Key Methods
@@ -522,6 +592,17 @@ metrics.compute_efficiency() → float
 metrics.detect_diminishing_returns() → bool
 metrics.find_optimal_stopping_point() → int
 metrics.summary() → str
+
+# TMOPAdaptivity (r-adaptivity)
+adaptivity.adapt(manager, error_field) → AdaptivityResult
+
+# AdaptivityResult
+result.success            → bool
+result.coords_adapted     → np.ndarray
+result.quality_before     → Dict[str, float]
+result.quality_after      → Dict[str, float]
+result.iterations         → int
+result.error_message      → Optional[str]
 ```
 
 ---

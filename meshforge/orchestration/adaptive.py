@@ -27,7 +27,11 @@ import numpy as np
 from ..data.dataset import DatasetConfig, FEMDataset, FEMSample
 from ..data.loader import SimulationResultLoader
 from ..mesh.mfem_manager import MFEMManager
-from ..morphing import MorphingEngine
+from ..morphing import (
+    TMOPAdaptivity,
+    AdaptivityConfig,
+    is_tmop_available,
+)
 from ..solvers.base import (
     BoundaryCondition,
     BoundaryConditionType,
@@ -112,6 +116,10 @@ class AdaptiveConfig:
     diversity_weight: float = 0.1  # Weight for spatial diversity in selection
     n_candidates: int = 1000  # Number of candidates to consider per iteration
     uncertainty_threshold: float = 0.05  # Uncertainty threshold for stopping
+
+    # R-adaptivity configuration
+    enable_r_adaptivity: bool = True  # Enable error-driven mesh adaptation
+    adaptivity_config: Optional[AdaptivityConfig] = None  # Custom adaptivity settings
 
     def __post_init__(self):
         self.output_dir = Path(self.output_dir)
@@ -220,6 +228,16 @@ class AdaptiveOrchestrator:
 
         # Initialize acquisition function
         self._acquisition_fn = get_acquisition_function(config.acquisition_strategy)
+
+        # Initialize r-adaptivity engine
+        self._adaptivity: Optional[TMOPAdaptivity] = None
+        if config.enable_r_adaptivity:
+            if is_tmop_available():
+                adaptivity_cfg = config.adaptivity_config or AdaptivityConfig()
+                self._adaptivity = TMOPAdaptivity(adaptivity_cfg)
+                logger.info("  R-adaptivity: enabled (TMOP)")
+            else:
+                logger.warning("R-adaptivity requested but PyMFEM not available")
 
         # Setup RNG
         np.random.seed(config.random_seed)
@@ -673,46 +691,76 @@ class AdaptiveOrchestrator:
             sample_id=sample_id,
         )
 
-    def _apply_morphing(
+    def _apply_r_adaptivity(
         self,
         mesh_manager: MFEMManager,
-        delta_R: float
-    ) -> np.ndarray:
+        error_field: np.ndarray,
+    ) -> Tuple[np.ndarray, Dict[str, float]]:
         """
-        Apply mesh morphing for hole radius change.
+        Apply r-adaptivity based on surrogate model error field.
+
+        Uses TMOP to redistribute mesh nodes, clustering them in regions
+        where the surrogate model has high prediction error.
 
         Args:
-            mesh_manager: Mesh manager
-            delta_R: Change in hole radius
+            mesh_manager: Mesh manager with current mesh
+            error_field: (N,) array of error values at each node.
+                        Higher values → nodes will cluster there.
 
         Returns:
-            Morphed coordinates
+            Tuple of (adapted coordinates, quality metrics dict)
         """
-        coords = mesh_manager.get_nodes()
+        if self._adaptivity is None:
+            logger.warning("R-adaptivity not available, skipping mesh adaptation")
+            return mesh_manager.get_nodes(), {}
 
-        # Simple radial morphing from center
-        # Assumes a hole at origin - adjust as needed
-        center = np.array([0.0, 0.0])
-        if coords.shape[1] == 3:
-            center = np.array([0.0, 0.0, 0.0])
+        result = self._adaptivity.adapt(mesh_manager, error_field)
 
-        # Calculate distances from center
-        distances = np.linalg.norm(coords - center, axis=1)
+        if result.success:
+            logger.info(
+                f"R-adaptivity: {result.iterations} iterations, "
+                f"quality {result.quality_before.get('min_quality', 0):.3f} → "
+                f"{result.quality_after.get('min_quality', 0):.3f}"
+            )
+            return result.coords_adapted, result.quality_after
+        else:
+            logger.warning(f"R-adaptivity failed: {result.error_message}")
+            return mesh_manager.get_nodes(), {}
 
-        # Apply morphing - nodes closer to center move more
-        R0 = np.min(distances[distances > 0])  # Initial hole radius estimate
-        R_outer = np.max(distances)
+    def adapt_mesh_to_error(
+        self,
+        error_field: np.ndarray,
+        mesh_path: Optional[Path] = None,
+    ) -> Tuple[MFEMManager, Dict[str, float]]:
+        """
+        Adapt mesh based on surrogate model error field.
 
-        morphed = coords.copy()
-        for i in range(len(coords)):
-            r = distances[i]
-            if r > 0:
-                # Linear interpolation of displacement
-                factor = (R_outer - r) / (R_outer - R0) if R_outer > R0 else 0
-                direction = (coords[i] - center) / r
-                morphed[i] = coords[i] + delta_R * factor * direction
+        Public method to perform r-adaptivity on a mesh given an error field.
+        Nodes are redistributed to cluster in high-error regions.
 
-        return morphed
+        Args:
+            error_field: (N,) array of pointwise error values.
+                        Typically from surrogate.compute_pointwise_error()
+            mesh_path: Optional path to mesh file. If None, uses base mesh.
+
+        Returns:
+            Tuple of (adapted MFEMManager, quality metrics)
+
+        Example:
+            # Get error from surrogate
+            coords = mesh_manager.get_nodes()
+            predictions = surrogate.predict(params, coords)
+            error_field = np.abs(predictions - ground_truth)
+
+            # Adapt mesh
+            adapted_manager, quality = orchestrator.adapt_mesh_to_error(error_field)
+        """
+        mesh_path = mesh_path or self.config.base_mesh_path
+        manager = MFEMManager(str(mesh_path))
+
+        coords, quality = self._apply_r_adaptivity(manager, error_field)
+
+        return manager, quality
 
     def _train_surrogate(self) -> TrainingResult:
         """Train surrogate model on current dataset."""

@@ -2,3 +2,4 @@ include LICENSE
 include README.md
 recursive-include meshforge/configs *.yaml *.md
 recursive-include meshforge/knowledge *.json
+recursive-include meshforge/morphing *.py

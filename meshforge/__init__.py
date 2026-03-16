@@ -7,6 +7,7 @@ the tedious manual work of creating FEA datasets for machine learning research.
 
 Key Features:
 - Adaptive learning: Surrogate-guided data generation with DeepONet
+- R-adaptivity: Error-driven mesh adaptation using TMOP
 - MFEM integration: Native support for MFEM mesh format
 - FEM simulation: Built-in solvers for elasticity and heat transfer
 
@@ -20,11 +21,11 @@ Example (Adaptive Learning):
     >>> orchestrator = AdaptiveOrchestrator(config)
     >>> result = orchestrator.run()
 
-Example (Basic Morphing):
-    >>> from meshforge import MFEMManager, apply_morphing
+Example (R-Adaptivity):
+    >>> from meshforge import MFEMManager, TMOPAdaptivity, AdaptivityConfig
     >>> manager = MFEMManager("model.mesh")
-    >>> apply_morphing(manager, config_path="morphing.md", delta_r=0.5)
-    >>> manager.save("output.mesh")
+    >>> adaptivity = TMOPAdaptivity(AdaptivityConfig())
+    >>> result = adaptivity.adapt(manager, error_field)
 """
 
 __version__ = "0.2.0"
@@ -33,7 +34,7 @@ __author__ = "H.-Y. Nam, Q. Jiang"
 # Core API - MFEM mesh management
 from meshforge.mesh.base import MeshManager
 from meshforge.mesh.mfem_manager import MFEMManager
-from meshforge.morphing import run_morphing as apply_morphing, MorphingContext
+from meshforge.morphing import TMOPAdaptivity, AdaptivityConfig, AdaptivityResult
 from meshforge.schema import HeavyData, LightData, Nodes, Elements
 
 # Solver API
@@ -49,14 +50,14 @@ from meshforge.solvers.mfem_solver import MFEMSolver
 # Evaluation API
 from meshforge.evaluation.pipeline import EvaluationPipeline, EvaluationResult
 
-# Adaptive Learning API (new)
+# Adaptive Learning API
 from meshforge.orchestration.adaptive import (
     AdaptiveOrchestrator,
-    AdaptiveConfig,
-    AdaptiveResult,
+    AdaptiveConfig as AdaptiveOrchestratorConfig,
+    AdaptiveResult as AdaptiveOrchestratorResult,
 )
 
-# Dataset API (new)
+# Dataset API
 from meshforge.data.dataset import FEMDataset, FEMSample, DatasetConfig
 
 __all__ = [
@@ -66,11 +67,14 @@ __all__ = [
     # Core classes - Mesh management
     "MeshManager",
     "MFEMManager",
-    "MorphingContext",
     "HeavyData",
     "LightData",
     "Nodes",
     "Elements",
+    # R-Adaptivity
+    "TMOPAdaptivity",
+    "AdaptivityConfig",
+    "AdaptivityResult",
     # Solver classes
     "SolverInterface",
     "MFEMSolver",
@@ -81,14 +85,12 @@ __all__ = [
     # Evaluation
     "EvaluationPipeline",
     "EvaluationResult",
-    # Adaptive Learning (new)
+    # Adaptive Learning
     "AdaptiveOrchestrator",
-    "AdaptiveConfig",
-    "AdaptiveResult",
-    # Dataset (new)
+    "AdaptiveOrchestratorConfig",
+    "AdaptiveOrchestratorResult",
+    # Dataset
     "FEMDataset",
     "FEMSample",
     "DatasetConfig",
-    # Functions
-    "apply_morphing",
 ]
