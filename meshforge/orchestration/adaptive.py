@@ -3,7 +3,7 @@ Adaptive learning orchestrator.
 
 Implements an autonomous active learning loop for efficient FEM dataset generation:
 1. Generate initial FEM simulations (Latin Hypercube Sampling)
-2. Train surrogate model (DeepONet ensemble)
+2. Train surrogate model (FNO/Transolver - implementation pending)
 3. Evaluate surrogate and identify high-error/high-uncertainty regions
 4. Select new samples using acquisition functions (informative sampling)
 5. Repeat until convergence criteria are met
@@ -40,8 +40,7 @@ from ..solvers.base import (
     PhysicsType,
 )
 from ..solvers.mfem_solver import MFEMSolver
-from ..surrogate.base import SurrogateConfig
-from ..surrogate.deeponet import DeepONetEnsemble
+from ..surrogate.base import SurrogateConfig, SurrogateModel
 from ..surrogate.evaluator import SurrogateEvaluator, UncertaintyAnalysis, WeakRegion
 from ..surrogate.trainer import SurrogateTrainer, TrainingConfig, TrainingResult
 from ..surrogate.acquisition import (
@@ -70,56 +69,54 @@ class AdaptiveConfig:
     """
     Configuration for adaptive active learning.
 
+    Essential parameters only - derived values computed at runtime.
+
     Attributes:
         base_mesh_path: Path to base mesh file
         output_dir: Directory for outputs
-        parameter_names: Names of varying parameters
-        parameter_bounds: Bounds for each parameter
-        initial_samples: Number of initial samples to generate
-        samples_per_iteration: New samples per iteration
-        max_iterations: Maximum adaptive iterations
-        convergence_threshold: Error threshold for convergence
-        surrogate_config: Configuration for surrogate model
-        physics_config: Physics configuration for simulations
-
-    Active Learning Parameters:
-        acquisition_strategy: Acquisition function for sample selection
-        adaptive_budget: Dynamically adjust samples_per_iteration
-        convergence_patience: Iterations without improvement before stopping
-        min_improvement: Minimum error reduction to count as improvement
+        parameter_bounds: Bounds for each parameter {name: (min, max)}
+        initial_samples: Number of initial LHS samples
         max_samples: Hard budget limit on total samples
-        diversity_weight: Weight for diversity in sample selection (0-1)
-        n_candidates: Number of candidate samples to consider per iteration
+        convergence_threshold: Error threshold for convergence
+        patience: Iterations without improvement before stopping
+        n_ensemble: Number of ensemble models for uncertainty
+        physics_config: Optional physics configuration for simulations
+        acquisition_strategy: Acquisition function ("uncertainty", "ei", "qbc")
     """
     base_mesh_path: Path
     output_dir: Path
-    parameter_names: List[str] = field(default_factory=lambda: ["delta_R"])
     parameter_bounds: Dict[str, Tuple[float, float]] = field(
         default_factory=lambda: {"delta_R": (-0.5, 0.5)}
     )
     initial_samples: int = 20
-    samples_per_iteration: int = 10
-    max_iterations: int = 10
+    max_samples: int = 200
     convergence_threshold: float = 0.05
-    surrogate_config: SurrogateConfig = field(default_factory=SurrogateConfig)
-    physics_config: Optional[PhysicsConfig] = None
-    use_ensemble: bool = True
+    patience: int = 3
     n_ensemble: int = 5
+    physics_config: Optional[PhysicsConfig] = None
+    acquisition_strategy: str = "uncertainty"
     random_seed: int = 42
 
-    # Active learning parameters
-    acquisition_strategy: str = "uncertainty"  # "uncertainty", "ei", "qbc", "ucb", "hybrid"
-    adaptive_budget: bool = True  # Dynamically adjust samples_per_iteration
-    convergence_patience: int = 3  # Stop after N iterations without improvement
-    min_improvement: float = 0.01  # Minimum error reduction to count as improvement
-    max_samples: int = 500  # Hard budget limit
-    diversity_weight: float = 0.1  # Weight for spatial diversity in selection
-    n_candidates: int = 1000  # Number of candidates to consider per iteration
-    uncertainty_threshold: float = 0.05  # Uncertainty threshold for stopping
+    # Derived at runtime
+    @property
+    def parameter_names(self) -> List[str]:
+        """Derive parameter names from bounds keys."""
+        return list(self.parameter_bounds.keys())
 
-    # R-adaptivity configuration
-    enable_r_adaptivity: bool = True  # Enable error-driven mesh adaptation
-    adaptivity_config: Optional[AdaptivityConfig] = None  # Custom adaptivity settings
+    @property
+    def samples_per_iteration(self) -> int:
+        """Base samples per iteration (dynamically adjusted)."""
+        return 10
+
+    @property
+    def max_iterations(self) -> int:
+        """Derive max iterations from budget."""
+        return (self.max_samples - self.initial_samples) // self.samples_per_iteration + 1
+
+    @property
+    def surrogate_config(self) -> SurrogateConfig:
+        """Default surrogate configuration."""
+        return SurrogateConfig()
 
     def __post_init__(self):
         self.output_dir = Path(self.output_dir)
@@ -168,7 +165,7 @@ class AdaptiveOrchestrator:
     Workflow:
     1. Generate initial samples with Latin Hypercube Sampling
     2. Run FEM simulations to get ground truth
-    3. Train surrogate model (DeepONet ensemble)
+    3. Train surrogate model (FNO/Transolver - implementation pending)
     4. Evaluate surrogate and compute acquisition scores
     5. Select new samples using acquisition function (informative sampling)
     6. Repeat until convergence criteria are met
@@ -187,7 +184,7 @@ class AdaptiveOrchestrator:
         """
         self.config = config
         self.dataset: Optional[FEMDataset] = None
-        self.surrogate: Optional[DeepONetEnsemble] = None
+        self.surrogate: Optional[SurrogateModel] = None
         self.trainer: Optional[SurrogateTrainer] = None
         self.evaluator: Optional[SurrogateEvaluator] = None
 
@@ -195,8 +192,8 @@ class AdaptiveOrchestrator:
         self.metrics = ActiveLearningMetrics()
         self.convergence_monitor = ConvergenceMonitor(
             target_error=config.convergence_threshold,
-            patience=config.convergence_patience,
-            min_improvement=config.min_improvement,
+            patience=config.patience,
+            min_improvement=0.01,  # Hardcoded sensible default
             max_samples=config.max_samples,
         )
         self._acquisition_fn: Optional[AcquisitionFunction] = None
@@ -229,23 +226,16 @@ class AdaptiveOrchestrator:
         # Initialize acquisition function
         self._acquisition_fn = get_acquisition_function(config.acquisition_strategy)
 
-        # Initialize r-adaptivity engine
+        # R-adaptivity deferred - not wired into the loop yet
         self._adaptivity: Optional[TMOPAdaptivity] = None
-        if config.enable_r_adaptivity:
-            if is_tmop_available():
-                adaptivity_cfg = config.adaptivity_config or AdaptivityConfig()
-                self._adaptivity = TMOPAdaptivity(adaptivity_cfg)
-                logger.info("  R-adaptivity: enabled (TMOP)")
-            else:
-                logger.warning("R-adaptivity requested but PyMFEM not available")
 
         # Setup RNG
         np.random.seed(config.random_seed)
 
-        logger.info(f"Initialized AdaptiveOrchestrator with active learning config")
-        logger.info(f"  Acquisition strategy: {config.acquisition_strategy}")
-        logger.info(f"  Convergence threshold: {config.convergence_threshold}")
-        logger.info(f"  Patience: {config.convergence_patience}")
+        logger.info(f"Initialized AdaptiveOrchestrator")
+        logger.info(f"  Acquisition: {config.acquisition_strategy}")
+        logger.info(f"  Convergence: {config.convergence_threshold}")
+        logger.info(f"  Patience: {config.patience}")
         logger.info(f"  Max samples: {config.max_samples}")
 
     def run(
@@ -436,6 +426,8 @@ class AdaptiveOrchestrator:
 
         Returns StoppingCriterion if should stop, None otherwise.
         """
+        min_improvement = 0.01  # Hardcoded sensible default
+
         # Check target error
         if test_error <= self.config.convergence_threshold:
             return StoppingCriterion.CONVERGED
@@ -446,23 +438,23 @@ class AdaptiveOrchestrator:
 
         # Check improvement (patience)
         improvement = self._best_error - test_error
-        if improvement > self.config.min_improvement:
+        if improvement > min_improvement:
             self._best_error = test_error
             self._no_improvement_count = 0
         else:
             self._no_improvement_count += 1
 
-        if self._no_improvement_count >= self.config.convergence_patience:
+        if self._no_improvement_count >= self.config.patience:
             return StoppingCriterion.PATIENCE_EXHAUSTED
 
-        # Check uncertainty
-        if mean_uncertainty < self.config.uncertainty_threshold:
+        # Check uncertainty (use convergence_threshold as uncertainty threshold)
+        if mean_uncertainty < self.config.convergence_threshold:
             return StoppingCriterion.LOW_UNCERTAINTY
 
         # Check diminishing returns
         if self.metrics.detect_diminishing_returns(
-            window=self.config.convergence_patience,
-            threshold=self.config.min_improvement
+            window=self.config.patience,
+            threshold=min_improvement
         ):
             return StoppingCriterion.DIMINISHING_RETURNS
 
@@ -474,8 +466,7 @@ class AdaptiveOrchestrator:
 
         Uses more samples when error is high, fewer as we converge.
         """
-        if not self.config.adaptive_budget:
-            return self.config.samples_per_iteration
+        base_samples = self.config.samples_per_iteration
 
         # Scale budget based on how far from convergence
         error_ratio = current_error / self.config.convergence_threshold
@@ -493,8 +484,8 @@ class AdaptiveOrchestrator:
             # Very close - minimal samples
             scale = 0.5
 
-        budget = int(self.config.samples_per_iteration * scale)
-        budget = max(3, min(budget, self.config.samples_per_iteration * 2))
+        budget = int(base_samples * scale)
+        budget = max(3, min(budget, base_samples * 2))
 
         return budget
 
@@ -522,13 +513,13 @@ class AdaptiveOrchestrator:
         except ValueError:
             pass
 
-        # Use acquisition-based selection
+        # Use acquisition-based selection (hardcoded sensible defaults)
         new_params = self.evaluator.suggest_samples_active(
             budget=n_samples,
             coordinates=self._coordinates,
             acquisition_type=self.config.acquisition_strategy,
-            n_candidates=self.config.n_candidates,
-            diversity_weight=self.config.diversity_weight,
+            n_candidates=1000,
+            diversity_weight=0.1,
             existing_samples=existing_samples,
         )
 
@@ -766,7 +757,7 @@ class AdaptiveOrchestrator:
         """Train surrogate model on current dataset."""
         training_config = TrainingConfig(
             surrogate_config=self.config.surrogate_config,
-            use_ensemble=self.config.use_ensemble,
+            use_ensemble=self.config.n_ensemble > 1,
             n_ensemble=self.config.n_ensemble,
             normalize_inputs=True,
             normalize_outputs=True,

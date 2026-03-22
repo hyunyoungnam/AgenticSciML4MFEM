@@ -1,12 +1,13 @@
 """
 Surrogate model module for adaptive learning.
 
-Provides DeepONet-based surrogate models using DeepXDE for predicting
+Provides surrogate model interfaces and training utilities for predicting
 FEM simulation outputs from input parameters.
+
+Note: FNO/Transolver implementation is planned to replace DeepONet.
 """
 
 from .base import SurrogateModel, SurrogateConfig, PredictionResult
-from .deeponet import DeepONetSurrogate
 from .trainer import SurrogateTrainer, TrainingConfig, TrainingResult
 from .evaluator import SurrogateEvaluator, WeakRegion, UncertaintyAnalysis
 
@@ -14,7 +15,6 @@ __all__ = [
     "SurrogateModel",
     "SurrogateConfig",
     "PredictionResult",
-    "DeepONetSurrogate",
     "SurrogateTrainer",
     "TrainingConfig",
     "TrainingResult",

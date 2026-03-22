@@ -17,8 +17,6 @@ import numpy as np
 class SurrogateType(Enum):
     """Types of surrogate models."""
     DEEPONET = auto()
-    FNO = auto()  # Fourier Neural Operator (future)
-    PINN = auto()  # Physics-Informed NN (future)
 
 
 @dataclass

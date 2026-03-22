@@ -6,7 +6,7 @@ validated MFEM mesh files through intelligent mesh morphing. It eliminates
 the tedious manual work of creating FEA datasets for machine learning research.
 
 Key Features:
-- Adaptive learning: Surrogate-guided data generation with DeepONet
+- Adaptive learning: Surrogate-guided data generation with FNO/Transolver
 - R-adaptivity: Error-driven mesh adaptation using TMOP
 - MFEM integration: Native support for MFEM mesh format
 - FEM simulation: Built-in solvers for elasticity and heat transfer
@@ -35,7 +35,6 @@ __author__ = "H.-Y. Nam, Q. Jiang"
 from meshforge.mesh.base import MeshManager
 from meshforge.mesh.mfem_manager import MFEMManager
 from meshforge.morphing import TMOPAdaptivity, AdaptivityConfig, AdaptivityResult
-from meshforge.schema import HeavyData, LightData, Nodes, Elements
 
 # Solver API
 from meshforge.solvers.base import (
@@ -53,9 +52,13 @@ from meshforge.evaluation.pipeline import EvaluationPipeline, EvaluationResult
 # Adaptive Learning API
 from meshforge.orchestration.adaptive import (
     AdaptiveOrchestrator,
-    AdaptiveConfig as AdaptiveOrchestratorConfig,
-    AdaptiveResult as AdaptiveOrchestratorResult,
+    AdaptiveConfig,
+    AdaptiveResult,
 )
+
+# Backwards-compatible aliases
+AdaptiveOrchestratorConfig = AdaptiveConfig
+AdaptiveOrchestratorResult = AdaptiveResult
 
 # Dataset API
 from meshforge.data.dataset import FEMDataset, FEMSample, DatasetConfig
@@ -67,10 +70,6 @@ __all__ = [
     # Core classes - Mesh management
     "MeshManager",
     "MFEMManager",
-    "HeavyData",
-    "LightData",
-    "Nodes",
-    "Elements",
     # R-Adaptivity
     "TMOPAdaptivity",
     "AdaptivityConfig",
@@ -87,8 +86,10 @@ __all__ = [
     "EvaluationResult",
     # Adaptive Learning
     "AdaptiveOrchestrator",
-    "AdaptiveOrchestratorConfig",
-    "AdaptiveOrchestratorResult",
+    "AdaptiveConfig",
+    "AdaptiveResult",
+    "AdaptiveOrchestratorConfig",  # Backwards compat
+    "AdaptiveOrchestratorResult",  # Backwards compat
     # Dataset
     "FEMDataset",
     "FEMSample",

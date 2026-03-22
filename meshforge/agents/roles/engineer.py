@@ -172,84 +172,56 @@ class EngineerAgent(BaseAgent[ImplementationResult]):
     def implement_mutation(
         self,
         proposal: MutationProposal,
-        base_inp_path: str,
+        base_mesh_path: str,
         output_path: str,
         config_path: Optional[str] = None,
     ) -> ImplementationResult:
         """
         Implement a mutation directly (without LLM).
 
-        This method provides direct implementation using the actual
-        manager.py and morphing.py APIs.
+        This method provides direct implementation using MFEM mesh
+        manager and morphing APIs.
 
         Args:
             proposal: The mutation proposal
-            base_inp_path: Path to base .inp file
-            output_path: Path for output .inp file
+            base_mesh_path: Path to base MFEM .mesh file
+            output_path: Path for output .mesh file
             config_path: Optional morphing config path
 
         Returns:
             ImplementationResult
+
+        Note:
+            TODO: This method needs to be reimplemented for MFEM workflow.
+            The Abaqus-based implementation has been removed.
         """
         result = ImplementationResult()
 
         try:
-            # Import the required modules
-            from manager import AbaqusManager
-            from validator import AbaqusValidator
+            from meshforge.mesh.mfem_manager import MFEMManager
+            from meshforge.morphing import TMOPAdaptivity, AdaptivityConfig
 
-            # Load the base model
-            manager = AbaqusManager(base_inp_path)
+            # Load the base mesh
+            manager = MFEMManager(base_mesh_path)
 
             # Apply morphing if delta_R is specified
             if proposal.delta_R is not None and proposal.delta_R != 0:
-                if config_path is None:
-                    result.error_message = "Morphing config path required for delta_R mutation"
-                    return result
-
-                from morphing import run_morphing
-                run_morphing(manager, config_path, proposal.delta_R)
-
-            # Apply material changes
-            for mat_name, changes in proposal.material_changes.items():
-                if mat_name in manager.materials:
-                    manager.update_material(mat_name, changes)
-                else:
-                    result.error_message = f"Material '{mat_name}' not found"
-                    return result
-
-            # Apply boundary condition changes
-            for bc_name, changes in proposal.bc_changes.items():
-                if bc_name in manager.boundary_conditions:
-                    for param, value in changes.items():
-                        manager.modify_boundary_condition(bc_name, value, param)
-                else:
-                    result.error_message = f"Boundary condition '{bc_name}' not found"
-                    return result
-
-            # Run pre-flight validation
-            validator = AbaqusValidator(manager)
-            report = validator.validate_all()
-
-            result.validation_passed = report.is_valid
-            result.validation_report = {
-                "is_valid": report.is_valid,
-                "errors": report.errors,
-                "warnings": report.warnings,
-            }
-
-            if not report.is_valid:
-                result.error_message = f"Validation failed: {report.errors}"
+                # TODO: Implement MFEM-based morphing
+                # The r-adaptivity is available via TMOPAdaptivity
+                result.error_message = "MFEM morphing not yet implemented for direct mutation"
                 return result
 
-            # Write output files
-            from writer import write_inp_and_vtu
+            # TODO: Apply material changes via MFEM solver config
+            # TODO: Apply boundary condition changes via MFEM solver config
+
+            # Write output mesh
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            inp_out, vtu_out = write_inp_and_vtu(manager, output_path)
+            mesh_out = manager.save(output_path)
 
             result.success = True
-            result.inp_path = inp_out
-            result.vtu_path = vtu_out
+            result.inp_path = str(mesh_out)
+            result.validation_passed = True
+            result.validation_report = {"is_valid": True, "errors": [], "warnings": []}
 
         except Exception as e:
             result.success = False

@@ -1,7 +1,7 @@
 """
 Evaluation pipeline for FEA solutions.
 
-Coordinates pre-flight checks, solver execution, and post-simulation
+Coordinates mesh validation, solver execution, and post-simulation
 metric extraction for solution evaluation using MFEM.
 """
 
@@ -11,10 +11,35 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from meshforge.evaluation.preflight import PreflightChecker, PreflightResult, PreflightStatus
 from meshforge.evaluation.metrics import MetricsCalculator, MeshQualityMetrics, calculate_solution_score
 from meshforge.mesh.base import MeshManager
 from meshforge.solvers.base import SolverInterface, PhysicsConfig, SolverResult
+
+
+class PreflightStatus(Enum):
+    """Status of pre-flight mesh validation."""
+    PASSED = "passed"
+    WARNINGS = "warnings"
+    FAILED = "failed"
+
+
+@dataclass
+class PreflightResult:
+    """Result of pre-flight mesh validation."""
+    status: PreflightStatus = PreflightStatus.PASSED
+    score: float = 1.0
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status.value,
+            "score": self.score,
+            "errors": self.errors,
+            "warnings": self.warnings,
+            "metadata": self.metadata,
+        }
 
 
 class EvaluationStage(Enum):
@@ -91,7 +116,7 @@ class EvaluationPipeline:
     Full evaluation pipeline for FEA solutions using MFEM.
 
     Coordinates:
-    1. Pre-flight validation
+    1. Mesh validation
     2. Solver execution (optional, via MFEM)
     3. Post-simulation analysis
     4. Score calculation
@@ -99,7 +124,6 @@ class EvaluationPipeline:
 
     def __init__(
         self,
-        preflight_checker: Optional[PreflightChecker] = None,
         metrics_calculator: Optional[MetricsCalculator] = None,
         run_solver: bool = False,
         solver_timeout: int = 3600,
@@ -110,16 +134,14 @@ class EvaluationPipeline:
         Initialize the evaluation pipeline.
 
         Args:
-            preflight_checker: PreflightChecker instance
             metrics_calculator: MetricsCalculator instance
             run_solver: Whether to run the solver
             solver_timeout: Solver timeout in seconds
             solver: Optional SolverInterface instance (MFEMSolver)
             physics: Optional PhysicsConfig for solver setup
         """
-        self.preflight_checker = preflight_checker or PreflightChecker()
         self.metrics_calculator = metrics_calculator or MetricsCalculator()
-        self.run_solver = run_solver
+        self._run_solver = run_solver
         self.solver_timeout = solver_timeout
         self.solver = solver
         self.physics = physics
@@ -195,7 +217,7 @@ class EvaluationPipeline:
             result.warnings.append(f"Mesh metrics calculation failed: {str(e)}")
 
         # Stage 2: Solver execution (if configured and not skipped)
-        if self.solver is not None and self.run_solver and not skip_solver:
+        if self.solver is not None and self._run_solver and not skip_solver:
             try:
                 result.stage = EvaluationStage.SOLVER
 
@@ -246,7 +268,7 @@ class EvaluationPipeline:
             result.overall_score = calculate_solution_score(
                 result.mesh_metrics,
                 preflight_score,
-                result.convergence_metrics if self.run_solver else None,
+                result.convergence_metrics if self._run_solver else None,
             )
         else:
             result.overall_score = preflight_score * 0.5

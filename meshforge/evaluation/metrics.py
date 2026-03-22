@@ -111,10 +111,10 @@ class MetricsCalculator:
 
     def calculate_from_manager(self, manager) -> MeshQualityMetrics:
         """
-        Calculate mesh quality metrics from an AbaqusManager.
+        Calculate mesh quality metrics from a MeshManager.
 
         Args:
-            manager: AbaqusManager instance
+            manager: MeshManager instance (e.g., MFEMManager)
 
         Returns:
             MeshQualityMetrics

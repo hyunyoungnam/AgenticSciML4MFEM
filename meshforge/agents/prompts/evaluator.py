@@ -112,17 +112,17 @@ Format as a well-structured markdown document that agents can parse.""",
 ## Task
 Generate a Python script (Evaluate.py) that:
 
-1. Loads a morphed .inp file using AbaqusManager
+1. Loads a morphed .mesh file using MFEMManager
 2. Computes mesh quality metrics:
-   - Jacobian ratio (min, avg)
+   - Element quality (min, avg)
    - Aspect ratio (max, avg)
    - Node spacing check
 3. Validates against the guidelines
 4. Returns a score between 0 and 1
 
 The script should:
-- Import from manager.py and validator.py
-- Define a `evaluate_solution(inp_path: str) -> dict` function
+- Import from meshforge.mesh.mfem_manager
+- Define a `evaluate_solution(mesh_path: str) -> dict` function
 - Return a dict with:
   - `score`: float (0-1)
   - `metrics`: dict of computed metrics

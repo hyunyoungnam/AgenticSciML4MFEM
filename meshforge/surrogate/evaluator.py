@@ -15,11 +15,6 @@ from .base import PredictionResult, SurrogateModel
 from .acquisition import (
     AcquisitionFunction,
     AcquisitionType,
-    UncertaintySampling,
-    ExpectedImprovement,
-    QueryByCommittee,
-    UpperConfidenceBound,
-    HybridAcquisition,
     get_acquisition_function,
 )
 
@@ -197,9 +192,6 @@ class SurrogateEvaluator:
                     region = self._create_local_region(params, uncertainty)
                     weak_regions.append(region)
 
-        # Grid-based coverage analysis
-        coverage_gaps = self._find_coverage_gaps(grid_resolution)
-
         # Compute overall statistics
         if uncertainties:
             overall_uncertainty = np.mean(uncertainties)
@@ -208,8 +200,8 @@ class SurrogateEvaluator:
             overall_uncertainty = 0.0
             max_uncertainty = 0.0
 
-        # Merge nearby weak regions
-        weak_regions = self._merge_nearby_regions(weak_regions)
+        # Deduplicate overlapping weak regions
+        weak_regions = self._deduplicate_regions(weak_regions)
 
         # Compute priorities
         for region in weak_regions:
@@ -219,11 +211,9 @@ class SurrogateEvaluator:
             weak_regions=weak_regions,
             overall_uncertainty=overall_uncertainty,
             max_uncertainty=max_uncertainty,
-            coverage_gaps=coverage_gaps,
             metrics={
                 "n_probe_samples": n_probe_samples,
                 "n_weak_regions": len(weak_regions),
-                "n_coverage_gaps": len(coverage_gaps),
             }
         )
 
@@ -266,8 +256,8 @@ class SurrogateEvaluator:
                 region = self._create_local_region(params_dict, error, metric="error")
                 weak_regions.append(region)
 
-        # Merge and prioritize
-        weak_regions = self._merge_nearby_regions(weak_regions)
+        # Deduplicate and prioritize
+        weak_regions = self._deduplicate_regions(weak_regions)
         for region in weak_regions:
             region.priority = self._compute_priority(region)
 
@@ -319,35 +309,23 @@ class SurrogateEvaluator:
             metric_value=metric_value,
         )
 
-    def _find_coverage_gaps(self, resolution: int) -> List[WeakRegion]:
-        """Find gaps in parameter space coverage using grid."""
-        # This would require access to training data
-        # For now, return empty list
-        # TODO: Implement with training data access
-        return []
-
-    def _merge_nearby_regions(
+    def _deduplicate_regions(
         self,
         regions: List[WeakRegion],
         overlap_threshold: float = 0.5
     ) -> List[WeakRegion]:
-        """Merge overlapping weak regions."""
+        """Remove duplicate/overlapping weak regions, keeping highest metric value."""
         if not regions:
             return regions
 
-        # Simple merging: keep distinct regions
-        # TODO: Implement proper overlap detection and merging
         merged = []
         for region in regions:
-            # Check if region overlaps significantly with existing
             is_redundant = False
-            for existing in merged:
+            for i, existing in enumerate(merged):
                 overlap = self._compute_overlap(region, existing)
                 if overlap > overlap_threshold:
-                    # Keep the one with higher metric value
                     if region.metric_value > existing.metric_value:
-                        merged.remove(existing)
-                        merged.append(region)
+                        merged[i] = region
                     is_redundant = True
                     break
 
@@ -357,7 +335,7 @@ class SurrogateEvaluator:
         return merged
 
     def _compute_overlap(self, region1: WeakRegion, region2: WeakRegion) -> float:
-        """Compute overlap ratio between two regions."""
+        """Compute Jaccard-like overlap ratio between two regions."""
         overlap_volume = 1.0
         region1_volume = 1.0
         region2_volume = 1.0
@@ -366,7 +344,6 @@ class SurrogateEvaluator:
             r1_min, r1_max = region1.parameter_ranges.get(name, (0, 1))
             r2_min, r2_max = region2.parameter_ranges.get(name, (0, 1))
 
-            # Overlap in this dimension
             overlap_min = max(r1_min, r2_min)
             overlap_max = min(r1_max, r2_max)
             overlap_size = max(0, overlap_max - overlap_min)
@@ -375,11 +352,11 @@ class SurrogateEvaluator:
             region1_volume *= (r1_max - r1_min)
             region2_volume *= (r2_max - r2_min)
 
-        if region1_volume + region2_volume - overlap_volume < 1e-10:
+        union = region1_volume + region2_volume - overlap_volume
+        if union < 1e-10:
             return 0.0
 
-        # Jaccard-like overlap
-        return overlap_volume / (region1_volume + region2_volume - overlap_volume)
+        return overlap_volume / union
 
     def _compute_priority(self, region: WeakRegion) -> float:
         """Compute sampling priority for a region."""

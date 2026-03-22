@@ -148,9 +148,9 @@ You are implementing an FEA model mutation. Your task is to:
 6. Verify the output files exist
 
 ## Important Requirements
-- Use the AbaqusManager class from manager.py
-- For morphing, use run_morphing() from morphing.py with delta_R={proposal.delta_R}
-- For file output, use write_inp_and_vtu() from writer.py
+- Use the MFEMManager class from meshforge.mesh.mfem_manager
+- For r-adaptivity, use TMOPAdaptivity from meshforge.morphing
+- For file output, use manager.save() to write the mesh file
 - Run validation and check for mesh quality issues
 
 ## Morphing Config
@@ -438,7 +438,7 @@ Output the configuration content.
 Verify the implementation by:
 
 1. Read the file: {inp_path}
-2. Load it using AbaqusManager from manager.py
+2. Load it using MFEMManager from meshforge.mesh.mfem_manager
 3. Check that the geometry reflects delta_R = {expected_delta_R}
 4. Report mesh quality metrics
 

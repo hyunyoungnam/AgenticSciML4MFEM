@@ -38,7 +38,7 @@ class AdaptiveProposal:
 ADAPTIVE_PROPOSER_SYSTEM = """You are an expert in scientific machine learning and surrogate model training.
 
 Your role is to propose new FEM simulation parameters that will most effectively improve
-the surrogate model (DeepONet). You analyze regions where the model has high error or
+the surrogate model (FNO/Transolver). You analyze regions where the model has high error or
 uncertainty and suggest targeted new simulations.
 
 Key principles:

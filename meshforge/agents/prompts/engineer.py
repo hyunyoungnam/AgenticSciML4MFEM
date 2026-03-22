@@ -1,8 +1,8 @@
 """
 Prompts for the Engineer agent.
 
-The Engineer implements approved mutations using the manager.py
-and morphing.py APIs, translating high-level proposals into code.
+The Engineer implements approved mutations using MFEMManager
+and morphing APIs, translating high-level proposals into code.
 """
 
 ENGINEER_PROMPTS = {
@@ -10,15 +10,15 @@ ENGINEER_PROMPTS = {
 
 Your role is to:
 1. Translate approved mutation proposals into implementation actions
-2. Use the manager.py and morphing.py APIs correctly
+2. Use the MFEMManager and morphing APIs correctly
 3. Ensure all modifications are properly applied
 4. Validate the implementation before solver execution
 
 You have expertise in:
-- Abaqus .inp file structure
-- AbaqusManager API (get_nodes, update_nodes, update_material, etc.)
-- Morphing operations (run_morphing with config files)
-- Pre-flight validation using validator.py
+- MFEM mesh file structure
+- MFEMManager API (get_nodes, update_nodes, save, etc.)
+- R-adaptivity operations (TMOPAdaptivity)
+- MFEM solver integration
 
 Your implementation style:
 - Be precise and methodical
@@ -28,10 +28,9 @@ Your implementation style:
 - Handle errors gracefully
 
 You work with:
-- AbaqusManager for model access/modification
-- run_morphing() for geometry changes
-- AbaqusValidator for pre-flight checks
-- AbaqusWriter for output generation""",
+- MFEMManager for mesh access/modification
+- TMOPAdaptivity for r-adaptivity operations
+- MFEMSolver for FEM simulations""",
 
     "implement_mutation": """Implement the approved mutation proposal.
 
@@ -44,42 +43,39 @@ You work with:
 - bc_changes: {bc_changes}
 
 ## Model Info
-- Base .inp path: {base_inp_path}
+- Base mesh path: {base_inp_path}
 - Output path: {output_path}
 - Morphing config: {config_path}
 
 ## API Reference
 ```python
 # Manager API
-manager = AbaqusManager(inp_path)
+from meshforge.mesh.mfem_manager import MFEMManager
+manager = MFEMManager(mesh_path)
 nodes = manager.get_nodes()  # Returns numpy array
 manager.update_nodes(new_coords)
-manager.update_material(name, properties)
-manager.modify_boundary_condition(name, value, param)
+manager.save(output_path)
 
-# Morphing API
-from meshforge.morphing import run_morphing
-new_coords = run_morphing(manager, config_path, delta_R)
+# R-Adaptivity API
+from meshforge.morphing import TMOPAdaptivity, AdaptivityConfig
+adaptivity = TMOPAdaptivity(AdaptivityConfig())
+result = adaptivity.adapt(manager, error_field)
 
-# Writer API
-from meshforge.writer import write_inp_and_vtu
-inp_out, vtu_out = write_inp_and_vtu(manager, output_path)
-
-# Validator API
-from meshforge.validator import AbaqusValidator
-validator = AbaqusValidator(manager)
-report = validator.validate_all()
+# Solver API
+from meshforge.solvers.mfem_solver import MFEMSolver
+solver = MFEMSolver(order=1)
+solver.setup(manager, physics_config)
+result = solver.solve(output_dir)
 ```
 
 ## Task
 Provide the implementation as a Python code block that:
 
-1. Loads the base model
+1. Loads the base mesh
 2. Applies the morphing transformation (if delta_R specified)
 3. Updates material properties (if specified)
 4. Modifies boundary conditions (if specified)
-5. Runs pre-flight validation
-6. Writes the output files
+5. Writes the output files
 
 Structure your response as:
 
@@ -193,8 +189,8 @@ Adjust parameters appropriately for the requested delta_R.""",
 Verify that the implementation was successful:
 
 **File Verification**:
-- [ ] Output .inp file exists
-- [ ] Output .vtu file exists (if applicable)
+- [ ] Output .mesh file exists
+- [ ] Output solution files exist (if applicable)
 - [ ] File sizes are reasonable
 
 **Validation Results**:

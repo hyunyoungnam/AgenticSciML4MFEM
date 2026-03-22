@@ -3,6 +3,9 @@ Surrogate model trainer.
 
 Handles the training workflow for surrogate models including
 data preparation, training, validation, and model checkpointing.
+
+Note: FNO/Transolver implementation is planned. Currently provides
+stub implementation that raises NotImplementedError.
 """
 
 from dataclasses import dataclass, field
@@ -12,7 +15,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from .base import SurrogateConfig, SurrogateModel
-from .deeponet import DeepONetSurrogate, DeepONetEnsemble
 
 
 @dataclass
@@ -201,77 +203,19 @@ class SurrogateTrainer:
             # Update config output dimension
             self.config.surrogate_config.output_dim = output_dim
 
-            # Create model
-            if self.config.use_ensemble:
-                self._model = DeepONetEnsemble(
-                    self.config.surrogate_config,
-                    n_models=self.config.n_ensemble
-                )
-            else:
-                self._model = DeepONetSurrogate(self.config.surrogate_config)
-
-            # Build model
-            # For DeepONet, we treat each parameter as a "sensor"
-            # So num_sensors = 1 and input_dim = n_params
-            self._model.build(
-                input_dim=1,
-                coord_dim=coord_dim,
-                num_sensors=n_params
+            # TODO: Implement FNO/Transolver surrogate model
+            # The DeepONet implementation has been removed.
+            # This will be replaced with FNO or Transolver.
+            raise NotImplementedError(
+                "Surrogate model training not yet implemented. "
+                "FNO/Transolver implementation is planned."
             )
 
-            # Train
-            history = self._model.train(
-                branch_inputs=train_params,
-                trunk_inputs=coords,
-                outputs=train_outputs,
-                validation_split=0.1
-            )
-
-            # Evaluate on test set
-            if len(test_params) > 0:
-                predictions = self._model.predict(test_params, coords)
-
-                # Denormalize for error computation
-                pred_values = predictions.values
-                if self.config.normalize_outputs and self._output_normalizer:
-                    pred_values = self._output_normalizer.inverse_transform(
-                        pred_values.reshape(-1, output_dim)
-                    ).reshape(pred_values.shape)
-                    test_outputs_denorm = self._output_normalizer.inverse_transform(
-                        test_outputs.reshape(-1, output_dim)
-                    ).reshape(test_outputs.shape)
-                else:
-                    test_outputs_denorm = test_outputs
-
-                errors = self._model.compute_error(
-                    pred_values.flatten(),
-                    test_outputs_denorm.flatten()
-                )
-            else:
-                errors = {}
-
-            # Save model if directory specified
-            model_path = None
-            if self.config.save_dir:
-                model_path = self.config.save_dir / "surrogate_model"
-                self._model.save(model_path)
-
-                # Save normalization params
-                import json
-                norm_path = self.config.save_dir / "normalization.json"
-                with open(norm_path, "w") as f:
-                    json.dump(norm_params, f, indent=2)
-
+        except NotImplementedError:
             return TrainingResult(
-                success=True,
-                train_loss=history.get("best_loss", 0.0),
-                test_loss=errors.get("mse", 0.0),
-                metrics=errors,
-                history=history,
-                model_path=model_path,
-                normalization_params=norm_params,
+                success=False,
+                error_message="FNO/Transolver surrogate model not yet implemented.",
             )
-
         except Exception as e:
             return TrainingResult(
                 success=False,

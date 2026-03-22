@@ -267,10 +267,10 @@ class EvaluatorAgent(BaseAgent[EvaluationCriteria]):
 
     def create_model_info(self, manager) -> Dict[str, Any]:
         """
-        Create model info dict from an AbaqusManager instance.
+        Create model info dict from a MeshManager instance.
 
         Args:
-            manager: AbaqusManager instance
+            manager: MeshManager instance (e.g., MFEMManager)
 
         Returns:
             Dict with model information for context

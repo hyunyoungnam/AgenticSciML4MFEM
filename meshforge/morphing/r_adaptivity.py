@@ -9,7 +9,7 @@ Key concepts:
 1. Target matrix is constructed as a spatial function of error - smaller target
    element size in high-error regions attracts nodes there.
 2. TMOP's barrier functions prevent element tangling and ensure mesh validity.
-3. The error field from surrogate model (e.g., DeepONet) drives the adaptation.
+3. The error field from surrogate model (e.g., FNO/Transolver) drives the adaptation.
 
 Reference:
     Dobrev et al., "The Target-Matrix Optimization Paradigm for High-Order Meshes"

@@ -2,11 +2,13 @@
 Common Fixtures for pytest test suite.
 
 This module provides shared fixtures for testing MFEM mesh file
-management, morphing, and solver functionality.
+management, morphing, solver functionality, surrogate models,
+acquisition functions, and active learning orchestration.
 """
 
 import pytest
 from pathlib import Path
+from unittest.mock import MagicMock
 import numpy as np
 
 
@@ -312,3 +314,324 @@ def sample_material_properties():
         'nu': 0.3,      # Poisson's ratio
         'density': 7850.0,  # kg/m^3
     }
+
+
+# ============================================================================
+# Surrogate Model Fixtures
+# ============================================================================
+
+@pytest.fixture
+def surrogate_config():
+    """
+    Fixture providing default surrogate configuration.
+
+    Returns:
+        SurrogateConfig: Default configuration for DeepONet models
+    """
+    try:
+        from meshforge.surrogate.base import SurrogateConfig
+        return SurrogateConfig(
+            branch_layers=[64, 64],
+            trunk_layers=[64, 64],
+            activation="tanh",
+            learning_rate=1e-3,
+            epochs=100,
+            batch_size=32,
+        )
+    except ImportError:
+        pytest.skip("meshforge.surrogate not available")
+
+
+@pytest.fixture
+def sample_branch_inputs():
+    """
+    Fixture providing sample branch network inputs.
+
+    Returns:
+        np.ndarray: Shape (n_samples, n_sensors * input_dim)
+    """
+    n_samples = 10
+    n_sensors = 5
+    input_dim = 2
+    return np.random.randn(n_samples, n_sensors * input_dim).astype(np.float32)
+
+
+@pytest.fixture
+def sample_trunk_inputs():
+    """
+    Fixture providing sample trunk network inputs (coordinates).
+
+    Returns:
+        np.ndarray: Shape (n_points, coord_dim)
+    """
+    n_points = 50
+    coord_dim = 2
+    return np.random.randn(n_points, coord_dim).astype(np.float32)
+
+
+@pytest.fixture
+def sample_surrogate_outputs(sample_branch_inputs, sample_trunk_inputs):
+    """
+    Fixture providing sample outputs for surrogate training.
+
+    Returns:
+        np.ndarray: Shape (n_samples, n_points, output_dim)
+    """
+    n_samples = sample_branch_inputs.shape[0]
+    n_points = sample_trunk_inputs.shape[0]
+    output_dim = 1
+    return np.random.randn(n_samples, n_points, output_dim).astype(np.float32)
+
+
+# ============================================================================
+# Mock Model Fixtures
+# ============================================================================
+
+@pytest.fixture
+def mock_surrogate_model():
+    """
+    Fixture providing a mock surrogate model with uncertainty.
+
+    Returns:
+        MagicMock: Mock model with predict method
+    """
+    try:
+        from meshforge.surrogate.base import PredictionResult
+    except ImportError:
+        pytest.skip("meshforge.surrogate not available")
+
+    model = MagicMock()
+
+    def mock_predict(params, coords):
+        n_points = coords.shape[0]
+        return PredictionResult(
+            values=np.random.randn(1, n_points, 1),
+            uncertainty=np.abs(np.random.randn(1, n_points, 1)) * 0.1,
+            coordinates=coords,
+            metadata={}
+        )
+
+    model.predict = mock_predict
+    model._is_trained = True
+    return model
+
+
+@pytest.fixture
+def mock_ensemble_model():
+    """
+    Fixture providing a mock ensemble model with multiple members.
+
+    Returns:
+        MagicMock: Mock ensemble with _models attribute
+    """
+    try:
+        from meshforge.surrogate.base import PredictionResult
+    except ImportError:
+        pytest.skip("meshforge.surrogate not available")
+
+    model = MagicMock()
+
+    # Create mock ensemble members
+    members = []
+    for _ in range(5):
+        member = MagicMock()
+        def member_predict(params, coords):
+            n_points = coords.shape[0]
+            return PredictionResult(
+                values=np.random.randn(1, n_points, 1),
+                coordinates=coords,
+                metadata={}
+            )
+        member.predict = member_predict
+        members.append(member)
+
+    model._models = members
+    model._is_trained = True
+
+    def ensemble_predict(params, coords):
+        n_points = coords.shape[0]
+        return PredictionResult(
+            values=np.random.randn(1, n_points, 1),
+            uncertainty=np.abs(np.random.randn(1, n_points, 1)) * 0.1,
+            coordinates=coords,
+            metadata={"uncertainty_method": "ensemble_std"}
+        )
+
+    model.predict = ensemble_predict
+    return model
+
+
+# ============================================================================
+# Error Analysis Fixtures
+# ============================================================================
+
+@pytest.fixture
+def sample_error_field_2d(sample_node_data_2d):
+    """
+    Fixture providing a sample error field with hotspot.
+
+    Returns:
+        np.ndarray: Error values per node
+    """
+    coords = sample_node_data_2d['coordinates']
+    # Error concentrated near (1.5, 0.5)
+    hotspot_center = np.array([1.5, 0.5])
+    distances = np.linalg.norm(coords - hotspot_center, axis=1)
+    return np.exp(-distances)
+
+
+@pytest.fixture
+def sample_grid_coordinates():
+    """
+    Fixture providing a regular 2D grid of coordinates.
+
+    Returns:
+        np.ndarray: Shape (n_points, 2)
+    """
+    x = np.linspace(0, 10, 20)
+    y = np.linspace(0, 10, 20)
+    xx, yy = np.meshgrid(x, y)
+    return np.column_stack([xx.ravel(), yy.ravel()])
+
+
+@pytest.fixture
+def sample_true_field(sample_grid_coordinates):
+    """
+    Fixture providing sample ground truth field values.
+
+    Returns:
+        np.ndarray: Field values at grid coordinates
+    """
+    coords = sample_grid_coordinates
+    return np.sin(coords[:, 0]) * np.cos(coords[:, 1])
+
+
+# ============================================================================
+# Active Learning Fixtures
+# ============================================================================
+
+@pytest.fixture
+def sample_parameter_bounds():
+    """
+    Fixture providing parameter bounds for active learning.
+
+    Returns:
+        dict: Parameter name to (min, max) bounds
+    """
+    return {
+        "delta_R": (-0.5, 0.5),
+        "E": (100e9, 300e9),
+        "nu": (0.25, 0.35),
+    }
+
+
+@pytest.fixture
+def sample_candidate_params(sample_parameter_bounds):
+    """
+    Fixture providing candidate parameter samples.
+
+    Returns:
+        np.ndarray: Shape (n_candidates, n_params)
+    """
+    n_candidates = 50
+    bounds = sample_parameter_bounds
+    param_names = list(bounds.keys())
+
+    candidates = np.zeros((n_candidates, len(param_names)))
+    for i, name in enumerate(param_names):
+        min_val, max_val = bounds[name]
+        candidates[:, i] = np.random.uniform(min_val, max_val, n_candidates)
+
+    return candidates
+
+
+@pytest.fixture
+def adaptive_config(tmp_path, beam_quad_mesh_file):
+    """
+    Fixture providing adaptive orchestrator configuration.
+
+    Returns:
+        AdaptiveConfig: Configuration for testing
+    """
+    try:
+        from meshforge.orchestration.adaptive import AdaptiveConfig
+    except ImportError:
+        pytest.skip("meshforge.orchestration not available")
+
+    output_dir = tmp_path / "adaptive_output"
+    output_dir.mkdir(exist_ok=True)
+
+    return AdaptiveConfig(
+        base_mesh_path=beam_quad_mesh_file,
+        output_dir=output_dir,
+        parameter_bounds={"delta_R": (-0.5, 0.5)},
+        initial_samples=5,
+        max_samples=20,
+        convergence_threshold=0.01,
+    )
+
+
+# ============================================================================
+# Benchmark Problem Fixtures
+# ============================================================================
+
+@pytest.fixture
+def plate_with_hole_mesh_content():
+    """
+    Fixture providing plate with hole mesh content.
+
+    Returns:
+        str: MFEM mesh file content
+    """
+    return """MFEM mesh v1.0
+
+dimension
+2
+
+elements
+4
+1 3 0 1 5 4
+1 3 1 2 6 5
+1 3 4 5 9 8
+1 3 5 6 10 9
+
+boundary
+8
+1 1 0 1
+1 1 1 2
+2 1 2 6
+2 1 6 10
+3 1 10 9
+3 1 9 8
+4 1 8 4
+4 1 4 0
+
+vertices
+12
+2
+0 0
+1 0
+2 0
+0 1
+1 1
+2 1
+0 2
+1 2
+2 2
+0 3
+1 3
+2 3
+"""
+
+
+@pytest.fixture
+def plate_with_hole_mesh_file(tmp_path, plate_with_hole_mesh_content):
+    """
+    Fixture providing a temporary plate with hole mesh file.
+
+    Returns:
+        Path: Path to mesh file
+    """
+    mesh_file = tmp_path / "plate_with_hole.mesh"
+    mesh_file.write_text(plate_with_hole_mesh_content, encoding='utf-8')
+    return mesh_file

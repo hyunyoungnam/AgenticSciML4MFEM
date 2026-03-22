@@ -17,17 +17,24 @@ from pathlib import Path
 # Add parent directory to path to import modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Import will fail if PyMFEM is not installed - skip tests gracefully
+# Check if PyMFEM is installed
 try:
-    from meshforge.mesh.mfem_manager import MFEMManager
-    from meshforge.mesh.base import MeshManager
-    from meshforge.evaluation.pipeline import EvaluationPipeline
-    from meshforge.evaluation.preflight import PreflightChecker
-    from meshforge.evaluation.metrics import MetricsCalculator
+    import mfem.ser as mfem
     MFEM_AVAILABLE = True
 except ImportError:
     MFEM_AVAILABLE = False
+
+# Import meshforge classes (these don't require mfem at import time)
+if MFEM_AVAILABLE:
+    from meshforge.mesh.mfem_manager import MFEMManager
+    from meshforge.mesh.base import MeshManager
+    from meshforge.evaluation.pipeline import EvaluationPipeline
+    from meshforge.evaluation.metrics import MetricsCalculator
+else:
     MFEMManager = None
+    MeshManager = None
+    EvaluationPipeline = None
+    MetricsCalculator = None
 
 
 @pytest.mark.skipif(not MFEM_AVAILABLE, reason="PyMFEM not installed")
@@ -185,9 +192,8 @@ class TestEvaluationPipelineIntegration:
         """Test evaluation pipeline with MFEM mesh."""
         manager = MFEMManager(str(beam_quad_mesh_file))
 
-        # Create evaluation pipeline
+        # Create evaluation pipeline (no preflight checker - removed)
         pipeline = EvaluationPipeline(
-            preflight_checker=PreflightChecker(),
             metrics_calculator=MetricsCalculator(),
             run_solver=False,  # Skip solver for basic test
         )
@@ -197,7 +203,6 @@ class TestEvaluationPipelineIntegration:
 
         # Verify evaluation succeeded
         assert result is not None
-        assert result.preflight_passed, "Preflight should pass for valid mesh"
         assert result.overall_score > 0, "Should have positive score"
 
     def test_evaluation_pipeline_with_modified_mesh(self, beam_quad_mesh_file):
@@ -208,9 +213,8 @@ class TestEvaluationPipelineIntegration:
         nodes = manager.get_nodes()
         manager.update_nodes(nodes * 1.1)
 
-        # Create evaluation pipeline
+        # Create evaluation pipeline (no preflight checker - removed)
         pipeline = EvaluationPipeline(
-            preflight_checker=PreflightChecker(),
             metrics_calculator=MetricsCalculator(),
             run_solver=False,
         )
@@ -220,7 +224,6 @@ class TestEvaluationPipelineIntegration:
 
         # Verification should still work on modified mesh
         assert result is not None
-        assert result.preflight_passed, "Preflight should pass for scaled mesh"
 
 
 @pytest.mark.skipif(not MFEM_AVAILABLE, reason="PyMFEM not installed")
