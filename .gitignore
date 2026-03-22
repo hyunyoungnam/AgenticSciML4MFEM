@@ -37,6 +37,7 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+tests/test_outputs/
 
 # Virtual environments
 venv/
@@ -48,6 +49,8 @@ ENV/
 .vscode/
 .idea/
 .claude/
+CLAUDE.md
+roadmap.md
 *.swp
 *.swo
 *~
