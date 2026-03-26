@@ -9,51 +9,58 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 
 
 class SurrogateType(Enum):
     """Types of surrogate models."""
-    DEEPONET = auto()
+    TRANSOLVER = auto()
+    ENSEMBLE = auto()
 
 
 @dataclass
-class SurrogateConfig:
+class TransolverConfig:
     """
-    Configuration for surrogate model.
+    Configuration for Transolver model.
 
     Attributes:
-        model_type: Type of surrogate model
-        branch_layers: Layer sizes for branch network (encodes input functions)
-        trunk_layers: Layer sizes for trunk network (encodes coordinates)
-        activation: Activation function name
+        slice_num: Number of physics slices (key hyperparameter)
+        n_heads: Number of attention heads
+        d_model: Hidden dimension
+        n_layers: Number of transformer layers
+        mlp_ratio: FFN expansion ratio
+        dropout: Dropout rate
         learning_rate: Initial learning rate
         batch_size: Training batch size
         epochs: Maximum training epochs
         patience: Early stopping patience
-        output_dim: Dimension of output field
+        output_dim: Dimension of output field (e.g., 3 for displacement)
         checkpoint_dir: Directory for saving checkpoints
     """
-    model_type: SurrogateType = SurrogateType.DEEPONET
-    branch_layers: List[int] = field(default_factory=lambda: [128, 128, 128])
-    trunk_layers: List[int] = field(default_factory=lambda: [128, 128, 128])
-    activation: str = "tanh"
+    slice_num: int = 32
+    n_heads: int = 8
+    d_model: int = 256
+    n_layers: int = 6
+    mlp_ratio: float = 4.0
+    dropout: float = 0.0
     learning_rate: float = 1e-3
     batch_size: int = 32
-    epochs: int = 10000
-    patience: int = 1000
-    output_dim: int = 1
+    epochs: int = 1000
+    patience: int = 100
+    output_dim: int = 3
     checkpoint_dir: Optional[Path] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
         return {
-            "model_type": self.model_type.name,
-            "branch_layers": self.branch_layers,
-            "trunk_layers": self.trunk_layers,
-            "activation": self.activation,
+            "slice_num": self.slice_num,
+            "n_heads": self.n_heads,
+            "d_model": self.d_model,
+            "n_layers": self.n_layers,
+            "mlp_ratio": self.mlp_ratio,
+            "dropout": self.dropout,
             "learning_rate": self.learning_rate,
             "batch_size": self.batch_size,
             "epochs": self.epochs,
@@ -61,6 +68,23 @@ class SurrogateConfig:
             "output_dim": self.output_dim,
             "checkpoint_dir": str(self.checkpoint_dir) if self.checkpoint_dir else None,
         }
+
+
+@dataclass
+class EnsembleConfig:
+    """
+    Configuration for ensemble model.
+
+    Attributes:
+        n_members: Number of ensemble members
+        member_config: Configuration for each ensemble member
+    """
+    n_members: int = 5
+    member_config: TransolverConfig = field(default_factory=TransolverConfig)
+
+
+# Alias for backward compatibility
+SurrogateConfig = TransolverConfig
 
 
 @dataclass
@@ -105,7 +129,7 @@ class SurrogateModel(ABC):
     (geometry, material properties, boundary conditions).
     """
 
-    def __init__(self, config: SurrogateConfig):
+    def __init__(self, config: TransolverConfig):
         """
         Initialize surrogate model.
 
@@ -114,59 +138,54 @@ class SurrogateModel(ABC):
         """
         self.config = config
         self._is_trained = False
-        self._model = None
 
     @abstractmethod
     def build(
         self,
         input_dim: int,
         coord_dim: int,
-        num_sensors: int
+        num_points: int
     ) -> None:
         """
         Build the model architecture.
 
         Args:
-            input_dim: Dimension of input parameters (branch input)
-            coord_dim: Dimension of coordinates (trunk input, typically 2 or 3)
-            num_sensors: Number of sensor points (for branch network)
+            input_dim: Dimension of input parameters
+            coord_dim: Dimension of coordinates (typically 2 or 3)
+            num_points: Number of mesh points
         """
         pass
 
     @abstractmethod
-    def train(
+    def forward(
         self,
-        branch_inputs: np.ndarray,
-        trunk_inputs: np.ndarray,
-        outputs: np.ndarray,
-        validation_split: float = 0.1
-    ) -> Dict[str, Any]:
+        params: "torch.Tensor",
+        coords: "torch.Tensor"
+    ) -> "torch.Tensor":
         """
-        Train the surrogate model.
+        Forward pass through the model.
 
         Args:
-            branch_inputs: Input function values at sensor points (N, num_sensors)
-            trunk_inputs: Coordinate points (N * num_points, coord_dim)
-            outputs: Target field values (N * num_points, output_dim)
-            validation_split: Fraction of data for validation
+            params: Input parameters (B, n_params)
+            coords: Mesh coordinates (B, N, coord_dim)
 
         Returns:
-            Training history dictionary
+            Predicted field values (B, N, output_dim)
         """
         pass
 
     @abstractmethod
     def predict(
         self,
-        branch_input: np.ndarray,
-        trunk_input: np.ndarray
+        params: np.ndarray,
+        coords: np.ndarray
     ) -> PredictionResult:
         """
         Make predictions with the trained model.
 
         Args:
-            branch_input: Input function values (1, num_sensors) or (N, num_sensors)
-            trunk_input: Query coordinates (num_points, coord_dim)
+            params: Input parameters (N, n_params) or (n_params,)
+            coords: Query coordinates (num_points, coord_dim)
 
         Returns:
             PredictionResult with predictions and uncertainty

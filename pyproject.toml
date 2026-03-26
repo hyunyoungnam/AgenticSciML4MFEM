@@ -26,7 +26,8 @@ keywords = [
     "active-learning",
     "multi-agent",
     "llm",
-    "deeponet",
+    "transolver",
+    "neural-operator",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -63,13 +64,13 @@ mfem = [
     "mfem>=4.6",
 ]
 surrogate = [
-    "deepxde>=1.11.0",
-    "tensorflow>=2.10.0",  # or torch>=2.0.0 as alternative backend
+    "torch>=2.0.0",
+    "einops>=0.7.0",
 ]
 all = [
     "mfem>=4.6",
-    "deepxde>=1.11.0",
-    "tensorflow>=2.10.0",
+    "torch>=2.0.0",
+    "einops>=0.7.0",
     "pyvista>=0.40.0",
 ]
 

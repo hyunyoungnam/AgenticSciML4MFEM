@@ -63,5 +63,8 @@ nul
 # Project specific
 outputs/
 Paper/
+img/
+inputs/
+examples/
 *.inp.bak
 *.log

@@ -3,9 +3,6 @@ Surrogate model trainer.
 
 Handles the training workflow for surrogate models including
 data preparation, training, validation, and model checkpointing.
-
-Note: FNO/Transolver implementation is planned. Currently provides
-stub implementation that raises NotImplementedError.
 """
 
 from dataclasses import dataclass, field
@@ -13,8 +10,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
-from .base import SurrogateConfig, SurrogateModel
+from .base import TransolverConfig, EnsembleConfig, SurrogateModel
+from .transolver import TransolverModel
+from .ensemble import EnsembleModel
 
 
 @dataclass
@@ -33,7 +35,7 @@ class TrainingConfig:
         save_dir: Directory to save trained model
         log_dir: Directory for training logs
     """
-    surrogate_config: SurrogateConfig = field(default_factory=SurrogateConfig)
+    surrogate_config: TransolverConfig = field(default_factory=TransolverConfig)
     use_ensemble: bool = True
     n_ensemble: int = 5
     normalize_inputs: bool = True
@@ -199,23 +201,148 @@ class SurrogateTrainer:
             n_params = train_params.shape[1]
             coord_dim = coords.shape[1]
             output_dim = train_outputs.shape[-1] if train_outputs.ndim > 2 else 1
+            num_points = coords.shape[0]
 
             # Update config output dimension
             self.config.surrogate_config.output_dim = output_dim
 
-            # TODO: Implement FNO/Transolver surrogate model
-            # The DeepONet implementation has been removed.
-            # This will be replaced with FNO or Transolver.
-            raise NotImplementedError(
-                "Surrogate model training not yet implemented. "
-                "FNO/Transolver implementation is planned."
+            # Create model
+            if self.config.use_ensemble:
+                ensemble_config = EnsembleConfig(
+                    n_members=self.config.n_ensemble,
+                    member_config=self.config.surrogate_config
+                )
+                model = EnsembleModel(ensemble_config)
+            else:
+                model = TransolverModel(self.config.surrogate_config)
+
+            model.build(n_params, coord_dim, num_points)
+
+            # Setup device
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.to(device)
+
+            # Convert data to tensors
+            train_params_t = torch.tensor(train_params, dtype=torch.float32)
+            train_outputs_t = torch.tensor(train_outputs, dtype=torch.float32)
+            coords_t = torch.tensor(coords, dtype=torch.float32, device=device)
+
+            test_params_t = torch.tensor(test_params, dtype=torch.float32, device=device)
+            test_outputs_t = torch.tensor(test_outputs, dtype=torch.float32, device=device)
+
+            # Create data loader
+            dataset = TensorDataset(train_params_t, train_outputs_t)
+            loader = DataLoader(
+                dataset,
+                batch_size=self.config.surrogate_config.batch_size,
+                shuffle=True
             )
 
-        except NotImplementedError:
-            return TrainingResult(
-                success=False,
-                error_message="FNO/Transolver surrogate model not yet implemented.",
+            # Setup optimizer and loss
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=self.config.surrogate_config.learning_rate
             )
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=20, verbose=False
+            )
+            criterion = nn.MSELoss()
+
+            # Training loop
+            history = {'train_loss': [], 'test_loss': []}
+            best_test_loss = float('inf')
+            patience_counter = 0
+            best_state = None
+
+            for epoch in range(self.config.surrogate_config.epochs):
+                # Train epoch
+                model.train()
+                epoch_loss = 0.0
+
+                for batch_params, batch_outputs in loader:
+                    batch_params = batch_params.to(device)
+                    batch_outputs = batch_outputs.to(device)
+
+                    # Expand coords for batch
+                    batch_coords = coords_t.unsqueeze(0).expand(
+                        batch_params.shape[0], -1, -1
+                    )
+
+                    optimizer.zero_grad()
+                    predictions = model.forward(batch_params, batch_coords)
+                    loss = criterion(predictions, batch_outputs)
+                    loss.backward()
+                    optimizer.step()
+
+                    epoch_loss += loss.item() * batch_params.shape[0]
+
+                train_loss = epoch_loss / len(train_params)
+                history['train_loss'].append(train_loss)
+
+                # Evaluate on test set
+                model.eval()
+                with torch.no_grad():
+                    test_coords = coords_t.unsqueeze(0).expand(
+                        test_params_t.shape[0], -1, -1
+                    )
+                    test_preds = model.forward(test_params_t, test_coords)
+                    test_loss = criterion(test_preds, test_outputs_t).item()
+                    history['test_loss'].append(test_loss)
+
+                scheduler.step(test_loss)
+
+                # Early stopping
+                if test_loss < best_test_loss:
+                    best_test_loss = test_loss
+                    patience_counter = 0
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= self.config.surrogate_config.patience:
+                    break
+
+                # Callback
+                if callback:
+                    callback(epoch, train_loss)
+
+            # Restore best model
+            if best_state:
+                model.load_state_dict(best_state)
+                model.to(device)
+
+            model._is_trained = True
+            self._model = model
+
+            # Save model if configured
+            model_path = None
+            if self.config.save_dir:
+                model_path = self.config.save_dir / "surrogate_model.pt"
+                model.save(model_path)
+
+            # Compute final metrics
+            model.eval()
+            with torch.no_grad():
+                test_coords = coords_t.unsqueeze(0).expand(
+                    test_params_t.shape[0], -1, -1
+                )
+                final_preds = model.forward(test_params_t, test_coords)
+
+            metrics = model.compute_error(
+                final_preds.cpu().numpy(),
+                test_outputs
+            )
+
+            return TrainingResult(
+                success=True,
+                train_loss=history['train_loss'][-1],
+                test_loss=best_test_loss,
+                metrics=metrics,
+                history=history,
+                model_path=model_path,
+                normalization_params=norm_params,
+            )
+
         except Exception as e:
             return TrainingResult(
                 success=False,
