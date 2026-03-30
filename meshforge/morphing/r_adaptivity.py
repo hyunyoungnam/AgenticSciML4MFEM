@@ -36,31 +36,31 @@ class AdaptivityConfig:
         smoothing_iterations: Number of Laplacian smoothing iterations for error field
         target_type: TMOP target type ("ideal_shape_equal_size", "given_shape_and_size")
         quality_metric: TMOP quality metric ("shape", "size", "shape_and_size")
-        barrier_type: Barrier function type ("shifted", "pseudo")
         max_iterations: Maximum Newton iterations
         tolerance: Newton solver tolerance
-        min_det_threshold: Minimum Jacobian determinant (for barrier activation)
         verbosity: Output verbosity level
     """
     # Size scaling based on error
-    size_scale_min: float = 0.3  # Target size in high-error regions (attracts nodes)
-    size_scale_max: float = 2.0  # Target size in low-error regions (repels nodes)
+    size_scale_min: float = 0.5  # Target size in high-error regions (attracts nodes)
+    size_scale_max: float = 1.5  # Target size in low-error regions (repels nodes)
     error_threshold: float = 0.1  # Normalize errors relative to max
 
     # Error field processing
     smoothing_iterations: int = 2  # Smooth error field to avoid oscillations
 
     # TMOP settings
-    target_type: str = "ideal_shape_equal_size"
+    target_type: str = "ideal_shape_given_size"
     quality_metric: str = "shape_and_size"
-    barrier_type: str = "shifted"  # "shifted" or "pseudo" barrier
     max_iterations: int = 200
     tolerance: float = 1e-8
-    min_det_threshold: float = 0.001  # Jacobian det threshold for barrier
     verbosity: int = 0
 
     # Boundary handling
     fix_boundary: bool = True  # Fix boundary nodes during adaptation
+
+    # Limiting: quadratic penalty ||x - x_init||^2 * coeff added to energy.
+    # Larger values bound node movement more tightly, preventing inversions.
+    limiting_coeff: float = 100.0
 
 
 @dataclass
@@ -116,8 +116,6 @@ class TMOPAdaptivity:
             config: Adaptivity configuration. Uses defaults if None.
         """
         self.config = config or AdaptivityConfig()
-        self._solver = None
-        self._mesh = None
 
     def adapt(
         self,
@@ -143,7 +141,6 @@ class TMOPAdaptivity:
             AdaptivityResult with adapted coordinates and quality metrics
         """
         try:
-            # Import PyMFEM
             import mfem.ser as mfem
         except ImportError:
             return AdaptivityResult(
@@ -163,7 +160,6 @@ class TMOPAdaptivity:
 
             n_nodes = len(coords)
 
-            # Validate error field
             if len(error_field) != n_nodes:
                 return AdaptivityResult(
                     success=False,
@@ -172,7 +168,6 @@ class TMOPAdaptivity:
                                  f"number of nodes ({n_nodes})"
                 )
 
-            # Get mesh from manager
             from ..mesh.mfem_manager import MFEMManager
             if not isinstance(manager, MFEMManager):
                 return AdaptivityResult(
@@ -182,35 +177,19 @@ class TMOPAdaptivity:
                 )
 
             mesh = manager.mesh
-            dim = mesh.Dimension()
-
-            # Compute quality before
             quality_before = self._compute_quality(mesh)
 
-            # Process error field
             processed_error = self._process_error_field(error_field, coords, mesh)
-
-            # Compute target size field from error
             target_sizes = self._error_to_target_size(processed_error)
 
-            # Create target size coefficient
-            target_size_coeff = self._create_size_coefficient(
-                mesh, target_sizes, manager.get_node_ids()
-            )
-
-            # Determine fixed nodes
             if fixed_nodes is None and self.config.fix_boundary:
                 fixed_nodes = self._get_boundary_nodes(mesh)
 
-            # Run TMOP optimization
             coords_adapted, iterations = self._run_tmop(
-                mesh, target_size_coeff, fixed_nodes
+                mesh, target_sizes, fixed_nodes
             )
 
-            # Update mesh
             manager.update_nodes(coords_adapted)
-
-            # Compute quality after
             quality_after = self._compute_quality(mesh)
 
             return AdaptivityResult(
@@ -234,29 +213,15 @@ class TMOPAdaptivity:
         coords: np.ndarray,
         mesh
     ) -> np.ndarray:
-        """
-        Process error field: normalize and smooth.
-
-        Args:
-            error_field: Raw error values at nodes
-            coords: Node coordinates
-            mesh: MFEM mesh
-
-        Returns:
-            Processed error field (normalized to [0, 1])
-        """
-        # Ensure non-negative
+        """Process error field: normalize and smooth."""
         error = np.maximum(error_field, 0.0)
 
-        # Normalize to [0, 1]
         max_error = np.max(error)
         if max_error > 1e-12:
             error = error / max_error
         else:
-            # Uniform error - no adaptation needed
             error = np.ones_like(error) * 0.5
 
-        # Apply Laplacian smoothing to avoid oscillations
         for _ in range(self.config.smoothing_iterations):
             error = self._laplacian_smooth(error, coords, mesh)
 
@@ -268,40 +233,22 @@ class TMOPAdaptivity:
         coords: np.ndarray,
         mesh
     ) -> np.ndarray:
-        """
-        Apply one iteration of Laplacian smoothing.
-
-        Args:
-            field: Field values at nodes
-            coords: Node coordinates
-            mesh: MFEM mesh
-
-        Returns:
-            Smoothed field
-        """
-        import mfem.ser as mfem
-
+        """Apply one iteration of Laplacian smoothing."""
         n_nodes = len(field)
         smoothed = field.copy()
 
-        # Build node adjacency from elements
-        # For each node, average with its neighbors
         neighbor_sum = np.zeros(n_nodes)
         neighbor_count = np.zeros(n_nodes)
 
         n_elements = mesh.GetNE()
         for e in range(n_elements):
-            elem = mesh.GetElement(e)
-            vertices = elem.GetVerticesArray()
-
-            # Each vertex is neighbor to all others in element
+            vertices = mesh.GetElementVertices(e)
             for v in vertices:
                 for u in vertices:
                     if u != v:
                         neighbor_sum[v] += field[u]
                         neighbor_count[v] += 1
 
-        # Apply smoothing where we have neighbors
         mask = neighbor_count > 0
         smoothed[mask] = 0.5 * field[mask] + 0.5 * neighbor_sum[mask] / neighbor_count[mask]
 
@@ -313,217 +260,196 @@ class TMOPAdaptivity:
 
         High error → small target size (attracts nodes)
         Low error → large target size (repels nodes)
-
-        Args:
-            error: Normalized error field [0, 1]
-
-        Returns:
-            Target size scaling factors
         """
-        # Linear interpolation between size_scale_min and size_scale_max
-        # High error (1) → size_scale_min
-        # Low error (0) → size_scale_max
         size_min = self.config.size_scale_min
         size_max = self.config.size_scale_max
-
-        # Invert: high error → small size
-        target_sizes = size_max - (size_max - size_min) * error
-
-        return target_sizes
-
-    def _create_size_coefficient(
-        self,
-        mesh,
-        target_sizes: np.ndarray,
-        node_ids: np.ndarray
-    ):
-        """
-        Create MFEM coefficient for target element sizes.
-
-        Args:
-            mesh: MFEM mesh
-            target_sizes: Target size at each node
-            node_ids: Node IDs
-
-        Returns:
-            MFEM Coefficient for target size field
-        """
-        import mfem.ser as mfem
-
-        # Create a GridFunction to hold the target size field
-        # We'll use H1 finite element space (continuous)
-        fec = mfem.H1_FECollection(1, mesh.Dimension())
-        fes = mfem.FiniteElementSpace(mesh, fec)
-
-        # Create grid function and set nodal values
-        size_gf = mfem.GridFunction(fes)
-
-        # Map target sizes to the grid function
-        # GridFunction uses same node ordering as mesh vertices
-        for i, node_id in enumerate(node_ids):
-            if i < size_gf.Size():
-                size_gf[i] = target_sizes[i]
-
-        # Create coefficient from grid function
-        return mfem.GridFunctionCoefficient(size_gf), fec, fes, size_gf
+        return size_max - (size_max - size_min) * error
 
     def _get_boundary_nodes(self, mesh) -> np.ndarray:
         """
-        Get indices of boundary nodes.
+        Get indices of boundary nodes using topological edge detection.
 
-        Args:
-            mesh: MFEM mesh
-
-        Returns:
-            Array of boundary node indices
+        An edge shared by exactly one element is a boundary edge; all its
+        vertices are boundary nodes.  This correctly identifies ALL boundary
+        nodes even when the mesh file only annotates a subset of boundary
+        elements (as is common with PyMFEM-generated plate-with-hole meshes).
         """
-        import mfem.ser as mfem
+        from collections import defaultdict
 
-        boundary_nodes = set()
+        # Count how many elements own each edge (sorted tuple of vertex indices)
+        edge_count: dict = defaultdict(int)
+        n_elements = mesh.GetNE()
+        for e in range(n_elements):
+            verts = list(mesh.GetElementVertices(e))
+            n = len(verts)
+            for i in range(n):
+                edge = tuple(sorted((verts[i], verts[(i + 1) % n])))
+                edge_count[edge] += 1
 
-        # Iterate over boundary elements
-        n_bdr = mesh.GetNBE()
-        for b in range(n_bdr):
-            bdr_elem = mesh.GetBdrElement(b)
-            vertices = bdr_elem.GetVerticesArray()
-            boundary_nodes.update(vertices)
+        # Boundary edges are shared by exactly one element
+        boundary_nodes: set = set()
+        for edge, count in edge_count.items():
+            if count == 1:
+                boundary_nodes.update(edge)
 
-        return np.array(list(boundary_nodes), dtype=int)
+        return np.array(sorted(boundary_nodes), dtype=int)
 
     def _run_tmop(
         self,
         mesh,
-        target_size_coeff,
+        target_sizes: np.ndarray,
         fixed_nodes: Optional[np.ndarray]
     ) -> Tuple[np.ndarray, int]:
         """
-        Run TMOP optimization with barrier functions.
+        Run TMOP optimization using DiscreteAdaptTC with nodal size field.
 
         Args:
-            mesh: MFEM mesh
-            target_size_coeff: Tuple of (coefficient, fec, fes, gf) for target size
+            mesh: MFEM mesh (must have high-order nodes via SetCurvature)
+            target_sizes: Target size scaling per node
             fixed_nodes: Indices of nodes to keep fixed
 
         Returns:
             Tuple of (adapted coordinates, number of iterations)
         """
         import mfem.ser as mfem
+        tmop = mfem.tmop
 
         dim = mesh.Dimension()
-        coeff, fec, fes, size_gf = target_size_coeff
 
-        # Create finite element space for mesh coordinates
-        fec_mesh = mfem.H1_FECollection(1, dim)
-        fes_mesh = mfem.FiniteElementSpace(mesh, fec_mesh, dim)
+        # Ensure mesh has high-order nodes (required for TMOP)
+        if mesh.GetNodes() is None:
+            mesh.SetCurvature(1)
 
-        # Get initial mesh node coordinates as GridFunction
-        x = mfem.GridFunction(fes_mesh)
-        mesh.GetNodes(x)
+        # Use the mesh's own nodes GridFunction as the optimization variable.
+        # This avoids byNODES/byVDIM ordering confusion: mesh.GetNodes(copy)
+        # raw-copies the vector ignoring FESpace ordering differences.
+        # Operating on the mesh's own GF also means no SetNodes call is needed.
+        x = mesh.GetNodes()
+        fes_mesh = x.FESpace()
 
-        # Setup target construction
-        # Use target type that respects size specification
-        target_c = mfem.TargetConstructor(
-            mfem.TargetConstructor.IDEAL_SHAPE_GIVEN_SIZE
-        )
-        target_c.SetNodes(x)
+        # Build H1 FE space for scalar nodal size field
+        fec_size = mfem.H1_FECollection(1, dim)
+        fes_size = mfem.FiniteElementSpace(mesh, fec_size)
 
-        # Set the target size field
-        # This makes TMOP optimize toward these target element sizes
-        target_c.SetSizeGF(size_gf)
+        # Scale target_sizes to physical Jacobian-determinant units.
+        # DiscreteAdaptTC.SetSerialDiscreteTargetSize expects det(J) values
+        # (≈ 2 × element area for triangles), not dimensionless scale factors.
+        mean_det = self._compute_mean_det(mesh)
 
-        # Choose TMOP metric based on config
+        size_gf = mfem.GridFunction(fes_size)
+        n = min(len(target_sizes), size_gf.Size())
+        for i in range(n):
+            size_gf[i] = float(target_sizes[i]) * mean_det
+        for i in range(n, size_gf.Size()):
+            size_gf[i] = mean_det
+
+        # x_init: fixed copy of initial node positions for limiting reference
+        # and as the fixed reference for DiscreteAdaptTC.
+        x_init = mfem.GridFunction(fes_mesh)
+        for i in range(x.Size()):
+            x_init[i] = x[i]
+
+        # Setup DiscreteAdaptTC with fixed reference x_init
+        datc = tmop.DiscreteAdaptTC(tmop.TargetConstructor.IDEAL_SHAPE_GIVEN_SIZE)
+        adv = tmop.AdvectorCG()
+        datc.SetAdaptivityEvaluator(adv)
+        datc.SetSerialDiscreteTargetSize(size_gf)
+        datc.SetNodes(x_init)
+
+        # Choose TMOP quality metric
         if dim == 2:
-            # 2D metrics
             if self.config.quality_metric == "shape":
-                mu = mfem.TMOP_Metric_002()  # Shape metric
+                mu = tmop.TMOP_Metric_002()
             elif self.config.quality_metric == "size":
-                mu = mfem.TMOP_Metric_080()  # Size metric
-            else:  # shape_and_size
-                mu = mfem.TMOP_Metric_077()  # Combined shape+size
-        else:
-            # 3D metrics
-            if self.config.quality_metric == "shape":
-                mu = mfem.TMOP_Metric_302()
-            elif self.config.quality_metric == "size":
-                mu = mfem.TMOP_Metric_316()
+                mu = tmop.TMOP_Metric_080()
             else:
-                mu = mfem.TMOP_Metric_321()
-
-        # Setup barrier for preventing element inversion
-        if self.config.barrier_type == "shifted":
-            # Shifted barrier - more aggressive
-            mu.SetBarrierType(mfem.TMOP_QualityMetric.SHIFTED_BARRIER)
+                mu = tmop.TMOP_Metric_077()
         else:
-            # Pseudo barrier - smoother
-            mu.SetBarrierType(mfem.TMOP_QualityMetric.PSEUDO_BARRIER)
+            if self.config.quality_metric == "shape":
+                mu = tmop.TMOP_Metric_302()
+            elif self.config.quality_metric == "size":
+                mu = tmop.TMOP_Metric_316()
+            else:
+                mu = tmop.TMOP_Metric_321()
 
-        mu.SetMinDetT(self.config.min_det_threshold)
+        tmop_integ = tmop.TMOP_Integrator(mu, datc)
 
-        # Create TMOP integrator
-        tmop_integ = mfem.TMOP_Integrator(mu, target_c)
+        # Limiting: quadratic penalty ||x - x_init||^2 * coeff bounds node
+        # movement and keeps the TMOP Hessian SPD (prevents inversions).
+        limiting_coeff = mfem.ConstantCoefficient(self.config.limiting_coeff)
+        tmop_integ.EnableLimiting(x_init, limiting_coeff)
 
-        # Enable finite difference for gradient/Hessian if needed
-        tmop_integ.EnableFiniteDifferences(x)
-
-        # Limiting to prevent large node movements (optional stabilization)
-        tmop_integ.EnableLimiting(x, mfem.ConstantCoefficient(1.0))
-
-        # Create nonlinear form
+        # Nonlinear form on the mesh's own FESpace
         a = mfem.NonlinearForm(fes_mesh)
         a.AddDomainIntegrator(tmop_integ)
 
-        # Setup essential boundary conditions for fixed nodes
+        # Fix essential DOFs using DofToVDof — ordering-agnostic.
         if fixed_nodes is not None and len(fixed_nodes) > 0:
             ess_tdof_list = mfem.intArray()
-            # Convert node indices to true DOF indices
             for node_idx in fixed_nodes:
                 for d in range(dim):
-                    dof = node_idx * dim + d
-                    if dof < fes_mesh.GetTrueVSize():
+                    dof = fes_mesh.DofToVDof(int(node_idx), d)
+                    if 0 <= dof < fes_mesh.GetTrueVSize():
                         ess_tdof_list.Append(dof)
             a.SetEssentialTrueDofs(ess_tdof_list)
 
-        # Newton solver
-        solver = mfem.NewtonSolver()
+        # CG inner solver: TMOP Hessian + limiting is SPD on a valid mesh.
+        lin_solver = mfem.CGSolver()
+        lin_solver.SetRelTol(1e-12)
+        lin_solver.SetAbsTol(0.0)
+        lin_solver.SetMaxIter(500)
+        lin_solver.SetPrintLevel(-1)
+
+        # TMOPNewtonSolver has barrier-aware backtracking line search that
+        # prevents Newton steps from crossing det(J)=0 (inverting elements).
+        # Build integration rule matching the mesh's element geometry.
+        geom = mesh.GetElementGeometry(0)
+        ir = mfem.IntRules.Get(geom, 8)
+        solver = tmop.TMOPNewtonSolver(ir)
         solver.SetMaxIter(self.config.max_iterations)
         solver.SetRelTol(self.config.tolerance)
         solver.SetAbsTol(0.0)
         solver.SetPrintLevel(self.config.verbosity)
-
-        # Linear solver for Newton steps
-        linear_solver = mfem.UMFPackSolver()
-        solver.SetSolver(linear_solver)
         solver.SetOperator(a)
+        solver.SetSolver(lin_solver)
 
-        # Solve
-        b = mfem.Vector()  # Empty RHS
+        b = mfem.Vector()
         solver.Mult(b, x)
-
         iterations = solver.GetNumIterations()
 
-        # Update mesh with new coordinates
-        mesh.SetNodes(x)
-
-        # Extract coordinates as numpy array
+        # x IS the mesh's nodes GF — mesh already updated in place.
+        # Extract coordinates using DofToVDof (ordering-agnostic).
         n_nodes = mesh.GetNV()
         coords_adapted = np.zeros((n_nodes, dim))
         for i in range(n_nodes):
-            v = mesh.GetVertex(i)
             for d in range(dim):
-                coords_adapted[i, d] = v[d]
+                dof = fes_mesh.DofToVDof(i, d)
+                coords_adapted[i, d] = x[dof]
 
         return coords_adapted, iterations
 
+    def _compute_mean_det(self, mesh) -> float:
+        """
+        Compute the mean absolute Jacobian determinant over all elements.
+
+        Used to convert dimensionless size-scaling factors into physical
+        units expected by DiscreteAdaptTC.SetSerialDiscreteTargetSize.
+        """
+        import mfem.ser as mfem
+
+        n_elements = mesh.GetNE()
+        if n_elements == 0:
+            return 1.0
+
+        total = 0.0
+        for e in range(n_elements):
+            T = mesh.GetElementTransformation(e)
+            T.SetIntPoint(mfem.Geometries.GetCenter(mesh.GetElementGeometry(e)))
+            total += abs(T.Jacobian().Det())
+        return total / n_elements
+
     def _compute_quality(self, mesh) -> Dict[str, float]:
-        """
-        Compute mesh quality metrics.
-
-        Args:
-            mesh: MFEM mesh
-
-        Returns:
-            Dictionary of quality metrics
-        """
+        """Compute mesh quality metrics."""
         import mfem.ser as mfem
 
         n_elements = mesh.GetNE()
@@ -534,27 +460,22 @@ class TMOPAdaptivity:
         num_inverted = 0
 
         for e in range(n_elements):
-            # Get element transformation
             T = mesh.GetElementTransformation(e)
             T.SetIntPoint(mfem.Geometries.GetCenter(mesh.GetElementGeometry(e)))
-
-            # Jacobian determinant
             det = T.Jacobian().Det()
 
             if det <= 0:
                 num_inverted += 1
                 qualities.append(0.0)
             else:
-                # Simple quality metric: based on Jacobian condition
-                # More sophisticated metrics could be added
                 qualities.append(min(det, 1.0 / det) if det != 0 else 0.0)
 
         qualities = np.array(qualities)
 
         return {
-            "min_quality": float(np.min(qualities)) if len(qualities) > 0 else 0.0,
-            "avg_quality": float(np.mean(qualities)) if len(qualities) > 0 else 0.0,
-            "max_quality": float(np.max(qualities)) if len(qualities) > 0 else 0.0,
+            "min_quality": float(np.min(qualities)),
+            "avg_quality": float(np.mean(qualities)),
+            "max_quality": float(np.max(qualities)),
             "num_inverted": num_inverted,
             "num_elements": n_elements,
         }
@@ -569,11 +490,11 @@ def is_tmop_available() -> bool:
     """
     try:
         import mfem.ser as mfem
-        # Check for TMOP classes
+        tmop = mfem.tmop
         return (
-            hasattr(mfem, 'TMOP_Integrator') and
-            hasattr(mfem, 'TargetConstructor') and
-            hasattr(mfem, 'TMOP_Metric_002')
+            hasattr(tmop, 'TMOP_Integrator') and
+            hasattr(tmop, 'DiscreteAdaptTC') and
+            hasattr(tmop, 'TMOP_Metric_002')
         )
-    except ImportError:
+    except (ImportError, AttributeError):
         return False

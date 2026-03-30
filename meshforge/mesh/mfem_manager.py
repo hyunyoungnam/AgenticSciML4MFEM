@@ -4,6 +4,7 @@ MFEM mesh manager implementation.
 Provides mesh management for MFEM .mesh files using the PyMFEM library.
 """
 
+import ctypes
 from pathlib import Path
 from typing import Optional, Union
 
@@ -84,11 +85,13 @@ class MFEMManager(MeshManager):
         self._node_ids = np.arange(num_vertices, dtype=np.int32)
 
         # Get vertex coordinates
+        # GetVertex returns a raw double* (SwigPyObject); use ctypes to read it
         self._nodes = np.zeros((num_vertices, self._space_dim), dtype=np.float64)
         for i in range(num_vertices):
             vertex = self._mesh.GetVertex(i)
+            ptr = ctypes.cast(int(vertex), ctypes.POINTER(ctypes.c_double))
             for d in range(self._space_dim):
-                self._nodes[i, d] = vertex[d]
+                self._nodes[i, d] = ptr[d]
 
         # Extract elements
         num_elements = self._mesh.GetNE()
@@ -196,11 +199,12 @@ class MFEMManager(MeshManager):
                     dof = fes.DofToVDof(i, d)
                     nodes_gf[dof] = self._nodes[i, d]
         else:
-            # Linear mesh: update vertices directly
+            # Linear mesh: update vertices directly via ctypes
             for i in range(self._mesh.GetNV()):
                 vertex = self._mesh.GetVertex(i)
+                ptr = ctypes.cast(int(vertex), ctypes.POINTER(ctypes.c_double))
                 for d in range(self._space_dim):
-                    vertex[d] = self._nodes[i, d]
+                    ptr[d] = float(self._nodes[i, d])
 
     def save(self, output_path: Union[str, Path]) -> Path:
         """
@@ -324,3 +328,38 @@ class MFEMManager(MeshManager):
         # Re-extract mesh data after refinement
         self._extract_mesh_data()
         self._modified = True
+
+    def refine_by_error(
+        self,
+        element_error: np.ndarray,
+        threshold_fraction: float = 0.5,
+        nonconforming: int = -1,
+    ) -> bool:
+        """
+        Refine elements with error above threshold_fraction * max_error.
+
+        Args:
+            element_error: Per-element error array, shape (num_elements,)
+            threshold_fraction: Fraction of max error used as refinement threshold
+            nonconforming: -1=auto, 0=conforming, 1=nonconforming
+
+        Returns:
+            True if any elements were refined
+        """
+        mfem = _get_mfem()
+        if len(element_error) != self.num_elements:
+            raise ValueError(
+                f"element_error length {len(element_error)} != "
+                f"num_elements {self.num_elements}"
+            )
+
+        threshold = float(threshold_fraction * np.max(element_error))
+        err_vec = mfem.Vector(len(element_error))
+        for i, v in enumerate(element_error):
+            err_vec[i] = float(v)
+
+        refined = self._mesh.RefineByError(err_vec, threshold, nonconforming)
+        if refined:
+            self._extract_mesh_data()
+            self._modified = True
+        return bool(refined)
