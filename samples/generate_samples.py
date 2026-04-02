@@ -189,20 +189,18 @@ def convert_gmsh_to_mfem(msh_file: str, mesh_file: str):
     if not elements:
         raise ValueError("No quads or triangles found in mesh")
 
-    # Extract boundary edges (lines)
-    lines = None
-    line_tags = None
-    for cell_block in mesh.cells:
+    # Collect ALL boundary edges across every line cell block (one block per physical group)
+    all_lines = []
+    all_line_tags = []
+    for idx, cell_block in enumerate(mesh.cells):
         if cell_block.type == "line":
-            lines = cell_block.data
-            break
-
-    # Get physical tags for boundaries
-    if "gmsh:physical" in mesh.cell_data:
-        for i, cell_block in enumerate(mesh.cells):
-            if cell_block.type == "line":
-                line_tags = mesh.cell_data["gmsh:physical"][i]
-                break
+            if "gmsh:physical" in mesh.cell_data:
+                tags = mesh.cell_data["gmsh:physical"][idx]
+            else:
+                tags = [1] * len(cell_block.data)
+            for j, line in enumerate(cell_block.data):
+                all_lines.append(line)
+                all_line_tags.append(int(tags[j]))
 
     # Write MFEM format
     with open(mesh_file, 'w') as f:
@@ -218,11 +216,10 @@ def convert_gmsh_to_mfem(msh_file: str, mesh_file: str):
                 f.write(f"1 2 {verts[0]} {verts[1]} {verts[2]}\n")
         f.write("\n")
 
-        # Boundary (lines)
-        if lines is not None:
-            f.write(f"boundary\n{len(lines)}\n")
-            for i, line in enumerate(lines):
-                tag = line_tags[i] if line_tags is not None else 1
+        # Boundary (lines) — all physical groups preserved
+        if all_lines:
+            f.write(f"boundary\n{len(all_lines)}\n")
+            for line, tag in zip(all_lines, all_line_tags):
                 f.write(f"{tag} 1 {line[0]} {line[1]}\n")
             f.write("\n")
 

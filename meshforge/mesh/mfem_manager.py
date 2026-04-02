@@ -333,7 +333,7 @@ class MFEMManager(MeshManager):
         self,
         element_error: np.ndarray,
         threshold_fraction: float = 0.5,
-        nonconforming: int = -1,
+        nonconforming: int = 1,
     ) -> bool:
         """
         Refine elements with error above threshold_fraction * max_error.

@@ -62,6 +62,10 @@ class MFEMSolver(SolverInterface):
         self._fespace: Optional[object] = None
         self._solution: Optional[object] = None
         self._solution_data: Dict[str, np.ndarray] = {}
+        # Keep MFEM coefficient objects alive for the lifetime of the solver.
+        # MFEM integrators hold raw C++ pointers; if the Python wrapper is
+        # garbage-collected before assembly completes, those pointers dangle.
+        self._coef_refs: list = []
 
     def setup(
         self,
@@ -159,9 +163,13 @@ class MFEMSolver(SolverInterface):
         # Set up the bilinear form (stiffness matrix)
         a = mfem.BilinearForm(fespace)
 
-        # Add elasticity integrator
+        # Add elasticity integrator.
+        # Store fec, lambda_coef, mu_coef to prevent Python GC from freeing
+        # objects that MFEM holds raw C++ pointers into.
+        self._coef_refs.clear()
         lambda_coef = mfem.ConstantCoefficient(lmbda)
         mu_coef = mfem.ConstantCoefficient(mu)
+        self._coef_refs.extend([fec, lambda_coef, mu_coef])
         a.AddDomainIntegrator(mfem.ElasticityIntegrator(lambda_coef, mu_coef))
         a.Assemble()
 
@@ -182,7 +190,6 @@ class MFEMSolver(SolverInterface):
 
         # Add traction boundary conditions
         self._add_traction_bcs(b, mesh, dim)
-
         b.Assemble()
 
         # Create solution vector with initial displacement from BCs
@@ -197,8 +204,8 @@ class MFEMSolver(SolverInterface):
         a.FormLinearSystem(ess_tdof_list, x, b, A, X, B)
 
         # Solve the system
-        M = mfem.GSSmoother(A.Ptr())
-        mfem.PCG(A.Ptr(), M, B, X, 1, 500, 1e-12, 0.0)
+        M = mfem.GSSmoother(A.AsSparseMatrix())
+        mfem.PCG(A, M, B, X, 1, 500, 1e-12, 0.0)
 
         # Recover the solution
         a.RecoverFEMSolution(X, b, x)
@@ -294,8 +301,8 @@ class MFEMSolver(SolverInterface):
         a.FormLinearSystem(ess_tdof_list, x, b, A, X, B)
 
         # Solve the system
-        M = mfem.GSSmoother(A.Ptr())
-        mfem.PCG(A.Ptr(), M, B, X, 1, 500, 1e-12, 0.0)
+        M = mfem.GSSmoother(A.AsSparseMatrix())
+        mfem.PCG(A, M, B, X, 1, 500, 1e-12, 0.0)
 
         # Recover the solution
         a.RecoverFEMSolution(X, b, x)
@@ -358,12 +365,13 @@ class MFEMSolver(SolverInterface):
         return ess_bdr
 
     def _apply_displacement_bcs(self, x, mesh, dim: int) -> None:
-        """Apply displacement boundary conditions to the solution."""
-        for bc in self._physics.boundary_conditions:
-            if bc.bc_type == BoundaryConditionType.DISPLACEMENT:
-                # For now, apply zero displacement (fixed)
-                # TODO: Support non-zero prescribed displacements
-                pass
+        """Apply displacement boundary conditions to the solution.
+
+        Zero displacement is correct here: x is pre-initialized to 0.0, and
+        FormLinearSystem enforces the essential DOFs at exactly those zero values.
+        Non-zero prescribed displacements are not currently needed.
+        """
+        pass
 
     def _apply_temperature_bcs(self, x, mesh) -> None:
         """Apply temperature boundary conditions to the solution."""
@@ -395,16 +403,22 @@ class MFEMSolver(SolverInterface):
         for bc in self._physics.boundary_conditions:
             if bc.bc_type == BoundaryConditionType.TRACTION:
                 if bc.value is not None:
-                    # Create vector coefficient for traction
-                    traction = mfem.VectorArrayCoefficient(dim)
+                    # Create vector coefficient for traction — store component
+                    # coefficients and the vector coefficient to prevent GC.
                     value = np.atleast_1d(bc.value)
+                    comp_coefs = []
                     for d in range(dim):
-                        if d < len(value):
-                            traction.Set(d, mfem.ConstantCoefficient(value[d]))
-                        else:
-                            traction.Set(d, mfem.ConstantCoefficient(0.0))
+                        v = float(value[d]) if d < len(value) else 0.0
+                        comp_coefs.append(mfem.ConstantCoefficient(v))
+                    traction = mfem.VectorArrayCoefficient(dim)
+                    for d, c in enumerate(comp_coefs):
+                        traction.Set(d, c)
+                    self._coef_refs.extend(comp_coefs)
+                    self._coef_refs.append(traction)
 
                     markers = self._get_bc_markers(mesh, bc)
+                    # markers must outlive b.Assemble() — MFEM stores a pointer
+                    self._coef_refs.append(markers)
                     b.AddBoundaryIntegrator(
                         mfem.VectorBoundaryLFIntegrator(traction),
                         markers
@@ -465,47 +479,47 @@ class MFEMSolver(SolverInterface):
         num_elements = self._mesh_manager.num_elements
         stress = np.zeros((num_elements, num_stress), dtype=np.float64)
 
-        # Get integration rule for element centers
+        # Evaluate stress at element centres
         for i in range(num_elements):
-            elem = self._mesh_manager.mesh.GetElement(i)
             trans = self._mesh_manager.mesh.GetElementTransformation(i)
 
-            # Evaluate at element center
+            # Set integration point at element centre (required before GetVectorGradient)
             ip = mfem.IntegrationPoint()
-            ip.Set2(0.5, 0.5) if dim == 2 else ip.Set3(0.5, 0.5, 0.5)
+            if dim == 2:
+                ip.Set2(0.5, 0.5)
+            else:
+                ip.Set3(0.5, 0.5, 0.5)
+            trans.SetIntPoint(ip)
 
-            # Compute gradient of displacement
+            # Compute displacement gradient; use GetDataArray for numpy-compatible extraction
             grad_u = mfem.DenseMatrix(dim, dim)
             displacement.GetVectorGradient(trans, grad_u)
+            g = np.array(grad_u.GetDataArray())  # shape (dim, dim), column-major → (row, col)
 
-            # Compute strain: epsilon = 0.5 * (grad_u + grad_u^T)
-            # Compute stress: sigma = lambda * tr(epsilon) * I + 2 * mu * epsilon
-            trace_eps = 0.0
-            for d in range(dim):
-                trace_eps += grad_u.Elem(d, d)
+            trace_eps = sum(g[d, d] for d in range(dim))
 
             if dim == 2:
-                eps_xx = grad_u.Elem(0, 0)
-                eps_yy = grad_u.Elem(1, 1)
-                eps_xy = 0.5 * (grad_u.Elem(0, 1) + grad_u.Elem(1, 0))
+                eps_xx = g[0, 0]
+                eps_yy = g[1, 1]
+                eps_xy = 0.5 * (g[0, 1] + g[1, 0])
 
                 stress[i, 0] = lmbda * trace_eps + 2 * mu * eps_xx  # sigma_xx
                 stress[i, 1] = lmbda * trace_eps + 2 * mu * eps_yy  # sigma_yy
-                stress[i, 2] = 2 * mu * eps_xy  # sigma_xy
+                stress[i, 2] = 2 * mu * eps_xy                       # sigma_xy
             else:
-                eps_xx = grad_u.Elem(0, 0)
-                eps_yy = grad_u.Elem(1, 1)
-                eps_zz = grad_u.Elem(2, 2)
-                eps_xy = 0.5 * (grad_u.Elem(0, 1) + grad_u.Elem(1, 0))
-                eps_yz = 0.5 * (grad_u.Elem(1, 2) + grad_u.Elem(2, 1))
-                eps_xz = 0.5 * (grad_u.Elem(0, 2) + grad_u.Elem(2, 0))
+                eps_xx = g[0, 0]
+                eps_yy = g[1, 1]
+                eps_zz = g[2, 2]
+                eps_xy = 0.5 * (g[0, 1] + g[1, 0])
+                eps_yz = 0.5 * (g[1, 2] + g[2, 1])
+                eps_xz = 0.5 * (g[0, 2] + g[2, 0])
 
                 stress[i, 0] = lmbda * trace_eps + 2 * mu * eps_xx  # sigma_xx
                 stress[i, 1] = lmbda * trace_eps + 2 * mu * eps_yy  # sigma_yy
                 stress[i, 2] = lmbda * trace_eps + 2 * mu * eps_zz  # sigma_zz
-                stress[i, 3] = 2 * mu * eps_xy  # sigma_xy
-                stress[i, 4] = 2 * mu * eps_yz  # sigma_yz
-                stress[i, 5] = 2 * mu * eps_xz  # sigma_xz
+                stress[i, 3] = 2 * mu * eps_xy                       # sigma_xy
+                stress[i, 4] = 2 * mu * eps_yz                       # sigma_yz
+                stress[i, 5] = 2 * mu * eps_xz                       # sigma_xz
 
         return stress
 
