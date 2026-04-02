@@ -736,6 +736,9 @@ def visualize_transolver_test(
     except FileNotFoundError:
         surrogate_rel = float('nan')
         print("  No surrogate found")
+    except Exception as e:
+        surrogate_rel = float('nan')
+        print(f"  Surrogate skipped: {e}")
 
     # Adaptation is always driven by the measured MFEM coarse error
     adapt_signal = error_coarse

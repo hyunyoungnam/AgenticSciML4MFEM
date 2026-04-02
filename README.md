@@ -66,11 +66,11 @@ The acquisition function quantifies "informativeness" — regions with high ense
 python samples/generate_samples.py --n 200 --output train01           # single-hole plates
 python samples/generate_two_hole_samples.py --n 200 --output train02  # two-hole plates
 
-# Train Transolver on single-hole data
+# Train on single-hole data only
 python train_transolver.py --train-dir train01 --epochs 500
 
-# Train on two-hole data
-python train_transolver.py --train-dir train02 --epochs 500
+# Train on both datasets merged (recommended)
+python train_transolver.py --train-dir train01 train02 --epochs 500
 ```
 
 ### Using the Framework Programmatically
@@ -85,7 +85,7 @@ config = AdaptiveConfig(
     parameter_bounds={
         "E": (150e9, 250e9),
         "nu": (0.25, 0.35),
-        "load": (50.0, 200.0),
+        "load": (80e6, 120e6),   # Pa (80–120 MPa uniaxial traction)
     },
     initial_samples=20,
     samples_per_iteration=10,
@@ -154,9 +154,9 @@ The domain is a unit-square plate `[0,1]×[0,1]` with one or two blob-shaped hol
 
 | Boundary | Tag | Type | Value |
 |----------|-----|------|-------|
-| Left (x=0) | 4 | Dirichlet displacement | u = [0, 0] — fully fixed |
-| Right (x=1) | 2 | Neumann traction | t = [σ₀, 0] — uniaxial load |
-| Bottom (y=0) | 1 | Free | zero traction (natural Neumann) |
+| Left (x=0) | 4 | Symmetry (roller) | u_x = 0 — prevents x-translation |
+| Bottom (y=0) | 1 | Symmetry (roller) | u_y = 0 — prevents y-translation/rotation |
+| Right (x=1) | 2 | Neumann traction | t = [σ₀, 0] — uniaxial load (80–120 MPa) |
 | Top (y=1) | 3 | Free | zero traction (natural Neumann) |
 | Hole surface | 5 / 6 | Free | traction-free |
 
@@ -185,10 +185,10 @@ physics = PhysicsConfig(
     physics_type=PhysicsType.LINEAR_ELASTICITY,
     material=MaterialProperties(E=200e9, nu=0.3),
     boundary_conditions=[
-        BoundaryCondition(BoundaryConditionType.DISPLACEMENT, boundary_id=4,
-                          value=np.array([0., 0.])),
-        BoundaryCondition(BoundaryConditionType.TRACTION, boundary_id=2,
-                          value=np.array([100.0, 0.])),
+        BoundaryCondition(BoundaryConditionType.SYMMETRY, boundary_id=4, direction=0),  # u_x=0 on left
+        BoundaryCondition(BoundaryConditionType.SYMMETRY, boundary_id=1, direction=1),  # u_y=0 on bottom
+        BoundaryCondition(BoundaryConditionType.TRACTION,  boundary_id=2,
+                          value=np.array([100e6, 0.])),  # 100 MPa uniaxial tension
     ],
 )
 
@@ -198,9 +198,29 @@ solver.setup(manager, physics)
 with tempfile.TemporaryDirectory() as tmp:
     result = solver.solve(tmp)
 
-print(f"von Mises range: {result.solution_data['von_mises'].min():.1f} "
-      f".. {result.solution_data['von_mises'].max():.1f} Pa")
+vm = result.solution_data['von_mises']
+print(f"von Mises range: {vm.min()*1e-6:.1f} .. {vm.max()*1e-6:.1f} MPa")
 ```
+
+---
+
+## Example Output
+
+Each test run produces a 5-panel SciML loop visualization comparing fine-mesh ground truth, coarse MFEM, error maps, and the r+h adapted result.
+
+### Single-hole plate (train01)
+
+![SciML loop — single hole](tests/test_outputs/sciml_loop_train01_best.png)
+
+`train01/sample_006` — SCF ≈ 4.95 (irregular blob hole under 80–120 MPa uniaxial tension).  
+Fine GT: 818 MPa peak · Coarse: 502 MPa · Adapted (343 elems): 660 MPa · Rel. error: 13.8%
+
+### Double-hole plate (train02)
+
+![SciML loop — double hole](tests/test_outputs/sciml_loop_train02_best.png)
+
+`train02/sample_007` — two interacting blob holes, SCF ≈ 3.63.  
+Fine GT: 901 MPa peak · Coarse: 412 MPa · Adapted (1009 elems): 674 MPa · Rel. error: 11.3% → 11.0% (+0.4 pp)
 
 ---
 
@@ -308,7 +328,7 @@ The training script:
 2. Trains Transolver: `(element centroids, physics params) → von Mises stress field`
 3. Saves the model to `outputs/surrogate/transolver_model.pt`
 
-Parameter vector per sample: `[E (GPa), ν, σ₀ (traction)]`
+Parameter vector per sample: `[E (GPa), ν, σ₀ (MPa)]`
 
 ### Analyzing Learning Efficiency
 
@@ -381,10 +401,10 @@ meshforge/
 ### Data Flow
 
 ```
-                    ┌──────────────────────────────┐
-                    │     ACTIVE LEARNING LOOP     │
-                    └──────────────────────────────┘
-                                  │
+                  ┌──────────────────────────────┐
+                  │     ACTIVE LEARNING LOOP     │
+                  └──────────────────────────────┘
+                                 │
     ┌────────────────────────────┼────────────────────────────┐
     │                            │                            │
     ▼                            ▼                            ▼

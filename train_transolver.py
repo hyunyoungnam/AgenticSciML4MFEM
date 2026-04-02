@@ -24,7 +24,7 @@ import ctypes
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import argparse
 import json
 
@@ -176,15 +176,16 @@ def run_fem_simulation(
 # =============================================================================
 
 def load_training_data(
-    train_dir: str,
+    train_dirs: Union[str, List[str]],
     max_samples: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
     """
     Load training data by running FEM on each mesh file.
 
     Args:
-        train_dir: Directory containing sample_*.mesh files
-        max_samples: Cap on number of samples to load
+        train_dirs: One or more directories containing sample_*.mesh files.
+                    All directories are merged into a single dataset.
+        max_samples: Cap on total number of samples to load (applied after merging)
 
     Returns:
         parameters:    (N, 3)               — [E/GPa, nu, load]
@@ -192,13 +193,19 @@ def load_training_data(
         stress_fields: (N, max_elems)        — von Mises stress, zero-padded
         mesh_files:    list of mesh file paths
     """
-    train_path = Path(train_dir)
-    mesh_files = sorted(train_path.glob("sample_*.mesh"))
+    if isinstance(train_dirs, str):
+        train_dirs = [train_dirs]
+
+    mesh_files = []
+    for d in train_dirs:
+        files = sorted(Path(d).glob("sample_*.mesh"))
+        mesh_files.extend(files)
+        print(f"  Found {len(files)} meshes in {d}")
 
     if max_samples:
         mesh_files = mesh_files[:max_samples]
 
-    print(f"Loading {len(mesh_files)} training samples via PyMFEM...")
+    print(f"Loading {len(mesh_files)} training samples total via PyMFEM...")
 
     # First pass: find max element count for padding
     max_elems = 0
@@ -561,7 +568,7 @@ def visualize_results(
 
 def main():
     parser = argparse.ArgumentParser(description="Train Transolver surrogate model")
-    parser.add_argument("--train-dir",    type=str,   default="train01",              help="Training data directory")
+    parser.add_argument("--train-dir",    type=str,   nargs="+", default=["train01"], help="Training data directories (space-separated; all are merged)")
     parser.add_argument("--output-dir",   type=str,   default="outputs/surrogate",    help="Output directory")
     parser.add_argument("--max-samples",  type=int,   default=None,                   help="Max training samples")
     parser.add_argument("--epochs",       type=int,   default=200,                    help="Training epochs")
@@ -573,11 +580,11 @@ def main():
     args = parser.parse_args()
 
     project_root = Path(__file__).parent
-    train_dir  = project_root / args.train_dir
+    train_dirs = [str(project_root / d) for d in args.train_dir]
     output_dir = project_root / args.output_dir
 
     parameters, coordinates, stress_fields, _ = load_training_data(
-        str(train_dir), max_samples=args.max_samples
+        train_dirs, max_samples=args.max_samples
     )
 
     config = {
