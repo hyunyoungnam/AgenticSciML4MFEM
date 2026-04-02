@@ -46,7 +46,7 @@ Traditional Sampling:          Active Learning:
 ┌───────────────────┐         ┌───────────────────┐
 │ • • • • • • • • • │         │ •       •     •   │
 │ • • • • • • • • • │         │           ••••••  │ ← High uncertainty region
-│ • • • • • • • • • │   vs    │ •    ••••••••••  │   gets more samples
+│ • • • • • • • • • │   vs    │ •    ••••••••••   │   gets more samples
 │ • • • • • • • • • │         │       •••••••     │
 │ • • • • • • • • • │         │ •   •       •     │
 └───────────────────┘         └───────────────────┘
@@ -208,43 +208,43 @@ print(f"von Mises range: {result.solution_data['von_mises'].min():.1f} "
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    ACTIVE LEARNING WORKFLOW                          │
+│                    ACTIVE LEARNING WORKFLOW                         │
 ├─────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  1. INITIAL SAMPLING (Latin Hypercube)                               │
-│     └─ Generate diverse initial samples for good coverage            │
-│                          ↓                                            │
-│  2. FEM SIMULATIONS (PyMFEM)                                         │
-│     └─ Run linear-elasticity solver for each mesh/parameter config   │
-│                          ↓                                            │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │  ACTIVE LEARNING LOOP                                           │ │
-│  │                                                                   │ │
-│  │  3. TRAIN Transolver SURROGATE                                   │ │
-│  │     └─ Physics-Attention operator on unstructured mesh coords    │ │
-│  │                          ↓                                        │ │
-│  │  4. EVALUATE & COMPUTE ACQUISITION SCORES                        │ │
-│  │     ├─ Predict on candidate parameter configurations             │ │
-│  │     ├─ Compute uncertainty (ensemble disagreement)               │ │
-│  │     └─ Score candidates with acquisition function                │ │
-│  │                          ↓                                        │ │
-│  │  5. SELECT INFORMATIVE SAMPLES                                   │ │
-│  │     ├─ Rank candidates by acquisition score                      │ │
-│  │     ├─ Apply diversity filter to avoid clustering                │ │
-│  │     └─ Select top-k most informative configurations              │ │
-│  │                          ↓                                        │ │
-│  │  6. CHECK CONVERGENCE CRITERIA                                   │ │
-│  │     ├─ Error < threshold? → CONVERGED                            │ │
-│  │     ├─ No improvement for N iterations? → PATIENCE_EXHAUSTED     │ │
-│  │     ├─ Samples >= budget? → BUDGET_EXHAUSTED                     │ │
-│  │     ├─ Uncertainty < threshold? → LOW_UNCERTAINTY                │ │
-│  │     └─ Efficiency dropping? → DIMINISHING_RETURNS                │ │
-│  │                          ↓                                        │ │
-│  │  7. RUN NEW SIMULATIONS & LOOP                                   │ │
-│  └─────────────────────────────────────────────────────────────────┘ │
-│                          ↓                                            │
-│  8. SAVE: Dataset, Trained Surrogate, Metrics                        │
-│                                                                       │
+│                                                                     │
+│  1. INITIAL SAMPLING (Latin Hypercube)                              │
+│     └─ Generate diverse initial samples for good coverage           │
+│                          ↓                                          │
+│  2. FEM SIMULATIONS (PyMFEM)                                        │
+│     └─ Run linear-elasticity solver for each mesh/parameter config  │
+│                          ↓                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │  ACTIVE LEARNING LOOP                                           ││
+│  │                                                                 ││
+│  │  3. TRAIN Transolver SURROGATE                                  ││
+│  │     └─ Physics-Attention operator on unstructured mesh coords   ││
+│  │                          ↓                                      ││
+│  │  4. EVALUATE & COMPUTE ACQUISITION SCORES                       ││
+│  │     ├─ Predict on candidate parameter configurations            ││
+│  │     ├─ Compute uncertainty (ensemble disagreement)              ││
+│  │     └─ Score candidates with acquisition function               ││
+│  │                          ↓                                      ││
+│  │  5. SELECT INFORMATIVE SAMPLES                                  ││
+│  │     ├─ Rank candidates by acquisition score                     ││
+│  │     ├─ Apply diversity filter to avoid clustering               ││
+│  │     └─ Select top-k most informative configurations             ││
+│  │                          ↓                                      ││
+│  │  6. CHECK CONVERGENCE CRITERIA                                  ││
+│  │     ├─ Error < threshold? → CONVERGED                           ││
+│  │     ├─ No improvement for N iterations? → PATIENCE_EXHAUSTED    ││
+│  │     ├─ Samples >= budget? → BUDGET_EXHAUSTED                    ││
+│  │     ├─ Uncertainty < threshold? → LOW_UNCERTAINTY               ││
+│  │     └─ Efficiency dropping? → DIMINISHING_RETURNS               ││
+│  │                          ↓                                      ││
+│  │  7. RUN NEW SIMULATIONS & LOOP                                  ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                          ↓                                          │
+│  8. SAVE: Dataset, Trained Surrogate, Metrics                       │
+│                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -382,14 +382,14 @@ meshforge/
 
 ```
                     ┌──────────────────────────────┐
-                    │     ACTIVE LEARNING LOOP      │
+                    │     ACTIVE LEARNING LOOP     │
                     └──────────────────────────────┘
                                   │
     ┌────────────────────────────┼────────────────────────────┐
     │                            │                            │
     ▼                            ▼                            ▼
 ┌─────────┐              ┌──────────────┐             ┌───────────────┐
-│ Dataset │◄────────────│ PyMFEM FEM   │◄────────────│ Acquisition   │
+│ Dataset │◄──────────── │ PyMFEM FEM   │◄────────────│ Acquisition   │
 │         │              │ Solver       │             │ Function      │
 └────┬────┘              └──────────────┘             └───────┬───────┘
      │                                                        │
@@ -466,7 +466,7 @@ Meshforge uses `nonconforming=1` (MFEM non-conforming AMR mode) to handle this c
 ```
 Refined element:       Neighbor element:
 A ---C--- B            A --------- B
-|   |    |            |           |
+|    |    |            |           |
 D ---E--- F            D --------- F
 
 Node C is a hanging node on the neighbor's edge A-B.
