@@ -14,9 +14,10 @@ Usage:
     python train_transolver.py --train-dir train02 --epochs 500 --batch-size 16
 
 Boundary conditions (uniaxial tension):
-    Left  (tag 4): u = [0, 0]  — fully fixed, prevents rigid body motion
-    Right (tag 2): traction [σ₀, 0]  — applied uniaxial load
-    Bottom / top / hole: traction-free (natural Neumann, no action needed)
+    Left   (tag 4): u_x = 0  (SYMMETRY, direction=0) — prevents x-translation
+    Bottom (tag 1): u_y = 0  (SYMMETRY, direction=1) — prevents y-translation/rotation
+    Right  (tag 2): traction [σ₀, 0]  — applied uniaxial load
+    Top / hole: traction-free (natural Neumann, no action needed)
 """
 
 import ctypes
@@ -134,11 +135,17 @@ def run_fem_simulation(
         physics_type=PhysicsType.LINEAR_ELASTICITY,
         material=MaterialProperties(E=params['E'], nu=params['nu']),
         boundary_conditions=[
-            # Left edge fully fixed — prevents rigid body motion
+            # Left edge: u_x = 0 (roller — prevents x-translation, allows y-sliding)
             BoundaryCondition(
-                bc_type=BoundaryConditionType.DISPLACEMENT,
+                bc_type=BoundaryConditionType.SYMMETRY,
                 boundary_id=4,
-                value=np.array([0.0, 0.0]),
+                direction=0,
+            ),
+            # Bottom edge: u_y = 0 (prevents y-translation / rigid-body rotation)
+            BoundaryCondition(
+                bc_type=BoundaryConditionType.SYMMETRY,
+                boundary_id=1,
+                direction=1,
             ),
             # Right edge: applied uniaxial traction [σ₀, 0]
             BoundaryCondition(
@@ -208,7 +215,7 @@ def load_training_data(
         np.random.seed(1000 + i)
         E    = np.random.uniform(150e9, 250e9)
         nu   = np.random.uniform(0.25, 0.35)
-        load = np.random.uniform(80.0, 120.0)
+        load = np.random.uniform(80e6, 120e6)
 
         von_mises, elem_centers = run_fem_simulation(
             str(mesh_file), {'E': E, 'nu': nu, 'load': load}
@@ -404,7 +411,148 @@ def train_transolver(
         'model_path':     str(model_path),
         'best_val_loss':  best_val_loss,
         'epochs_trained': len(history['train_loss']),
+        'history':        history,
+        'model':          model,
+        'norm': {
+            'param_mean':  param_mean,
+            'param_std':   param_std,
+            'stress_mean': stress_mean,
+            'stress_std':  stress_std,
+        },
+        'val_idx':     val_idx,
+        'val_params':  val_params,
+        'val_coords':  val_coords,
+        'val_stress':  val_stress,
     }
+
+
+# =============================================================================
+# Visualization
+# =============================================================================
+
+def visualize_results(
+    results: Dict,
+    parameters: np.ndarray,
+    coordinates: np.ndarray,
+    stress_fields: np.ndarray,
+    output_dir: str,
+    n_samples: int = 3,
+) -> None:
+    """
+    Generate and save PNG visualizations:
+      1. Training / validation loss curve
+      2. Predicted vs ground-truth von Mises stress scatter + spatial plot
+         for up to n_samples validation samples
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.tri as mtri
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    history    = results['history']
+    model      = results['model']
+    norm       = results['norm']
+    val_idx    = results['val_idx']
+    val_params = results['val_params']
+    val_coords = results['val_coords']
+    val_stress = results['val_stress']
+
+    # ------------------------------------------------------------------
+    # 1. Loss curve
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(7, 4))
+    epochs = range(1, len(history['train_loss']) + 1)
+    ax.semilogy(epochs, history['train_loss'], label='Train loss')
+    ax.semilogy(epochs, history['val_loss'],   label='Val loss')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('MSE loss (normalised)')
+    ax.set_title('Transolver training history')
+    ax.legend()
+    ax.grid(True, which='both', ls='--', alpha=0.4)
+    fig.tight_layout()
+    loss_path = output_path / 'training_loss.png'
+    fig.savefig(loss_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved: {loss_path}")
+
+    # ------------------------------------------------------------------
+    # 2. Per-sample prediction vs ground truth
+    # ------------------------------------------------------------------
+    model.eval()
+    with torch.no_grad():
+        pred_norm = model.forward(val_params, val_coords).cpu().numpy()  # (V, N, 1)
+
+    stress_mean = norm['stress_mean']
+    stress_std  = norm['stress_std']
+
+    pred_denorm = pred_norm[..., 0] * stress_std + stress_mean   # (V, N)
+    true_denorm = val_stress.cpu().numpy()[..., 0] * stress_std + stress_mean
+
+    n_show = min(n_samples, len(val_idx))
+
+    for k in range(n_show):
+        orig_idx = val_idx[k]
+        coords_k = coordinates[orig_idx]          # (N, 2)
+        true_k   = stress_fields[orig_idx]        # (N,)  — original, unpadded
+        pred_k   = pred_denorm[k]                 # (N,)
+
+        # Mask out zero-padded elements
+        mask = true_k > 0
+
+        x, y   = coords_k[mask, 0], coords_k[mask, 1]
+        t_vals = true_k[mask]
+        p_vals = pred_k[mask]
+
+        vmin = min(t_vals.min(), p_vals.min())
+        vmax = max(t_vals.max(), p_vals.max())
+
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+        for ax, vals, title in zip(
+            axes[:2],
+            [t_vals, p_vals],
+            ['FEM ground truth', 'Transolver prediction'],
+        ):
+            try:
+                triang = mtri.Triangulation(x, y)
+                tcf = ax.tricontourf(triang, vals, levels=20, cmap='jet',
+                                     vmin=vmin, vmax=vmax)
+            except Exception:
+                sc = ax.scatter(x, y, c=vals, cmap='jet', s=8,
+                                vmin=vmin, vmax=vmax)
+                tcf = sc
+            plt.colorbar(tcf, ax=ax, label='von Mises (Pa)')
+            ax.set_title(title)
+            ax.set_aspect('equal')
+            ax.set_xlabel('x')
+            ax.set_ylabel('y')
+
+        # Scatter: predicted vs true
+        ax = axes[2]
+        ax.scatter(t_vals, p_vals, s=6, alpha=0.5)
+        lims = [vmin, vmax]
+        ax.plot(lims, lims, 'r--', lw=1, label='y = x')
+        ax.set_xlabel('FEM stress (Pa)')
+        ax.set_ylabel('Predicted stress (Pa)')
+        ax.set_title(f'Scatter — sample {orig_idx}')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        fig.suptitle(
+            f'Sample {orig_idx}  |  '
+            f'E={parameters[orig_idx,0]*1e9/1e9:.0f} GPa  '
+            f'ν={parameters[orig_idx,1]:.3f}  '
+            f'σ₀={parameters[orig_idx,2]:.1f} Pa',
+            fontsize=10,
+        )
+        fig.tight_layout()
+        out = output_path / f'prediction_sample_{orig_idx:03d}.png'
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"Saved: {out}")
 
 
 # =============================================================================
@@ -456,6 +604,9 @@ def main():
     print(f"  Model saved to:       {results['model_path']}")
     print(f"  Best validation loss: {results['best_val_loss']:.6f}")
     print(f"  Epochs trained:       {results['epochs_trained']}")
+
+    print("\nGenerating visualizations...")
+    visualize_results(results, parameters, coordinates, stress_fields, str(output_dir))
 
 
 if __name__ == "__main__":

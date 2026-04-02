@@ -161,11 +161,13 @@ def adapt_mesh_h(mesh_file, elem_error):
     Apply h-refinement (element splitting) driven by the element error field.
 
     Returns:
-        h_verts:    (N', 2) array — more nodes than original
-        h_elements: list of element connectivity — more elements than original
-        h_result:   HRefinementResult or None if failed
+        h_verts:       (N', 2) array — more nodes than original
+        h_elements:    list of element connectivity — more elements than original
+        h_result:      HRefinementResult or None if failed
+        h_mesh_file:   path to saved temp .mesh file (caller must delete); or None
     """
     try:
+        import tempfile
         from meshforge.mesh.mfem_manager import MFEMManager
         from meshforge.morphing.h_refinement import HRefinement, HRefinementConfig
 
@@ -173,7 +175,7 @@ def adapt_mesh_h(mesh_file, elem_error):
         if mgr.num_elements != len(elem_error):
             print(f"  H-refinement skipped: element count mismatch "
                   f"({mgr.num_elements} vs {len(elem_error)})")
-            return None, None, None
+            return None, None, None, None
 
         result = HRefinement(
             HRefinementConfig(error_threshold=0.3, max_refinement_levels=3,
@@ -183,12 +185,16 @@ def adapt_mesh_h(mesh_file, elem_error):
         if result.success:
             h_verts = mgr.get_nodes()
             h_elements = [list(e[e >= 0]) for e in mgr.get_elements()]
-            return h_verts, h_elements, result
-        return None, None, result
+            # Save adapted mesh so FEM can be run on it
+            with tempfile.NamedTemporaryFile(suffix='.mesh', delete=False) as f:
+                h_tmp = f.name
+            mgr.save(h_tmp)
+            return h_verts, h_elements, result, h_tmp
+        return None, None, result, None
 
     except Exception as e:
         print(f"  H-refinement failed: {e}")
-        return None, None, None
+        return None, None, None, None
 
 
 # keep old name as alias so existing call sites don't break
@@ -333,112 +339,119 @@ def refine_mesh(vertices: np.ndarray, elements: list, levels: int = 2) -> Tuple[
     return verts, elems
 
 
+def _retag_boundaries_mfem(mfem_mesh, verts: np.ndarray) -> None:
+    """Assign boundary tags geometrically for [0,1]x[0,1] domain."""
+    eps = 1e-10
+    for i in range(mfem_mesh.GetNBE()):
+        iv = mfem_mesh.GetBdrElement(i).GetVerticesArray()
+        xs = [verts[iv[j]][0] for j in range(len(iv))]
+        ys = [verts[iv[j]][1] for j in range(len(iv))]
+        if all(y < eps for y in ys):             tag = 1  # bottom
+        elif all(x > 1.0 - eps for x in xs):    tag = 2  # right
+        elif all(y > 1.0 - eps for y in ys):    tag = 3  # top
+        elif all(x < eps for x in xs):           tag = 4  # left
+        else:                                     tag = 5  # hole
+        mfem_mesh.GetBdrElement(i).SetAttribute(tag)
+    mfem_mesh.SetAttributes()
+
+
+def _extract_verts_ctypes(mfem_mesh) -> np.ndarray:
+    """Extract vertex coordinates from mfem.Mesh via ctypes."""
+    import ctypes
+    nv = mfem_mesh.GetNV()
+    verts = np.zeros((nv, 2))
+    for i in range(nv):
+        v = mfem_mesh.GetVertex(i)
+        p = ctypes.cast(int(v), ctypes.POINTER(ctypes.c_double))
+        verts[i] = [p[0], p[1]]
+    return verts
+
+
+def simulate_ground_truth(mesh_file: str, params: Dict) -> Tuple[np.ndarray, np.ndarray, list]:
+    """
+    Run PyMFEM linear-elasticity FEM on a mesh file.
+
+    Args:
+        mesh_file: Path to MFEM .mesh file
+        params:    Dict with 'E' (Pa), 'nu', 'load' (traction magnitude)
+
+    Returns:
+        von_mises:  per-element von Mises stress  (N_elements,)
+        vertices:   node coordinates              (N_nodes, 2)
+        elements:   element connectivity          list of lists
+    """
+    import tempfile
+    from meshforge.mesh.mfem_manager import MFEMManager
+    from meshforge.solvers.mfem_solver import MFEMSolver
+    from meshforge.solvers.base import (
+        PhysicsConfig, PhysicsType, MaterialProperties,
+        BoundaryCondition, BoundaryConditionType,
+    )
+
+    manager = MFEMManager(mesh_file)
+    verts = _extract_verts_ctypes(manager.mesh)
+    _retag_boundaries_mfem(manager.mesh, verts)
+
+    physics = PhysicsConfig(
+        physics_type=PhysicsType.LINEAR_ELASTICITY,
+        material=MaterialProperties(E=params['E'], nu=params['nu']),
+        boundary_conditions=[
+            # Left: u_x=0 — roller (prevents x-translation, allows y-sliding)
+            BoundaryCondition(BoundaryConditionType.SYMMETRY,
+                              boundary_id=4, direction=0),
+            # Bottom: u_y=0 — prevents y-translation / rigid-body rotation
+            BoundaryCondition(BoundaryConditionType.SYMMETRY,
+                              boundary_id=1, direction=1),
+            BoundaryCondition(BoundaryConditionType.TRACTION,
+                              boundary_id=2, value=np.array([params['load'], 0.])),
+        ],
+    )
+    solver = MFEMSolver(order=1)
+    solver.setup(manager, physics)
+    with tempfile.TemporaryDirectory() as tmp:
+        result = solver.solve(tmp)
+    if not result.success:
+        raise RuntimeError(f"FEM failed on {mesh_file}: {result.error_message}")
+
+    vertices = manager.get_nodes()
+    elements = [list(e[e >= 0]) for e in manager.get_elements()]
+    return result.solution_data['von_mises'], vertices, elements
+
+
 def simulate_ground_truth_refined(
-    vertices: np.ndarray,
-    elements: list,
-    boundary: list,
+    mesh_file: str,
     params: Dict,
-    refine_levels: int = 2
+    refine_levels: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, list]:
     """
-    Generate ground truth stress field on REFINED mesh.
+    Uniformly refine the mesh N levels, then run PyMFEM FEM.
 
     Args:
-        vertices: Original node coordinates
-        elements: Original element connectivity
-        boundary: Boundary info
-        params: Material/load parameters
-        refine_levels: Number of mesh refinement levels
+        mesh_file:     Path to MFEM .mesh file
+        params:        Dict with 'E', 'nu', 'load'
+        refine_levels: Uniform refinement levels
 
     Returns:
-        refined_vertices: Refined mesh vertices
-        von_mises: Von Mises stress at refined element centers
-        refined_elements: Refined element connectivity
+        von_mises:        per-element stress on refined mesh
+        refined_vertices: node coordinates  (N', 2)
+        refined_elements: element connectivity
     """
-    # Refine mesh
-    refined_verts, refined_elems = refine_mesh(vertices, elements, levels=refine_levels)
+    import os as _os, tempfile
+    from meshforge.mesh.mfem_manager import MFEMManager
 
-    # Compute hole properties from original boundary + topology
-    hole_props = compute_hole_properties(vertices, boundary, elements)
-    hole_center = hole_props['center']
-    hole_radius = hole_props['radius']
+    mgr = MFEMManager(mesh_file)
+    mgr.refine_uniformly(times=refine_levels)
 
-    element_centers = get_element_centers(refined_verts, refined_elems)
+    with tempfile.NamedTemporaryFile(suffix='.mesh', delete=False) as f:
+        fine_tmp = f.name
+    mgr.save(fine_tmp)
 
-    r = np.linalg.norm(element_centers - hole_center, axis=1)
-    r = np.maximum(r, hole_radius * 1.001)   # clamp just outside boundary
-    rho = r / hole_radius
+    try:
+        von_mises, verts, elems = simulate_ground_truth(fine_tmp, params)
+    finally:
+        _os.unlink(fine_tmp)
 
-    sigma_0 = params.get('load', 100.0)
-    E = params.get('E', 200e9)
-    nu = params.get('nu', 0.3)
-
-    theta = np.arctan2(element_centers[:, 1] - hole_center[1],
-                       element_centers[:, 0] - hole_center[0])
-
-    sigma_r = sigma_0 / 2 * ((1 - 1/rho**2) + (1 - 4/rho**2 + 3/rho**4) * np.cos(2*theta))
-    sigma_theta = sigma_0 / 2 * ((1 + 1/rho**2) - (1 + 3/rho**4) * np.cos(2*theta))
-    tau_r_theta = -sigma_0 / 2 * (1 + 2/rho**2 - 3/rho**4) * np.sin(2*theta)
-
-    von_mises = np.sqrt(sigma_r**2 + sigma_theta**2 - sigma_r*sigma_theta + 3*tau_r_theta**2)
-
-    scale = (E / 200e9) * ((1 + nu) / 1.3)
-    von_mises *= scale
-
-    return refined_verts, von_mises, refined_elems
-
-
-def simulate_ground_truth(
-    vertices: np.ndarray,
-    elements: list,
-    boundary: list,
-    params: Dict,
-    hole_props: Dict = None,
-) -> np.ndarray:
-    """
-    Generate ground truth stress field via FEA simulation (coarse mesh version).
-
-    Args:
-        vertices:   Node coordinates
-        elements:   Element connectivity
-        boundary:   Boundary info
-        params:     Material/load parameters
-        hole_props: Pre-computed hole centre/radius.  When given (recommended),
-                    skips re-detection so that h-refined/r-adapted meshes whose
-                    new edge midpoints would otherwise distort the hole estimate
-                    use the same reference geometry as the original coarse mesh.
-
-    Returns:
-        Von Mises stress at element centers
-    """
-    if hole_props is None:
-        hole_props = compute_hole_properties(vertices, boundary, elements)
-    hole_center = hole_props['center']
-    hole_radius = hole_props['radius']
-
-    element_centers = get_element_centers(vertices, elements)
-
-    r = np.linalg.norm(element_centers - hole_center, axis=1)
-    r = np.maximum(r, hole_radius * 1.001)   # clamp just outside boundary
-    rho = r / hole_radius
-
-    sigma_0 = params.get('load', 100.0)
-    E = params.get('E', 200e9)
-    nu = params.get('nu', 0.3)
-
-    theta = np.arctan2(element_centers[:, 1] - hole_center[1],
-                       element_centers[:, 0] - hole_center[0])
-
-    sigma_r = sigma_0 / 2 * ((1 - 1/rho**2) + (1 - 4/rho**2 + 3/rho**4) * np.cos(2*theta))
-    sigma_theta = sigma_0 / 2 * ((1 + 1/rho**2) - (1 + 3/rho**4) * np.cos(2*theta))
-    tau_r_theta = -sigma_0 / 2 * (1 + 2/rho**2 - 3/rho**4) * np.sin(2*theta)
-
-    von_mises = np.sqrt(sigma_r**2 + sigma_theta**2 - sigma_r*sigma_theta + 3*tau_r_theta**2)
-
-    scale = (E / 200e9) * ((1 + nu) / 1.3)
-    von_mises *= scale
-
-    return von_mises
+    return von_mises, verts, elems
 
 
 # =============================================================================
@@ -520,13 +533,8 @@ def predict_with_transolver(
     """
     import torch
 
-    hole_props = compute_hole_properties(vertices, boundary, elements)
-
-    # Create parameter vector (same format as training)
+    # Parameter vector must match training format: [E/GPa, nu, load]
     param_vec = np.array([
-        hole_props['center'][0],
-        hole_props['center'][1],
-        hole_props['radius'],
         params['E'] / 1e9,
         params['nu'],
         params['load'],
@@ -681,32 +689,20 @@ def visualize_transolver_test(
         params = {
             'E': np.random.uniform(150e9, 250e9),
             'nu': np.random.uniform(0.25, 0.35),
-            'load': np.random.uniform(80, 120),
+            'load': np.random.uniform(80e6, 120e6),
         }
 
-    # Compute hole geometry once from the ORIGINAL coarse mesh so that all
-    # later simulate_ground_truth calls (fine, coarse, adapted) use the same
-    # reference hole.  After h-refinement or r-adaptation, new midpoint
-    # vertices may be added on the hole boundary edges; their positions are
-    # chord midpoints of the blob boundary and can distort the estimated hole
-    # radius if we re-detect from the refined mesh.
-    orig_hole_props = compute_hole_properties(vertices, boundary, elements)
-    print(f"  Hole centre={orig_hole_props['center']}, "
-          f"radius={orig_hole_props['radius']:.4f}")
-
     # ── ① Fine-mesh ground truth ──────────────────────────────────────────
-    # Uniformly refine the coarse mesh N levels to get a dense reference.
     print(f"Building fine-mesh ground truth ({refine_levels} refinement levels)...")
-    fine_verts, fine_elements = refine_mesh(vertices, elements, levels=refine_levels)
-    gt_fine = simulate_ground_truth(fine_verts, fine_elements, boundary, params,
-                                    hole_props=orig_hole_props)
+    gt_fine, fine_verts, fine_elements = simulate_ground_truth_refined(
+        mesh_file, params, refine_levels=refine_levels
+    )
     fine_centers = get_element_centers(fine_verts, fine_elements)
     print(f"  Fine: {len(fine_verts)} nodes, {len(fine_elements)} elements  "
           f"peak={gt_fine.max():.1f}")
 
     # ── ② Coarse-mesh MFEM ────────────────────────────────────────────────
-    gt_coarse = simulate_ground_truth(vertices, elements, boundary, params,
-                                      hole_props=orig_hole_props)
+    gt_coarse, vertices, elements = simulate_ground_truth(mesh_file, params)
     coarse_centers = get_element_centers(vertices, elements)
     print(f"  Coarse MFEM peak={gt_coarse.max():.1f}")
 
@@ -761,7 +757,7 @@ def visualize_transolver_test(
     # nodes.  If r-adaptivity failed, fall back to the original file.
     print("Applying h-refinement...")
     h_src_file = r_tmp_file if r_tmp_file else mesh_file
-    h_verts, h_elements, h_result = adapt_mesh_h(h_src_file, adapt_signal)
+    h_verts, h_elements, h_result, h_adapted_file = adapt_mesh_h(h_src_file, adapt_signal)
     h_ok = h_result is not None and h_result.success
     if h_ok:
         print(f"  H-refine OK — {h_result.num_elements_before}→{h_result.num_elements_after} "
@@ -771,17 +767,24 @@ def visualize_transolver_test(
         h_elements = elements
         print("  H-refine unavailable")
 
-    # Clean up the temp r-adapted mesh file
+    # Clean up temp files
+    import os as _os
     if r_tmp_file:
-        import os as _os
-        try:
-            _os.unlink(r_tmp_file)
-        except OSError:
-            pass
+        try: _os.unlink(r_tmp_file)
+        except OSError: pass
 
     # ── ④ MFEM on the adapted (h-refined) mesh ────────────────────────────
-    gt_adapted = simulate_ground_truth(h_verts, h_elements, boundary, params,
-                                        hole_props=orig_hole_props)
+    if h_ok and h_adapted_file:
+        try:
+            gt_adapted, h_verts, h_elements = simulate_ground_truth(h_adapted_file, params)
+        finally:
+            try: _os.unlink(h_adapted_file)
+            except OSError: pass
+    else:
+        if h_adapted_file:
+            try: _os.unlink(h_adapted_file)
+            except OSError: pass
+        gt_adapted, h_verts, h_elements = simulate_ground_truth(mesh_file, params)
     adapted_centers = get_element_centers(h_verts, h_elements)
     print(f"  Adapted MFEM peak={gt_adapted.max():.1f}")
 
@@ -806,50 +809,63 @@ def visualize_transolver_test(
         fontsize=11, fontweight='bold', y=1.02
     )
 
+    # Convert stress to MPa for display (raw solver output is in Pa)
+    S = 1e-6
+    gt_fine_MPa    = gt_fine    * S
+    gt_coarse_MPa  = gt_coarse  * S
+    gt_adapted_MPa = gt_adapted * S
+    err_coarse_MPa = error_coarse * S
+    err_adapted_MPa = error_adapted * S
+
     # Shared stress colour scale across ①②④
-    stress_vmin = min(gt_fine.min(), gt_coarse.min(), gt_adapted.min())
-    stress_vmax = max(gt_fine.max(), gt_coarse.max(), gt_adapted.max())
+    # Clip at 98th percentile so the bulk of the field uses the full colour range;
+    # the extreme peak near the hole only occupies a tiny fraction of elements and
+    # would otherwise wash out all other variation.
+    stress_vmin = 0.0
+    stress_vmax = float(np.percentile(
+        np.concatenate([gt_fine_MPa, gt_coarse_MPa, gt_adapted_MPa]), 98
+    ))
 
     # ① Fine-mesh ground truth
     coll1 = plot_mesh_field(
-        axes[0], fine_verts, fine_elements, gt_fine,
+        axes[0], fine_verts, fine_elements, gt_fine_MPa,
         title=f"① Fine Mesh GT  ({len(fine_elements)} elems)\n"
               f"Uniform {refine_levels}-level refinement",
         cmap="jet", vmin=stress_vmin, vmax=stress_vmax
     )
-    fig.colorbar(coll1, ax=axes[0], shrink=0.8).set_label('Von Mises Stress', fontsize=8)
+    fig.colorbar(coll1, ax=axes[0], shrink=0.8).set_label('Von Mises Stress (MPa)', fontsize=8)
     axes[0].text(
-        0.02, 0.02, f"Peak: {gt_fine.max():.1f}\nReference solution",
+        0.02, 0.02, f"Peak: {gt_fine.max()*S:.1f} MPa\nReference solution",
         transform=axes[0].transAxes, fontsize=8, va='bottom',
         bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.9)
     )
 
     # ② Coarse-mesh MFEM
     coll2 = plot_mesh_field(
-        axes[1], vertices, elements, gt_coarse,
+        axes[1], vertices, elements, gt_coarse_MPa,
         title=f"② Coarse Mesh MFEM  ({len(elements)} elems)\n"
               f"Starting point — poor accuracy",
         cmap="jet", vmin=stress_vmin, vmax=stress_vmax
     )
-    fig.colorbar(coll2, ax=axes[1], shrink=0.8).set_label('Von Mises Stress', fontsize=8)
+    fig.colorbar(coll2, ax=axes[1], shrink=0.8).set_label('Von Mises Stress (MPa)', fontsize=8)
     axes[1].text(
         0.02, 0.02,
-        f"Peak: {gt_coarse.max():.1f}\nRel err vs GT: {rel_err_coarse:.1f}%",
+        f"Peak: {gt_coarse.max()*S:.1f} MPa\nRel err vs GT: {rel_err_coarse:.1f}%",
         transform=axes[1].transAxes, fontsize=8, va='bottom',
         bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9)
     )
 
     # ③ Error map: fine GT − coarse MFEM
-    err_vmax = max(error_coarse.max(), error_adapted.max())   # shared scale for ③ and ⑤
+    err_vmax_MPa = max(err_coarse_MPa.max(), err_adapted_MPa.max())   # shared scale for ③⑤
     coll3 = plot_mesh_field(
-        axes[2], vertices, elements, error_coarse,
+        axes[2], vertices, elements, err_coarse_MPa,
         title="③ Error Map  |GT − Coarse|\n(drives r+h adaptation)",
-        cmap="Reds", vmin=0, vmax=err_vmax
+        cmap="Reds", vmin=0, vmax=err_vmax_MPa
     )
-    fig.colorbar(coll3, ax=axes[2], shrink=0.8).set_label('|Fine GT − Coarse MFEM|', fontsize=8)
+    fig.colorbar(coll3, ax=axes[2], shrink=0.8).set_label('|Fine GT − Coarse MFEM| (MPa)', fontsize=8)
     axes[2].text(
         0.02, 0.98,
-        f"Mean: {np.mean(error_coarse):.2f}\nMax:  {np.max(error_coarse):.2f}\n"
+        f"Mean: {np.mean(error_coarse)*S:.2f} MPa\nMax:  {np.max(error_coarse)*S:.2f} MPa\n"
         f"Rel:  {rel_err_coarse:.1f}%",
         transform=axes[2].transAxes, fontsize=8, va='top',
         bbox=dict(boxstyle='round', facecolor='white', alpha=0.9)
@@ -857,13 +873,13 @@ def visualize_transolver_test(
 
     # ④ MFEM on adapted mesh (r+h)
     coll4 = plot_mesh_field(
-        axes[3], h_verts, h_elements, gt_adapted,
+        axes[3], h_verts, h_elements, gt_adapted_MPa,
         title=f"④ Adapted MFEM  ({len(h_elements)} elems)\n"
               f"After agentic r+h refinement loop",
         cmap="jet", vmin=stress_vmin, vmax=stress_vmax
     )
-    fig.colorbar(coll4, ax=axes[3], shrink=0.8).set_label('Von Mises Stress', fontsize=8)
-    note4_lines = [f"Peak: {gt_adapted.max():.1f}"]
+    fig.colorbar(coll4, ax=axes[3], shrink=0.8).set_label('Von Mises Stress (MPa)', fontsize=8)
+    note4_lines = [f"Peak: {gt_adapted.max()*S:.1f} MPa"]
     if h_ok:
         note4_lines.append(f"H-refine: {h_result.num_elements_before}→{h_result.num_elements_after} elems")
     if r_ok:
@@ -876,16 +892,16 @@ def visualize_transolver_test(
 
     # ⑤ Error map: fine GT − adapted MFEM
     coll5 = plot_mesh_field(
-        axes[4], h_verts, h_elements, error_adapted,
+        axes[4], h_verts, h_elements, err_adapted_MPa,
         title="⑤ Error Map  |GT − Adapted|\nAccuracy gain from the loop",
-        cmap="Reds", vmin=0, vmax=err_vmax
+        cmap="Reds", vmin=0, vmax=err_vmax_MPa
     )
-    fig.colorbar(coll5, ax=axes[4], shrink=0.8).set_label('|Fine GT − Adapted MFEM|', fontsize=8)
+    fig.colorbar(coll5, ax=axes[4], shrink=0.8).set_label('|Fine GT − Adapted MFEM| (MPa)', fontsize=8)
     improvement = rel_err_coarse - rel_err_adapted
     colour5 = 'lightgreen' if improvement > 0 else 'lightsalmon'
     axes[4].text(
         0.02, 0.98,
-        f"Mean: {np.mean(error_adapted):.2f}\nMax:  {np.max(error_adapted):.2f}\n"
+        f"Mean: {np.mean(error_adapted)*S:.2f} MPa\nMax:  {np.max(error_adapted)*S:.2f} MPa\n"
         f"Rel:  {rel_err_adapted:.1f}%\n"
         f"Δ error: {improvement:+.1f} pp\n"
         f"{'✓ improved' if improvement > 0 else '✗ no gain'}",
@@ -962,12 +978,12 @@ def compare_multiple_samples(
         params = {
             'E': np.random.uniform(150e9, 250e9),
             'nu': np.random.uniform(0.25, 0.35),
-            'load': np.random.uniform(80, 120),
+            'load': np.random.uniform(80e6, 120e6),
         }
 
         # Get refined ground truth
-        refined_verts, refined_stress, refined_elems = simulate_ground_truth_refined(
-            vertices, elements, boundary, params, refine_levels=refine_levels
+        refined_stress, refined_verts, refined_elems = simulate_ground_truth_refined(
+            str(mesh_file), params, refine_levels=refine_levels
         )
 
         # Get coarse prediction
@@ -976,7 +992,7 @@ def compare_multiple_samples(
                 model, vertices, elements, boundary, params, norm_params, device, max_elems
             )
         else:
-            coarse_stress = simulate_ground_truth(vertices, elements, boundary, params)
+            coarse_stress, _, _ = simulate_ground_truth(str(mesh_file), params)
             prediction = coarse_stress * (1 + 0.1 * np.random.randn(len(coarse_stress)))
             prediction = np.maximum(prediction, 0)
 
@@ -999,7 +1015,7 @@ def compare_multiple_samples(
         )
 
         # Compute error on coarse mesh
-        coarse_gt = simulate_ground_truth(vertices, elements, boundary, params)
+        coarse_gt, _, _ = simulate_ground_truth(str(mesh_file), params)
         error = np.abs(prediction - coarse_gt)
         mean_err = np.mean(error)
 
@@ -1076,11 +1092,11 @@ def visualize_best_training_sample(
         params = {
             'E': np.random.uniform(150e9, 250e9),
             'nu': np.random.uniform(0.25, 0.35),
-            'load': np.random.uniform(80, 120),
+            'load': np.random.uniform(80e6, 120e6),
         }
 
         # Get coarse ground truth and prediction
-        coarse_gt = simulate_ground_truth(vertices, elements, boundary, params)
+        coarse_gt, _, _ = simulate_ground_truth(str(mesh_file), params)
         prediction = predict_with_transolver(
             model, vertices, elements, boundary, params, norm_params, device, max_elems
         )
@@ -1109,8 +1125,8 @@ def visualize_best_training_sample(
     vertices, elements, boundary = read_mfem_mesh(str(best_mesh_file))
 
     # Generate ground truth on REFINED mesh
-    refined_verts, refined_stress, refined_elems = simulate_ground_truth_refined(
-        vertices, elements, boundary, best_params, refine_levels=refine_levels
+    refined_stress, refined_verts, refined_elems = simulate_ground_truth_refined(
+        str(best_mesh_file), best_params, refine_levels=refine_levels
     )
 
     # Get surrogate prediction on COARSE mesh
@@ -1119,7 +1135,7 @@ def visualize_best_training_sample(
     )
 
     # Coarse ground truth for error
-    coarse_ground_truth = simulate_ground_truth(vertices, elements, boundary, best_params)
+    coarse_ground_truth, _, _ = simulate_ground_truth(str(best_mesh_file), best_params)
 
     # Compute error
     error = np.abs(prediction - coarse_ground_truth)
@@ -1253,8 +1269,8 @@ def visualize_sciml_loop_output(
 
     # Generate ground truth on REFINED mesh
     print(f"Computing ground truth FEA on refined mesh (level={refine_levels})...")
-    refined_verts, refined_stress, refined_elems = simulate_ground_truth_refined(
-        vertices, elements, boundary, params, refine_levels=refine_levels
+    refined_stress, refined_verts, refined_elems = simulate_ground_truth_refined(
+        str(mesh_file), params, refine_levels=refine_levels
     )
     print(f"  Refined mesh - Vertices: {len(refined_verts)}, Elements: {len(refined_elems)}")
 
@@ -1265,7 +1281,7 @@ def visualize_sciml_loop_output(
     )
 
     # Coarse ground truth for error comparison
-    coarse_ground_truth = simulate_ground_truth(vertices, elements, boundary, params)
+    coarse_ground_truth, _, _ = simulate_ground_truth(str(mesh_file), params)
 
     # Compute error
     error = np.abs(prediction - coarse_ground_truth)
@@ -1394,7 +1410,7 @@ def visualize_sciml_active_learning(
         params = {
             'E': np.random.uniform(150e9, 250e9),
             'nu': np.random.uniform(0.25, 0.35),
-            'load': np.random.uniform(80, 120),
+            'load': np.random.uniform(80e6, 120e6),
         }
 
         coarse_gt = simulate_ground_truth(vertices, elements, boundary, params)
@@ -1417,7 +1433,7 @@ def visualize_sciml_active_learning(
         params = {
             'E': np.random.uniform(150e9, 250e9),
             'nu': np.random.uniform(0.25, 0.35),
-            'load': np.random.uniform(80, 120),
+            'load': np.random.uniform(80e6, 120e6),
         }
 
         coarse_gt = simulate_ground_truth(vertices, elements, boundary, params)
@@ -1451,13 +1467,13 @@ def visualize_sciml_active_learning(
 
     # Row 1: Best training sample
     vertices, elements, boundary = read_mfem_mesh(str(best_train['file']))
-    refined_verts, refined_stress, refined_elems = simulate_ground_truth_refined(
-        vertices, elements, boundary, best_train['params'], refine_levels=2
+    refined_stress, refined_verts, refined_elems = simulate_ground_truth_refined(
+        str(best_train['file']), best_train['params'], refine_levels=2
     )
     prediction = predict_with_transolver(
         model, vertices, elements, boundary, best_train['params'], norm_params, device, max_elems
     )
-    coarse_gt = simulate_ground_truth(vertices, elements, boundary, best_train['params'])
+    coarse_gt, _, _ = simulate_ground_truth(str(best_train['file']), best_train['params'])
     error = np.abs(prediction - coarse_gt)
 
     vmin = min(refined_stress.min(), prediction.min())
@@ -1484,13 +1500,13 @@ def visualize_sciml_active_learning(
 
     # Row 2: Worst test sample (where active learning would help)
     vertices, elements, boundary = read_mfem_mesh(str(worst_test['file']))
-    refined_verts, refined_stress, refined_elems = simulate_ground_truth_refined(
-        vertices, elements, boundary, worst_test['params'], refine_levels=2
+    refined_stress, refined_verts, refined_elems = simulate_ground_truth_refined(
+        str(worst_test['file']), worst_test['params'], refine_levels=2
     )
     prediction = predict_with_transolver(
         model, vertices, elements, boundary, worst_test['params'], norm_params, device, max_elems
     )
-    coarse_gt = simulate_ground_truth(vertices, elements, boundary, worst_test['params'])
+    coarse_gt, _, _ = simulate_ground_truth(str(worst_test['file']), worst_test['params'])
     error = np.abs(prediction - coarse_gt)
 
     vmin = min(refined_stress.min(), prediction.min())
@@ -1558,8 +1574,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     project_root = Path(__file__).parent.parent
-    samples_dir = args.samples_dir or str(project_root / "samples")
-    train_dir = args.train_dir or str(project_root / "train")
+    samples_dir = args.samples_dir or str(project_root / "train01")
+    train_dir = args.train_dir or str(project_root / "train01")
     model_dir = args.model_dir or str(project_root / "outputs" / "surrogate")
     output_dir = project_root / "tests" / "test_outputs"
     output_dir.mkdir(exist_ok=True)
@@ -1611,7 +1627,7 @@ if __name__ == "__main__":
 
         sample_idx = min(args.sample, len(mesh_files) - 1)
         mesh_file = str(mesh_files[sample_idx])
-        output_file = args.output or str(output_dir / f"transolver_test_sample_{sample_idx:03d}.png")
+        output_file = args.output or str(output_dir / f"sciml_loop_sample_{sample_idx:03d}.png")
 
         results = visualize_transolver_test(mesh_file, model_dir, output_file)
 

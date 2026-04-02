@@ -20,18 +20,51 @@ class PhysicsType(Enum):
     """Enumeration of supported physics types."""
     LINEAR_ELASTICITY = auto()
     HEAT_TRANSFER = auto()
+    # Future
+    INCOMPRESSIBLE_NAVIER_STOKES = auto()
+    STOKES = auto()
+    NONLINEAR_ELASTICITY = auto()
 
 
 class BoundaryConditionType(Enum):
     """Enumeration of boundary condition types."""
     # Mechanical
-    DISPLACEMENT = auto()  # Fixed displacement
-    TRACTION = auto()      # Applied force/traction
-    SYMMETRY = auto()      # Symmetry condition
+    DISPLACEMENT = auto()
+    TRACTION = auto()
+    SYMMETRY = auto()
     # Thermal
-    TEMPERATURE = auto()   # Fixed temperature (Dirichlet)
-    HEAT_FLUX = auto()     # Applied heat flux (Neumann)
-    CONVECTION = auto()    # Convective boundary
+    TEMPERATURE = auto()
+    HEAT_FLUX = auto()
+    CONVECTION = auto()
+    # Fluid (future)
+    VELOCITY = auto()
+    PRESSURE = auto()
+    SLIP = auto()
+    PERIODIC = auto()
+
+
+@dataclass
+class FluidProperties:
+    """
+    Material properties for fluid problems (Navier-Stokes / Stokes).
+
+    Attributes:
+        dynamic_viscosity: μ (Pa·s)
+        density: ρ (kg/m³)
+    """
+    dynamic_viscosity: float  # μ (Pa·s)
+    density: float            # ρ (kg/m³)
+
+    def __post_init__(self):
+        if self.dynamic_viscosity <= 0:
+            raise ValueError("dynamic_viscosity must be positive")
+        if self.density <= 0:
+            raise ValueError("density must be positive")
+
+    @property
+    def kinematic_viscosity(self) -> float:
+        """ν = μ / ρ (m²/s)"""
+        return self.dynamic_viscosity / self.density
 
 
 @dataclass
@@ -45,12 +78,14 @@ class MaterialProperties:
         density: Mass density (kg/m^3)
         k: Thermal conductivity (W/(m*K))
         cp: Specific heat capacity (J/(kg*K))
+        fluid: Fluid properties for Navier-Stokes / Stokes problems (optional)
     """
-    E: float = 200e9        # Default: Steel Young's modulus
-    nu: float = 0.3         # Default: Steel Poisson's ratio
-    density: float = 7850.0 # Default: Steel density
-    k: float = 50.0         # Default: Steel thermal conductivity
-    cp: float = 500.0       # Default: Steel specific heat
+    E: float = 200e9
+    nu: float = 0.3
+    density: float = 7850.0
+    k: float = 50.0
+    cp: float = 500.0
+    fluid: Optional[FluidProperties] = None
 
     def __post_init__(self):
         """Validate material properties."""
@@ -89,7 +124,7 @@ class BoundaryCondition:
     Attributes:
         bc_type: Type of boundary condition
         boundary_id: Boundary attribute/ID in the mesh
-        value: BC value (scalar, vector, or None for symmetry)
+        value: BC value (scalar, vector, or None for symmetry/slip)
         direction: Direction for displacement BCs (0=x, 1=y, 2=z)
     """
     bc_type: BoundaryConditionType
@@ -107,22 +142,69 @@ class BoundaryCondition:
 
 
 @dataclass
+class TransientConfig:
+    """
+    Time integration settings.
+
+    When set on PhysicsConfig, the solver runs a time-stepping loop.
+    None (default) means steady-state — existing behaviour is unchanged.
+
+    Attributes:
+        t_start: Start time
+        t_end: End time
+        dt: Time step size
+        scheme: Time integration scheme
+        save_interval: Save solution every N steps
+        initial_condition: Per-DOF initial values (None = zero)
+    """
+    t_start: float = 0.0
+    t_end: float = 1.0
+    dt: float = 0.01
+    scheme: str = "backward_euler"  # "backward_euler", "bdf2", "crank_nicolson"
+    save_interval: int = 1
+    initial_condition: Optional[np.ndarray] = None
+
+
+@dataclass
+class NonlinearConfig:
+    """
+    Newton iteration settings for nonlinear problems.
+
+    None (default) means linear solve — existing behaviour is unchanged.
+
+    Attributes:
+        max_iter: Maximum Newton iterations
+        abs_tol: Absolute residual tolerance
+        rel_tol: Relative residual tolerance
+        line_search: Enable line search in Newton iteration
+    """
+    max_iter: int = 20
+    abs_tol: float = 1e-10
+    rel_tol: float = 1e-8
+    line_search: bool = True
+
+
+@dataclass
 class PhysicsConfig:
     """
     Physics configuration for FEM analysis.
 
     Attributes:
-        physics_type: Type of physics (elasticity, heat transfer, etc.)
+        physics_type: Type of physics
         material: Material properties
         boundary_conditions: List of boundary conditions
         body_force: Body force vector (e.g., gravity)
         heat_source: Volumetric heat source (W/m^3)
+        transient: Time integration settings (None = steady-state)
+        nonlinear: Newton iteration settings (None = linear problem)
     """
     physics_type: PhysicsType
     material: MaterialProperties = field(default_factory=MaterialProperties)
     boundary_conditions: List[BoundaryCondition] = field(default_factory=list)
     body_force: Optional[np.ndarray] = None
     heat_source: float = 0.0
+    transient: Optional[TransientConfig] = None
+    nonlinear: Optional[NonlinearConfig] = None
 
 
 @dataclass

@@ -154,11 +154,8 @@ class MFEMSolver(SolverInterface):
         fespace = mfem.FiniteElementSpace(mesh, fec, dim)
         self._fespace = fespace
 
-        # Define essential (Dirichlet) boundary conditions
-        ess_tdof_list = mfem.intArray()
-        ess_bdr = self._get_essential_boundaries(mesh, dim)
-        if ess_bdr.Size() > 0:
-            fespace.GetEssentialTrueDofs(ess_bdr, ess_tdof_list)
+        # Define essential (Dirichlet) boundary conditions — per-component for SYMMETRY BCs
+        ess_tdof_list = self._get_essential_true_dofs(mesh, fespace)
 
         # Set up the bilinear form (stiffness matrix)
         a = mfem.BilinearForm(fespace)
@@ -333,22 +330,48 @@ class MFEMSolver(SolverInterface):
             metrics=metrics,
         )
 
-    def _get_essential_boundaries(self, mesh, dim: int):
-        """Get essential boundary markers for vector problems."""
+    def _get_essential_true_dofs(self, mesh, fespace):
+        """
+        Build the combined essential true-DOF list, supporting per-component constraints.
+
+        DISPLACEMENT BCs constrain all vector components on the marked boundary.
+        SYMMETRY BCs with direction=0 or 1 constrain only that displacement component,
+        which is the correct way to impose symmetry / roller BCs in MFEM.
+        """
         mfem = _get_mfem()
         num_bdr = mesh.bdr_attributes.Max() if mesh.bdr_attributes.Size() > 0 else 0
-        ess_bdr = mfem.intArray(num_bdr)
-        ess_bdr.Assign(0)
+
+        all_dofs: set = set()
 
         for bc in self._physics.boundary_conditions:
-            if bc.bc_type in (
+            if bc.bc_type not in (
                 BoundaryConditionType.DISPLACEMENT,
-                BoundaryConditionType.SYMMETRY
+                BoundaryConditionType.SYMMETRY,
             ):
-                if 1 <= bc.boundary_id <= num_bdr:
-                    ess_bdr[bc.boundary_id - 1] = 1
+                continue
+            if not (1 <= bc.boundary_id <= num_bdr):
+                continue
 
-        return ess_bdr
+            marker = mfem.intArray(num_bdr)
+            marker.Assign(0)
+            marker[bc.boundary_id - 1] = 1
+
+            tdofs = mfem.intArray()
+            if bc.bc_type == BoundaryConditionType.SYMMETRY and bc.direction is not None:
+                # Constrain only the specified displacement component (0=x, 1=y)
+                fespace.GetEssentialTrueDofs(marker, tdofs, bc.direction)
+            else:
+                # DISPLACEMENT: constrain all components
+                fespace.GetEssentialTrueDofs(marker, tdofs)
+
+            for j in range(tdofs.Size()):
+                all_dofs.add(tdofs[j])
+
+        sorted_dofs = sorted(all_dofs)
+        combined = mfem.intArray(len(sorted_dofs))
+        for i, v in enumerate(sorted_dofs):
+            combined[i] = v
+        return combined
 
     def _get_essential_boundaries_scalar(self, mesh):
         """Get essential boundary markers for scalar problems."""
