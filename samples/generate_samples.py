@@ -168,65 +168,20 @@ def create_plate_with_blob_hole(filename: str, center: tuple, base_radius: float
 
 
 def convert_gmsh_to_mfem(msh_file: str, mesh_file: str):
-    """Convert Gmsh .msh file to MFEM .mesh format (supports quads and triangles)."""
-    import meshio
+    """
+    Convert Gmsh .msh file to MFEM .mesh format using PyMFEM's native reader.
 
-    mesh = meshio.read(msh_file)
+    PyMFEM's Mesh class reads Gmsh v2/v4 format directly, mapping physical
+    curves to boundary attributes and physical surfaces to element attributes.
+    This is the authoritative conversion path — no meshio intermediary, no
+    manual edge iteration, no geometric fallback needed.
 
-    # Extract 2D elements (quads preferred, triangles as fallback)
-    points = mesh.points[:, :2]  # Only x, y coordinates
-
-    elements = []  # List of (type, vertices) where type is 2=tri, 3=quad
-
-    for cell_block in mesh.cells:
-        if cell_block.type == "quad":
-            for quad in cell_block.data:
-                elements.append((3, quad))  # MFEM type 3 = SQUARE/QUAD
-        elif cell_block.type == "triangle":
-            for tri in cell_block.data:
-                elements.append((2, tri))  # MFEM type 2 = TRIANGLE
-
-    if not elements:
-        raise ValueError("No quads or triangles found in mesh")
-
-    # Collect ALL boundary edges across every line cell block (one block per physical group)
-    all_lines = []
-    all_line_tags = []
-    for idx, cell_block in enumerate(mesh.cells):
-        if cell_block.type == "line":
-            if "gmsh:physical" in mesh.cell_data:
-                tags = mesh.cell_data["gmsh:physical"][idx]
-            else:
-                tags = [1] * len(cell_block.data)
-            for j, line in enumerate(cell_block.data):
-                all_lines.append(line)
-                all_line_tags.append(int(tags[j]))
-
-    # Write MFEM format
-    with open(mesh_file, 'w') as f:
-        f.write("MFEM mesh v1.0\n\n")
-        f.write("dimension\n2\n\n")
-
-        # Elements (quads and/or triangles)
-        f.write(f"elements\n{len(elements)}\n")
-        for elem_type, verts in elements:
-            if elem_type == 3:  # Quad
-                f.write(f"1 3 {verts[0]} {verts[1]} {verts[2]} {verts[3]}\n")
-            else:  # Triangle
-                f.write(f"1 2 {verts[0]} {verts[1]} {verts[2]}\n")
-        f.write("\n")
-
-        # Boundary (lines) — all physical groups preserved
-        if all_lines:
-            f.write(f"boundary\n{len(all_lines)}\n")
-            for line, tag in zip(all_lines, all_line_tags):
-                f.write(f"{tag} 1 {line[0]} {line[1]}\n")
-            f.write("\n")
-
-        # Vertices
-        f.write(f"vertices\n{len(points)}\n2\n")
-        for pt in points:
-            f.write(f"{pt[0]} {pt[1]}\n")
+    Boundary attribute mapping (set via gmsh.model.addPhysicalGroup):
+      1 = bottom, 2 = right, 3 = top, 4 = left, 5 = hole
+    """
+    import mfem.ser as mfem
+    mesh = mfem.Mesh(msh_file, 1, 1)
+    mesh.Print(mesh_file)
 
 
 def generate_all_samples(output_dir: str, n_samples: int = 30, mesh_size: float = 0.1):

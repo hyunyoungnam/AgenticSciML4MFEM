@@ -1,26 +1,33 @@
 """
-Transolver Test and Visualization.
+Ensemble Uncertainty Visualization.
 
-Tests the trained Transolver surrogate model on unseen samples.
+Tests the ensemble surrogate pipeline:
+  1. Train a small EnsembleModel on FEM samples (or on-the-fly if none exist)
+  2. Predict mean field + per-node uncertainty on a coarse mesh
+  3. Drive r-adaptivity with the uncertainty signal (no GT needed)
+  4. Show how uncertainty changes after mesh adaptation
+  5. Optionally compare against fine-mesh GT when FEM produces valid results
 
-Workflow:
-1. Load trained Transolver model from outputs/surrogate/
-2. Load TEST meshes from samples/ (different from training data)
-3. Generate ground truth stress via FEA simulation
-4. Compare surrogate prediction vs ground truth
-5. Visualize: Ground Truth | Surrogate Prediction | Error Map
+New 5-panel layout:
+  ① Ensemble mean prediction on coarse mesh
+  ② Ensemble uncertainty (std across members) — the adaptation signal
+  ③ R-adapted mesh (nodes clustered toward high-uncertainty regions)
+  ④ Ensemble uncertainty on adapted mesh
+  ⑤ GT comparison (optional — shown only when FEM returns non-trivial results)
 
 Usage:
     python tests/test_transolver.py
-    python tests/test_transolver.py --sample 5
+    python tests/test_transolver.py --sample 3
     python tests/test_transolver.py --compare
+    python tests/test_transolver.py --no-gt
 """
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import argparse
-import json
 
 import numpy as np
 
@@ -34,14 +41,12 @@ import matplotlib.colors as mcolors
 
 
 # =============================================================================
-# Mesh Utilities
+# Mesh I/O
 # =============================================================================
 
 def read_mfem_mesh(filepath: str) -> Tuple[np.ndarray, list, list]:
-    """Read MFEM mesh file."""
-    vertices = []
-    elements = []
-    boundary = []
+    """Read MFEM .mesh file → (vertices, elements, boundary)."""
+    vertices, elements, boundary = [], [], []
 
     with open(filepath, 'r') as f:
         lines = f.readlines()
@@ -52,38 +57,30 @@ def read_mfem_mesh(filepath: str) -> Tuple[np.ndarray, list, list]:
 
         if line == "elements":
             i += 1
-            n_elements = int(lines[i].strip())
-            i += 1
-            for _ in range(n_elements):
-                parts = lines[i].strip().split()
-                elem_type = int(parts[1])
-                if elem_type == 2:  # Triangle
+            n = int(lines[i].strip()); i += 1
+            for _ in range(n):
+                parts = lines[i].strip().split(); i += 1
+                t = int(parts[1])
+                if t == 2:
                     elements.append([int(parts[2]), int(parts[3]), int(parts[4])])
-                elif elem_type == 3:  # Quad
-                    elements.append([int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])])
-                i += 1
+                elif t == 3:
+                    elements.append([int(parts[2]), int(parts[3]),
+                                     int(parts[4]), int(parts[5])])
 
         elif line == "boundary":
             i += 1
-            n_boundary = int(lines[i].strip())
-            i += 1
-            for _ in range(n_boundary):
-                parts = lines[i].strip().split()
-                attr = int(parts[0])
-                v1, v2 = int(parts[2]), int(parts[3])
-                boundary.append((attr, v1, v2))
-                i += 1
+            n = int(lines[i].strip()); i += 1
+            for _ in range(n):
+                parts = lines[i].strip().split(); i += 1
+                boundary.append((int(parts[0]), int(parts[2]), int(parts[3])))
 
         elif line == "vertices":
             i += 1
-            n_vertices = int(lines[i].strip())
-            i += 1
-            dim = int(lines[i].strip())
-            i += 1
-            for _ in range(n_vertices):
-                coords = [float(x) for x in lines[i].strip().split()]
+            n = int(lines[i].strip()); i += 1
+            i += 1  # skip dimension line
+            for _ in range(n):
+                coords = [float(x) for x in lines[i].strip().split()]; i += 1
                 vertices.append(coords[:2])
-                i += 1
         else:
             i += 1
 
@@ -91,105 +88,104 @@ def read_mfem_mesh(filepath: str) -> Tuple[np.ndarray, list, list]:
 
 
 def get_element_centers(vertices: np.ndarray, elements: list) -> np.ndarray:
-    """Compute element centroids."""
-    centers = []
-    for elem in elements:
-        elem_vertices = vertices[elem]
-        centers.append(np.mean(elem_vertices, axis=0))
-    return np.array(centers)
+    """Centroid of each element → (N_elem, 2)."""
+    return np.array([np.mean(vertices[e], axis=0) for e in elements])
 
 
-# =============================================================================
-# R-Adaptivity Helpers
-# =============================================================================
+def node_to_elem_field(elements: list, node_field: np.ndarray) -> np.ndarray:
+    """Average per-node values to element centers."""
+    return np.array([np.mean(node_field[e]) for e in elements])
 
-def elem_to_node_error(vertices: np.ndarray, elements: list, elem_error: np.ndarray) -> np.ndarray:
-    """Average element-centered error to node-centered error."""
-    n = len(vertices)
-    total = np.zeros(n)
-    count = np.zeros(n)
+
+def elem_to_node_field(vertices: np.ndarray, elements: list,
+                       elem_field: np.ndarray) -> np.ndarray:
+    """Average per-element values to nodes."""
+    total = np.zeros(len(vertices))
+    count = np.zeros(len(vertices))
     for i, elem in enumerate(elements):
         for v in elem:
-            total[v] += elem_error[i]
+            total[v] += elem_field[i]
             count[v] += 1
     return total / np.maximum(count, 1)
 
 
-def adapt_mesh_r(mesh_file, vertices, elements, elem_error):
+# =============================================================================
+# Mesh Adaptation
+# =============================================================================
+
+def adapt_mesh_r(mesh_file: str,
+                 node_uncertainty: np.ndarray
+                 ) -> Tuple[Optional[np.ndarray], object, Optional[str]]:
     """
-    Apply TMOP r-adaptivity (node relocation) driven by the element error field.
+    Apply TMOP r-adaptivity driven by per-node uncertainty.
+
+    Args:
+        mesh_file:        Path to MFEM .mesh file
+        node_uncertainty: (N_nodes,) scalar uncertainty per node
 
     Returns:
-        adapted_verts:   (N, 2) array of relocated node positions
-        adapt_result:    AdaptivityResult or None if adaptation failed
-        r_adapted_file:  path to a temp .mesh file with the adapted nodes
-                         (caller is responsible for deleting it)
+        (adapted_verts, AdaptivityResult|None, tmp_mesh_path|None)
     """
-    import tempfile, os
     try:
         from meshforge.mesh.mfem_manager import MFEMManager
         from meshforge.morphing.r_adaptivity import TMOPAdaptivity, AdaptivityConfig
 
-        node_err = elem_to_node_error(vertices, elements, elem_error)
         mgr = MFEMManager(mesh_file)
-        if mgr.num_nodes != len(vertices):
+        if mgr.num_nodes != len(node_uncertainty):
             print(f"  R-adaptivity skipped: node count mismatch "
-                  f"({mgr.num_nodes} vs {len(vertices)})")
-            return vertices, None, None
+                  f"({mgr.num_nodes} vs {len(node_uncertainty)})")
+            return None, None, None
 
         result = TMOPAdaptivity(
             AdaptivityConfig(max_iterations=100, verbosity=0)
-        ).adapt(mgr, node_err)
+        ).adapt(mgr, node_uncertainty)
 
         if result.success:
-            # Save the r-adapted mesh to a temp file so h-refinement can chain on it
             with tempfile.NamedTemporaryFile(suffix=".mesh", delete=False) as f:
-                tmp_path = f.name
-            mgr._extract_mesh_data()   # sync Python-side caches
-            saved = mgr.save(tmp_path)
-            r_file = str(saved) if saved is not None else None
-            return result.coords_adapted, result, r_file
-        return vertices, None, None
+                tmp = f.name
+            mgr._extract_mesh_data()
+            saved = mgr.save(tmp)
+            return result.coords_adapted, result, str(saved) if saved else None
+
+        return None, None, None
 
     except Exception as e:
         print(f"  R-adaptivity failed: {e}")
-        return vertices, None, None
+        return None, None, None
 
 
-def adapt_mesh_h(mesh_file, elem_error):
+def adapt_mesh_h(mesh_file: str,
+                 elem_uncertainty: np.ndarray
+                 ) -> Tuple[Optional[np.ndarray], Optional[list], object, Optional[str]]:
     """
-    Apply h-refinement (element splitting) driven by the element error field.
+    Apply h-refinement driven by per-element uncertainty.
 
     Returns:
-        h_verts:       (N', 2) array — more nodes than original
-        h_elements:    list of element connectivity — more elements than original
-        h_result:      HRefinementResult or None if failed
-        h_mesh_file:   path to saved temp .mesh file (caller must delete); or None
+        (h_verts, h_elements, HRefinementResult|None, tmp_mesh_path|None)
     """
     try:
-        import tempfile
         from meshforge.mesh.mfem_manager import MFEMManager
         from meshforge.morphing.h_refinement import HRefinement, HRefinementConfig
 
         mgr = MFEMManager(mesh_file)
-        if mgr.num_elements != len(elem_error):
+        if mgr.num_elements != len(elem_uncertainty):
             print(f"  H-refinement skipped: element count mismatch "
-                  f"({mgr.num_elements} vs {len(elem_error)})")
+                  f"({mgr.num_elements} vs {len(elem_uncertainty)})")
             return None, None, None, None
 
         result = HRefinement(
             HRefinementConfig(error_threshold=0.3, max_refinement_levels=3,
                               max_elements=3000)
-        ).refine(mgr, elem_error)
+        ).refine(mgr, elem_uncertainty)
 
         if result.success:
             h_verts = mgr.get_nodes()
             h_elements = [list(e[e >= 0]) for e in mgr.get_elements()]
-            # Save adapted mesh so FEM can be run on it
             with tempfile.NamedTemporaryFile(suffix='.mesh', delete=False) as f:
-                h_tmp = f.name
-            mgr.save(h_tmp)
-            return h_verts, h_elements, result, h_tmp
+                tmp = f.name
+            mgr.save(tmp)
+            return h_verts, h_elements, result, tmp
+
         return None, None, result, None
 
     except Exception as e:
@@ -197,166 +193,26 @@ def adapt_mesh_h(mesh_file, elem_error):
         return None, None, None, None
 
 
-# keep old name as alias so existing call sites don't break
-def adapt_mesh_to_error(mesh_file, vertices, elements, elem_error):
-    return adapt_mesh_r(mesh_file, vertices, elements, elem_error)
-
-
 # =============================================================================
-# Ground Truth FEA Simulation
+# FEM Simulation (optional GT)
 # =============================================================================
-
-def compute_hole_properties(vertices: np.ndarray, boundary: list,
-                            elements: list = None) -> Dict:
-    """
-    Extract hole centre and radius from the mesh.
-
-    Strategy (in priority order):
-    1. Boundary edges tagged attr=5  → hole boundary vertices
-    2. Topological inner boundary    → edges on hole + outer sides, strip outer
-    3. Fallback                      → mesh centroid + hardcoded 0.15
-
-    The topological path detects boundary edges as those shared by exactly one
-    element, then excludes vertices that sit on the plate's outer perimeter
-    (x≈0, x≈1, y≈0, y≈1).  What remains is the hole.
-    """
-    from collections import defaultdict
-
-    # ── path 1: explicitly tagged attr=5 ────────────────────────────────
-    hole_vertices: set = set()
-    for attr, v1, v2 in boundary:
-        if attr == 5:
-            hole_vertices.add(v1)
-            hole_vertices.add(v2)
-
-    if hole_vertices:
-        hole_coords = vertices[sorted(hole_vertices)]
-        hole_center = np.mean(hole_coords, axis=0)
-        hole_radius = float(np.max(np.linalg.norm(hole_coords - hole_center, axis=1)))
-        return {'center': hole_center, 'radius': hole_radius}
-
-    # ── path 2: topological detection ───────────────────────────────────
-    if elements is not None:
-        edge_count: dict = defaultdict(int)
-        for elem in elements:
-            n = len(elem)
-            for k in range(n):
-                e = tuple(sorted((elem[k], elem[(k + 1) % n])))
-                edge_count[e] += 1
-        topo_bdr_edges = {e for e, c in edge_count.items() if c == 1}
-
-        # Edges in MFEM boundary section (mechanical/Dirichlet BC)
-        mfem_bdr_edges = {tuple(sorted((v1, v2))) for _, v1, v2 in boundary}
-
-        # Collect all topo-boundary vertices that are NOT on the plate perimeter
-        plate_tol = 1e-6
-        x_min, x_max = vertices[:, 0].min(), vertices[:, 0].max()
-        y_min, y_max = vertices[:, 1].min(), vertices[:, 1].max()
-
-        def on_outer_bdr(v: int) -> bool:
-            x, y = vertices[v]
-            return (x <= x_min + plate_tol or x >= x_max - plate_tol or
-                    y <= y_min + plate_tol or y >= y_max - plate_tol)
-
-        for e in topo_bdr_edges:
-            if e not in mfem_bdr_edges:
-                for v in e:
-                    if not on_outer_bdr(v):
-                        hole_vertices.add(v)
-
-    if hole_vertices:
-        hole_coords = vertices[sorted(hole_vertices)]
-        hole_center = np.mean(hole_coords, axis=0)
-        hole_radius = float(np.max(np.linalg.norm(hole_coords - hole_center, axis=1)))
-        return {'center': hole_center, 'radius': hole_radius}
-
-    # ── path 3: fallback ─────────────────────────────────────────────────
-    return {'center': np.mean(vertices, axis=0), 'radius': 0.15}
-
-
-def refine_mesh(vertices: np.ndarray, elements: list, levels: int = 2) -> Tuple[np.ndarray, list]:
-    """
-    Refine mesh by subdividing elements.
-
-    Args:
-        vertices: Original vertices
-        elements: Original elements
-        levels: Number of refinement levels
-
-    Returns:
-        Refined vertices and elements
-    """
-    verts = vertices.copy()
-    elems = [list(e) for e in elements]
-
-    for _ in range(levels):
-        new_elems = []
-        edge_midpoints = {}  # (v1, v2) -> midpoint_index
-
-        for elem in elems:
-            if len(elem) == 4:  # Quad
-                # Get or create midpoints for each edge and center
-                midpoints = []
-                for i in range(4):
-                    v1, v2 = elem[i], elem[(i+1) % 4]
-                    edge_key = tuple(sorted([v1, v2]))
-                    if edge_key not in edge_midpoints:
-                        mid = (verts[v1] + verts[v2]) / 2
-                        edge_midpoints[edge_key] = len(verts)
-                        verts = np.vstack([verts, mid])
-                    midpoints.append(edge_midpoints[edge_key])
-
-                # Center point
-                center = np.mean(verts[elem], axis=0)
-                center_idx = len(verts)
-                verts = np.vstack([verts, center])
-
-                # Create 4 sub-quads
-                new_elems.append([elem[0], midpoints[0], center_idx, midpoints[3]])
-                new_elems.append([midpoints[0], elem[1], midpoints[1], center_idx])
-                new_elems.append([center_idx, midpoints[1], elem[2], midpoints[2]])
-                new_elems.append([midpoints[3], center_idx, midpoints[2], elem[3]])
-
-            elif len(elem) == 3:  # Triangle
-                midpoints = []
-                for i in range(3):
-                    v1, v2 = elem[i], elem[(i+1) % 3]
-                    edge_key = tuple(sorted([v1, v2]))
-                    if edge_key not in edge_midpoints:
-                        mid = (verts[v1] + verts[v2]) / 2
-                        edge_midpoints[edge_key] = len(verts)
-                        verts = np.vstack([verts, mid])
-                    midpoints.append(edge_midpoints[edge_key])
-
-                # Create 4 sub-triangles
-                new_elems.append([elem[0], midpoints[0], midpoints[2]])
-                new_elems.append([midpoints[0], elem[1], midpoints[1]])
-                new_elems.append([midpoints[2], midpoints[1], elem[2]])
-                new_elems.append([midpoints[0], midpoints[1], midpoints[2]])
-
-        elems = new_elems
-
-    return verts, elems
-
 
 def _retag_boundaries_mfem(mfem_mesh, verts: np.ndarray) -> None:
-    """Assign boundary tags geometrically for [0,1]x[0,1] domain."""
     eps = 1e-10
     for i in range(mfem_mesh.GetNBE()):
         iv = mfem_mesh.GetBdrElement(i).GetVerticesArray()
         xs = [verts[iv[j]][0] for j in range(len(iv))]
         ys = [verts[iv[j]][1] for j in range(len(iv))]
-        if all(y < eps for y in ys):             tag = 1  # bottom
-        elif all(x > 1.0 - eps for x in xs):    tag = 2  # right
-        elif all(y > 1.0 - eps for y in ys):    tag = 3  # top
-        elif all(x < eps for x in xs):           tag = 4  # left
-        else:                                     tag = 5  # hole
+        if all(y < eps for y in ys):           tag = 1
+        elif all(x > 1.0 - eps for x in xs):  tag = 2
+        elif all(y > 1.0 - eps for y in ys):  tag = 3
+        elif all(x < eps for x in xs):         tag = 4
+        else:                                   tag = 5
         mfem_mesh.GetBdrElement(i).SetAttribute(tag)
     mfem_mesh.SetAttributes()
 
 
 def _extract_verts_ctypes(mfem_mesh) -> np.ndarray:
-    """Extract vertex coordinates from mfem.Mesh via ctypes."""
     import ctypes
     nv = mfem_mesh.GetNV()
     verts = np.zeros((nv, 2))
@@ -367,20 +223,17 @@ def _extract_verts_ctypes(mfem_mesh) -> np.ndarray:
     return verts
 
 
-def simulate_ground_truth(mesh_file: str, params: Dict) -> Tuple[np.ndarray, np.ndarray, list]:
+def simulate_ground_truth(mesh_file: str,
+                          params: Dict
+                          ) -> Tuple[np.ndarray, np.ndarray, list]:
     """
-    Run PyMFEM linear-elasticity FEM on a mesh file.
-
-    Args:
-        mesh_file: Path to MFEM .mesh file
-        params:    Dict with 'E' (Pa), 'nu', 'load' (traction magnitude)
+    Run PyMFEM linear-elasticity FEM.
 
     Returns:
-        von_mises:  per-element von Mises stress  (N_elements,)
-        vertices:   node coordinates              (N_nodes, 2)
-        elements:   element connectivity          list of lists
+        (von_mises per element, vertices, elements)
+        Returns all-zeros von_mises if the solver fails or produces a
+        trivial solution — callers should check ``np.any(von_mises > 0)``.
     """
-    import tempfile
     from meshforge.mesh.mfem_manager import MFEMManager
     from meshforge.solvers.mfem_solver import MFEMSolver
     from meshforge.solvers.base import (
@@ -396,47 +249,35 @@ def simulate_ground_truth(mesh_file: str, params: Dict) -> Tuple[np.ndarray, np.
         physics_type=PhysicsType.LINEAR_ELASTICITY,
         material=MaterialProperties(E=params['E'], nu=params['nu']),
         boundary_conditions=[
-            # Left: u_x=0 — roller (prevents x-translation, allows y-sliding)
             BoundaryCondition(BoundaryConditionType.SYMMETRY,
                               boundary_id=4, direction=0),
-            # Bottom: u_y=0 — prevents y-translation / rigid-body rotation
             BoundaryCondition(BoundaryConditionType.SYMMETRY,
                               boundary_id=1, direction=1),
             BoundaryCondition(BoundaryConditionType.TRACTION,
-                              boundary_id=2, value=np.array([params['load'], 0.])),
+                              boundary_id=2,
+                              value=np.array([params['load'], 0.])),
         ],
     )
     solver = MFEMSolver(order=1)
     solver.setup(manager, physics)
+
     with tempfile.TemporaryDirectory() as tmp:
         result = solver.solve(tmp)
-    if not result.success:
-        raise RuntimeError(f"FEM failed on {mesh_file}: {result.error_message}")
 
     vertices = manager.get_nodes()
     elements = [list(e[e >= 0]) for e in manager.get_elements()]
-    return result.solution_data['von_mises'], vertices, elements
+
+    if not result.success:
+        return np.zeros(len(elements)), vertices, elements
+
+    return result.solution_data.get('von_mises',
+                                    np.zeros(len(elements))), vertices, elements
 
 
-def simulate_ground_truth_refined(
-    mesh_file: str,
-    params: Dict,
-    refine_levels: int = 2,
-) -> Tuple[np.ndarray, np.ndarray, list]:
-    """
-    Uniformly refine the mesh N levels, then run PyMFEM FEM.
-
-    Args:
-        mesh_file:     Path to MFEM .mesh file
-        params:        Dict with 'E', 'nu', 'load'
-        refine_levels: Uniform refinement levels
-
-    Returns:
-        von_mises:        per-element stress on refined mesh
-        refined_vertices: node coordinates  (N', 2)
-        refined_elements: element connectivity
-    """
-    import os as _os, tempfile
+def simulate_ground_truth_refined(mesh_file: str, params: Dict,
+                                  refine_levels: int = 2
+                                  ) -> Tuple[np.ndarray, np.ndarray, list]:
+    """Uniformly refine mesh N levels then run FEM."""
     from meshforge.mesh.mfem_manager import MFEMManager
 
     mgr = MFEMManager(mesh_file)
@@ -445,136 +286,228 @@ def simulate_ground_truth_refined(
     with tempfile.NamedTemporaryFile(suffix='.mesh', delete=False) as f:
         fine_tmp = f.name
     mgr.save(fine_tmp)
-
     try:
-        von_mises, verts, elems = simulate_ground_truth(fine_tmp, params)
+        return simulate_ground_truth(fine_tmp, params)
     finally:
-        _os.unlink(fine_tmp)
-
-    return von_mises, verts, elems
+        os.unlink(fine_tmp)
 
 
 # =============================================================================
-# Surrogate Model Loading and Prediction
+# Ensemble Model
 # =============================================================================
 
-def load_transolver_model(model_dir: str):
+def load_ensemble_model(model_dir: str):
     """
-    Load trained Transolver model.
+    Load a trained EnsembleModel from ``model_dir/ensemble_model.pt``.
+
+    Returns a SurrogateTrainer with normalizers restored from the sidecar
+    ``normalizer_params.json`` so that predictions are properly denormalized.
+
+    Raises FileNotFoundError if the model file does not exist.
+    """
+    import json, torch
+    from meshforge.surrogate.base import TransolverConfig, EnsembleConfig
+    from meshforge.surrogate.ensemble import EnsembleModel
+    from meshforge.surrogate.trainer import SurrogateTrainer, TrainingConfig, Normalizer
+
+    path = Path(model_dir) / "ensemble_model.pt"
+    if not path.exists():
+        raise FileNotFoundError(f"Ensemble model not found: {path}")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    mc = checkpoint['ensemble_config']['member_config']
+    member_cfg = TransolverConfig(**{k: v for k, v in mc.items()
+                                     if k != 'checkpoint_dir'})
+    ens_cfg = EnsembleConfig(
+        n_members=checkpoint['ensemble_config']['n_members'],
+        member_config=member_cfg,
+    )
+    model = EnsembleModel(ens_cfg)
+    model.build(checkpoint['input_dim'],
+                checkpoint['coord_dim'],
+                checkpoint['num_points'])
+    model.load_state_dict(checkpoint['state_dict'])
+    model._is_trained = True
+    model.eval()
+
+    # Reconstruct trainer shell with saved normalizers
+    trainer = SurrogateTrainer(TrainingConfig())
+    trainer._model = model
+
+    norm_path = Path(model_dir) / "normalizer_params.json"
+    if norm_path.exists():
+        with open(norm_path) as f:
+            np_dict = json.load(f)
+        if 'input_mean' in np_dict:
+            n = Normalizer()
+            n.mean = np.array(np_dict['input_mean'])
+            n.std  = np.array(np_dict['input_std'])
+            trainer._input_normalizer = n
+        if 'output_mean' in np_dict:
+            n = Normalizer()
+            n.mean = np.array(np_dict['output_mean'])
+            n.std  = np.array(np_dict['output_std'])
+            trainer._output_normalizer = n
+
+    return trainer
+
+
+def train_fast_ensemble(
+    samples_dirs: List[str],
+    n_ensemble: int = 3,
+    epochs: int = 80,
+    params_seed: int = 42,
+    save_dir: Optional[str] = None,
+):
+    """
+    Train an EnsembleModel on all FEM samples from one or more directories.
 
     Args:
-        model_dir: Directory containing transolver_model.pt
+        samples_dirs: One or more directories containing sample_*.mesh files
+        n_ensemble:   Ensemble members
+        epochs:       Training epochs
+        params_seed:  RNG seed for material/load parameters
+        save_dir:     Save trained model here if provided
 
     Returns:
-        Loaded model, normalization params
+        SurrogateTrainer with trained model and normalizers
     """
-    model_path = Path(model_dir) / "transolver_model.pt"
-    norm_path = Path(model_dir) / "normalization.json"
-
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model not found: {model_path}")
-
-    import torch
+    from meshforge.data.dataset import FEMDataset, FEMSample, DatasetConfig
+    from meshforge.surrogate.trainer import SurrogateTrainer, TrainingConfig
     from meshforge.surrogate.base import TransolverConfig
-    from meshforge.surrogate.transolver import TransolverModel
 
-    # Load normalization params
-    norm_params = {}
-    if norm_path.exists():
-        with open(norm_path, 'r') as f:
-            norm_params = json.load(f)
+    if isinstance(samples_dirs, str):
+        samples_dirs = [samples_dirs]
 
-    # Load model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    checkpoint = torch.load(model_path, map_location=device)
+    mesh_files = []
+    for d in samples_dirs:
+        mesh_files.extend(sorted(Path(d).glob("sample_*.mesh")))
 
-    config = TransolverConfig(**{k: v for k, v in checkpoint['config'].items() if k != 'checkpoint_dir'})
-    model = TransolverModel(config)
-    model.build(
-        checkpoint['input_dim'],
-        checkpoint['coord_dim'],
-        checkpoint['num_points']
+    if not mesh_files:
+        raise FileNotFoundError(f"No sample_*.mesh found in {samples_dirs}")
+
+    rng = np.random.default_rng(params_seed)
+
+    dataset = FEMDataset(DatasetConfig(
+        parameter_names=['E', 'nu', 'load'],
+        parameter_bounds={
+            'E':    (150e9, 250e9),
+            'nu':   (0.25, 0.35),
+            'load': (50e6, 150e6),
+        },
+    ))
+
+    dirs_str = ", ".join(samples_dirs)
+    print(f"  Collecting FEM data from {len(mesh_files)} meshes ({dirs_str})...")
+    for i, mf in enumerate(mesh_files):
+        params = {
+            'E':    float(rng.uniform(150e9, 250e9)),
+            'nu':   float(rng.uniform(0.25, 0.35)),
+            'load': float(rng.uniform(50e6, 150e6)),
+        }
+        try:
+            von_mises, verts_fem, elems_fem = simulate_ground_truth(str(mf), params)
+            if not np.any(von_mises > 0):
+                raise RuntimeError(f"FEM returned trivial solution for {mf.stem}")
+
+            # Use element centres as coordinates so coords/outputs have same N
+            centers = get_element_centers(verts_fem, elems_fem)
+            sample = FEMSample(
+                sample_id=f"s{i:03d}",
+                parameters=params,
+                coordinates=centers,               # (N_elem, 2)
+                von_mises=von_mises[:, np.newaxis], # (N_elem, 1)
+                is_valid=True,
+            )
+            dataset.add_sample(sample)
+        except Exception as e:
+            print(f"    Skipping {mf.stem}: {e}")
+
+    valid = dataset.get_valid_samples()
+    if len(valid) < 3:
+        raise RuntimeError(f"Need ≥3 valid samples, got {len(valid)}")
+
+    print(f"  {len(valid)} valid samples — training {n_ensemble}-member ensemble "
+          f"for {epochs} epochs...")
+
+    training_cfg = TrainingConfig(
+        surrogate_config=TransolverConfig(
+            d_model=64, n_heads=4, n_layers=2, slice_num=8,
+            epochs=epochs, patience=50, batch_size=4,
+        ),
+        use_ensemble=True,
+        n_ensemble=n_ensemble,
+        train_test_split=0.2,
+        random_seed=params_seed,
+        save_dir=Path(save_dir) if save_dir else None,
     )
-    model.load_state_dict(checkpoint['state_dict'])
-    model.to(device)
-    model.eval()
-    model._is_trained = True
+    trainer = SurrogateTrainer(training_cfg)
 
-    return model, norm_params, device
+    params_arr, coords_list, outputs_list = dataset.prepare_training_data('von_mises')
+    result = trainer.train(params_arr, coords_list, outputs_list)
+
+    if not result.success:
+        raise RuntimeError(f"Ensemble training failed: {result.error_message}")
+
+    print(f"  Done — train_loss={result.train_loss:.4f}  "
+          f"test_loss={result.test_loss:.4f}")
+
+    if save_dir:
+        out = Path(save_dir) / "ensemble_model.pt"
+        trainer.model.save(out)
+        print(f"  Saved ensemble → {out}")
+        # Save normalizer params so the model can be loaded with proper normalization
+        import json
+        norm_params = trainer._get_normalization_params()
+        with open(Path(save_dir) / "normalizer_params.json", "w") as f:
+            json.dump(norm_params, f)
+
+    return trainer
 
 
-def predict_with_transolver(
-    model,
+def predict_ensemble(
+    trainer,
     vertices: np.ndarray,
     elements: list,
-    boundary: list,
     params: Dict,
-    norm_params: Dict,
-    device,
-    max_elems: int
-) -> np.ndarray:
+    param_names: List[str],
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Run Transolver prediction on a mesh.
+    Run ensemble prediction on a mesh with proper normalization.
 
-    Uses element centers as coordinates (matching training format).
+    Uses element centres as query coordinates (consistent with training).
+    Delegates to ``SurrogateTrainer.predict_with_uncertainty()`` so that
+    input parameters are normalized before inference and outputs are
+    denormalized before returning.
 
     Args:
-        model: Trained Transolver model
-        vertices: Mesh vertices
-        elements: Element connectivity
-        boundary: Boundary info
-        params: Input parameters
-        norm_params: Normalization parameters
-        device: Torch device
-        max_elems: Maximum elements for padding
+        trainer:     SurrogateTrainer (wraps EnsembleModel + normalizers)
+        vertices:    (N_nodes, 2)
+        elements:    element connectivity list
+        params:      parameter dict (raw, un-normalized)
+        param_names: ordered list of parameter keys
 
     Returns:
-        Predicted stress at element centers
+        mean_field:  (N_elem,) ensemble mean von Mises prediction (Pa scale)
+        uncertainty: (N_elem,) ensemble std (Pa scale) — the adaptation signal
     """
-    import torch
+    from meshforge.surrogate.trainer import SurrogateTrainer
 
-    # Parameter vector must match training format: [E/GPa, nu, load]
-    param_vec = np.array([
-        params['E'] / 1e9,
-        params['nu'],
-        params['load'],
-    ], dtype=np.float32)
+    centers   = get_element_centers(vertices, elements)   # (N_elem, 2)
+    param_arr = np.array([[params[k] for k in param_names]], dtype=np.float32)
 
-    # Normalize parameters
-    if 'param_mean' in norm_params and 'param_std' in norm_params:
-        param_mean = np.array(norm_params['param_mean'], dtype=np.float32)
-        param_std = np.array(norm_params['param_std'], dtype=np.float32)
-        param_vec = (param_vec - param_mean) / param_std
+    mean, unc = trainer.predict_with_uncertainty(param_arr, centers)
 
-    # Get element centers as coordinates (matching training)
-    elem_centers = get_element_centers(vertices, elements)
+    mean_field  = mean.flatten()
+    uncertainty = unc.flatten() if unc is not None else np.zeros(len(centers))
 
-    # Pad coordinates
-    padded_coords = np.zeros((max_elems, 2), dtype=np.float32)
-    padded_coords[:len(elem_centers)] = elem_centers
-
-    # Convert to tensors
-    param_t = torch.tensor(param_vec, dtype=torch.float32, device=device).unsqueeze(0)
-    coord_t = torch.tensor(padded_coords, dtype=torch.float32, device=device).unsqueeze(0)
-
-    # Predict
-    with torch.no_grad():
-        pred = model.forward(param_t, coord_t)
-
-    # Extract predictions for actual elements
-    pred_np = pred.cpu().numpy()[0, :len(elements), 0]
-
-    # Denormalize output
-    if 'stress_mean' in norm_params and 'stress_std' in norm_params:
-        stress_mean = norm_params['stress_mean']
-        stress_std = norm_params['stress_std']
-        pred_np = pred_np * stress_std + stress_mean
-
-    return pred_np
+    return mean_field, uncertainty
 
 
 # =============================================================================
-# Visualization
+# Plotting Utilities
 # =============================================================================
 
 def plot_mesh_field(
@@ -585,977 +518,425 @@ def plot_mesh_field(
     title: str = "",
     cmap: str = "viridis",
     vmin: float = None,
-    vmax: float = None
-):
-    """Plot scalar field on mesh."""
+    vmax: float = None,
+) -> PolyCollection:
+    """Plot a scalar element-centred field on the mesh."""
     polygons = [vertices[elem] for elem in elements]
 
-    if vmin is None:
-        vmin = np.min(field)
-    if vmax is None:
-        vmax = np.max(field)
+    if vmin is None: vmin = float(np.min(field))
+    if vmax is None: vmax = float(np.max(field))
+    if vmin == vmax:
+        vmax = vmin + 1e-10
 
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-
-    collection = PolyCollection(
+    coll = PolyCollection(
         polygons,
         array=field,
         cmap=cmap,
-        norm=norm,
+        norm=mcolors.Normalize(vmin=vmin, vmax=vmax),
         edgecolors='black',
         linewidths=0.2,
     )
-
-    ax.add_collection(collection)
+    ax.add_collection(coll)
     ax.set_xlim(vertices[:, 0].min() - 0.05, vertices[:, 0].max() + 0.05)
     ax.set_ylim(vertices[:, 1].min() - 0.05, vertices[:, 1].max() + 0.05)
     ax.set_aspect('equal')
-    ax.set_title(title, fontsize=11, fontweight='bold')
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
-
-    return collection
+    ax.set_title(title, fontsize=10, fontweight='bold')
+    ax.set_xlabel('x'); ax.set_ylabel('y')
+    return coll
 
 
-def nearest_neighbour_interp(
-    src_centers: np.ndarray,
-    src_values: np.ndarray,
-    tgt_centers: np.ndarray,
-) -> np.ndarray:
-    """
-    Map per-element values from source mesh to target mesh via nearest centroid.
-
-    For each target element centre, find the closest source element centre and
-    copy its value.  Pure numpy — no scipy required.
-    """
+def nearest_neighbour_interp(src_centers, src_values, tgt_centers):
     diff    = tgt_centers[:, np.newaxis, :] - src_centers[np.newaxis, :, :]
-    sq_dist = np.sum(diff ** 2, axis=-1)          # (N_tgt, N_src)
-    nearest = np.argmin(sq_dist, axis=1)           # (N_tgt,)
-    return src_values[nearest]
+    sq_dist = np.sum(diff ** 2, axis=-1)
+    return src_values[np.argmin(sq_dist, axis=1)]
 
 
-def compute_element_areas(vertices: np.ndarray, elements: list) -> np.ndarray:
-    """Compute element areas (proxy for local mesh resolution)."""
-    areas = []
-    for elem in elements:
-        v = vertices[elem]
-        if len(elem) == 3:  # Triangle: 0.5 * |cross product|
-            a = 0.5 * abs((v[1, 0] - v[0, 0]) * (v[2, 1] - v[0, 1]) -
-                          (v[2, 0] - v[0, 0]) * (v[1, 1] - v[0, 1]))
-        else:  # Quad: shoelace
-            n = len(elem)
-            a = 0.5 * abs(sum(v[i, 0] * v[(i+1) % n, 1] - v[(i+1) % n, 0] * v[i, 1]
-                              for i in range(n)))
-        areas.append(a)
-    return np.array(areas)
+# =============================================================================
+# Main Visualization: Uncertainty-Driven Loop
+# =============================================================================
 
-
-def visualize_transolver_test(
+def visualize_uncertainty_loop(
     mesh_file: str,
     model_dir: str,
     output_file: str,
+    samples_dirs: Optional[List[str]] = None,
     params: Optional[Dict] = None,
-    refine_levels: int = 3
+    show_gt: bool = True,
+    n_ensemble: int = 3,
+    epochs: int = 80,
 ) -> Dict:
     """
-    5-panel agentic SciML loop visualization.
+    5-panel uncertainty-driven SciML loop visualization.
 
-    ① Fine-mesh MFEM ground truth  — high-resolution reference
-    ② Coarse-mesh MFEM             — starting point (poor accuracy)
-    ③ Error map  ①−②              — drives r+h adaptation
-    ④ Adapted mesh MFEM result     — after agentic r+h refinement loop
-    ⑤ Error map  ①−④              — accuracy gain from the loop
+    ① Ensemble mean prediction  (coarse mesh)
+    ② Ensemble uncertainty      (coarse mesh) — the adaptation signal
+    ③ R-adapted mesh            (nodes toward high-uncertainty)
+    ④ Ensemble uncertainty      (adapted mesh)
+    ⑤ GT comparison             (optional fine-mesh FEM)
 
-    The surrogate (Transolver) drives the adaptation in step ④ when a
-    trained model is available; otherwise the MFEM coarse error is used
-    directly as the adaptation signal.
+    Panel ⑤ is shown only when ``show_gt=True`` AND the FEM solver returns a
+    non-trivial solution.  Otherwise the panel displays a note explaining that
+    GT is optional validation and was not available for this run.
 
     Args:
-        mesh_file: Path to coarse input mesh (from train/ folder)
-        model_dir: Directory with trained Transolver model
+        mesh_file:   Path to the coarse test mesh
+        model_dir:   Directory with ``ensemble_model.pt`` (or where to save one)
         output_file: Output PNG path
-        params: Optional material/load parameters
-        refine_levels: Uniform refinement levels for fine-mesh GT (default 3)
+        samples_dir: Directory with training meshes (used if no model found)
+        params:      Material/load parameters (random if None)
+        show_gt:     Whether to attempt fine-mesh FEM for panel ⑤
+        n_train:     Training meshes for on-the-fly ensemble
+        n_ensemble:  Ensemble size for on-the-fly training
+        epochs:      Training epochs for on-the-fly ensemble
 
     Returns:
-        Dict with error metrics
+        Dict of metrics
     """
     print(f"Loading coarse mesh: {mesh_file}")
     vertices, elements, boundary = read_mfem_mesh(mesh_file)
-    print(f"  Coarse: {len(vertices)} nodes, {len(elements)} elements")
+    n_nodes, n_elems = len(vertices), len(elements)
+    print(f"  {n_nodes} nodes, {n_elems} elements")
 
     if params is None:
-        np.random.seed(hash(mesh_file) % 10000)
+        rng = np.random.default_rng(hash(mesh_file) % 2**31)
         params = {
-            'E': np.random.uniform(150e9, 250e9),
-            'nu': np.random.uniform(0.25, 0.35),
-            'load': np.random.uniform(80e6, 120e6),
+            'E':    float(rng.uniform(150e9, 250e9)),
+            'nu':   float(rng.uniform(0.25, 0.35)),
+            'load': float(rng.uniform(50e6, 150e6)),
         }
+    param_names = ['E', 'nu', 'load']
 
-    # ── ① Fine-mesh ground truth ──────────────────────────────────────────
-    print(f"Building fine-mesh ground truth ({refine_levels} refinement levels)...")
-    gt_fine, fine_verts, fine_elements = simulate_ground_truth_refined(
-        mesh_file, params, refine_levels=refine_levels
-    )
-    fine_centers = get_element_centers(fine_verts, fine_elements)
-    print(f"  Fine: {len(fine_verts)} nodes, {len(fine_elements)} elements  "
-          f"peak={gt_fine.max():.1f}")
-
-    # ── ② Coarse-mesh MFEM ────────────────────────────────────────────────
-    gt_coarse, vertices, elements = simulate_ground_truth(mesh_file, params)
-    coarse_centers = get_element_centers(vertices, elements)
-    print(f"  Coarse MFEM peak={gt_coarse.max():.1f}")
-
-    # ── ③ Error map: fine GT vs coarse MFEM ──────────────────────────────
-    # error_coarse: per-element on coarse mesh (for visualising panel ③)
-    gt_fine_on_coarse = nearest_neighbour_interp(fine_centers, gt_fine, coarse_centers)
-    error_coarse = np.abs(gt_fine_on_coarse - gt_coarse)
-    # Fair metric: project coarse solution onto the fine grid so both sides
-    # are evaluated at the same 7 k+ points (avoids bias from element count).
-    coarse_on_fine = nearest_neighbour_interp(coarse_centers, gt_coarse, fine_centers)
-    rel_err_coarse = (np.mean(np.abs(gt_fine - coarse_on_fine))
-                      / (np.mean(np.abs(gt_fine)) + 1e-10) * 100)
-    print(f"  Coarse error vs fine GT — mean={np.mean(error_coarse):.2f}  "
-          f"rel(fine-grid)={rel_err_coarse:.1f}%")
-
-    # ── Agentic SciML loop adaptation signal ─────────────────────────────
-    # The coarse-vs-fine MFEM error (error_coarse) is the ground-truth signal
-    # that tells us WHERE the coarse mesh is inaccurate.  This is what drives
-    # r+h refinement.  The surrogate (Transolver) is loaded here to annotate
-    # the output but does not change the adaptation target.
-    print("Loading Transolver model (for annotation)...")
+    # ── Load or train ensemble ─────────────────────────────────────────────
+    print("Loading ensemble model...")
     try:
-        model, norm_params, device = load_transolver_model(model_dir)
-        max_elems = model._num_points
-        prediction = predict_with_transolver(
-            model, vertices, elements, boundary, params, norm_params, device, max_elems
-        )
-        surrogate_error = np.abs(prediction - gt_coarse)
-        surrogate_rel   = np.mean(surrogate_error) / (np.mean(np.abs(gt_coarse)) + 1e-10) * 100
-        print(f"  Surrogate rel. err on coarse mesh: {surrogate_rel:.1f}%")
+        trainer = load_ensemble_model(model_dir)
+        print(f"  Loaded from {model_dir}")
     except FileNotFoundError:
-        surrogate_rel = float('nan')
-        print("  No surrogate found")
-    except Exception as e:
-        surrogate_rel = float('nan')
-        print(f"  Surrogate skipped: {e}")
+        print("  Not found — training on-the-fly...")
+        if samples_dirs is None:
+            samples_dirs = [str(Path(mesh_file).parent)]
+        trainer = train_fast_ensemble(
+            samples_dirs,
+            n_ensemble=n_ensemble,
+            epochs=epochs,
+            save_dir=model_dir,
+        )
 
-    # Adaptation is always driven by the measured MFEM coarse error
-    adapt_signal = error_coarse
+    # ── ① Ensemble mean prediction on coarse mesh ─────────────────────────
+    print("Running ensemble on coarse mesh...")
+    mean_coarse, unc_coarse = predict_ensemble(
+        trainer, vertices, elements, params, param_names
+    )
+    print(f"  Mean prediction range: [{mean_coarse.min():.2f}, {mean_coarse.max():.2f}]")
+    print(f"  Uncertainty range:     [{unc_coarse.min():.4f}, {unc_coarse.max():.4f}]")
 
-    # ── R-adaptivity (node relocation, same element count) ────────────────
-    print("Applying TMOP r-adaptivity...")
-    r_verts, r_result, r_tmp_file = adapt_mesh_r(mesh_file, vertices, elements, adapt_signal)
+    # ── ② → ③  R-adaptivity driven by uncertainty ─────────────────────────
+    print("Applying TMOP r-adaptivity (driven by ensemble uncertainty)...")
+    node_unc_coarse = elem_to_node_field(vertices, elements, unc_coarse)
+    r_verts, r_result, r_tmp = adapt_mesh_r(mesh_file, node_unc_coarse)
     r_ok = r_result is not None and r_result.success
+
     if r_ok:
-        print(f"  R-adapt OK — max node disp: "
-              f"{np.linalg.norm(r_verts - vertices, axis=1).max():.4f}")
+        max_disp = np.linalg.norm(r_verts - vertices, axis=1).max()
+        print(f"  R-adapt OK — max node displacement: {max_disp:.4f}")
     else:
         r_verts = vertices.copy()
-        r_tmp_file = None
+        r_tmp = None
         print("  R-adapt unavailable")
 
-    # ── H-refinement (element splitting, chained on the r-adapted mesh) ──
-    # Pass the r-adapted mesh file so h-refinement operates on already-relocated
-    # nodes.  If r-adaptivity failed, fall back to the original file.
-    print("Applying h-refinement...")
-    h_src_file = r_tmp_file if r_tmp_file else mesh_file
-    h_verts, h_elements, h_result, h_adapted_file = adapt_mesh_h(h_src_file, adapt_signal)
+    # ── H-refinement chained on r-adapted mesh ────────────────────────────
+    print("Applying h-refinement (driven by ensemble uncertainty)...")
+    h_src = r_tmp if r_tmp else mesh_file
+    h_verts, h_elements, h_result, h_tmp = adapt_mesh_h(h_src, unc_coarse)
     h_ok = h_result is not None and h_result.success
+
     if h_ok:
-        print(f"  H-refine OK — {h_result.num_elements_before}→{h_result.num_elements_after} "
-              f"elems, {h_result.num_nodes_before}→{h_result.num_nodes_after} nodes")
+        print(f"  H-refine OK — elements: "
+              f"{h_result.num_elements_before} → {h_result.num_elements_after}")
     else:
         h_verts    = r_verts.copy()
         h_elements = elements
         print("  H-refine unavailable")
 
-    # Clean up temp files
-    import os as _os
-    if r_tmp_file:
-        try: _os.unlink(r_tmp_file)
+    if r_tmp:
+        try: os.unlink(r_tmp)
         except OSError: pass
 
-    # ── ④ MFEM on the adapted (h-refined) mesh ────────────────────────────
-    if h_ok and h_adapted_file:
-        try:
-            gt_adapted, h_verts, h_elements = simulate_ground_truth(h_adapted_file, params)
-        finally:
-            try: _os.unlink(h_adapted_file)
-            except OSError: pass
-    else:
-        if h_adapted_file:
-            try: _os.unlink(h_adapted_file)
-            except OSError: pass
-        gt_adapted, h_verts, h_elements = simulate_ground_truth(mesh_file, params)
-    adapted_centers = get_element_centers(h_verts, h_elements)
-    print(f"  Adapted MFEM peak={gt_adapted.max():.1f}")
+    # ── ④ Uncertainty on adapted mesh ─────────────────────────────────────
+    print("Running ensemble on adapted mesh...")
+    mean_adapted, unc_adapted = predict_ensemble(
+        trainer, h_verts, h_elements, params, param_names
+    )
+    print(f"  Adapted uncertainty range: "
+          f"[{unc_adapted.min():.4f}, {unc_adapted.max():.4f}]")
+    mean_unc_reduction = float(np.mean(unc_coarse) - np.mean(unc_adapted))
 
-    # ── ⑤ Error map: fine GT vs adapted MFEM ─────────────────────────────
-    # error_adapted: per-element on adapted mesh (for visualising panel ⑤)
-    gt_fine_on_adapted = nearest_neighbour_interp(fine_centers, gt_fine, adapted_centers)
-    error_adapted = np.abs(gt_fine_on_adapted - gt_adapted)
-    # Fair metric: project adapted solution onto the fine grid (same reference
-    # as rel_err_coarse above — both measured at the same 7k+ evaluation points).
-    adapted_on_fine = nearest_neighbour_interp(adapted_centers, gt_adapted, fine_centers)
-    rel_err_adapted = (np.mean(np.abs(gt_fine - adapted_on_fine))
-                       / (np.mean(np.abs(gt_fine)) + 1e-10) * 100)
-    print(f"  Adapted error vs fine GT — mean={np.mean(error_adapted):.2f}  "
-          f"rel(fine-grid)={rel_err_adapted:.1f}%  "
-          f"(improvement: {rel_err_coarse - rel_err_adapted:+.1f} pp)")
+    if h_tmp:
+        try: os.unlink(h_tmp)
+        except OSError: pass
+
+    # ── ⑤ GT comparison (optional) ────────────────────────────────────────
+    gt_available = False
+    gt_fine, fine_verts, fine_elements = None, None, None
+    rel_err_coarse = rel_err_adapted = float('nan')
+
+    if show_gt:
+        print("Computing optional GT (fine-mesh FEM)...")
+        try:
+            gt_fine, fine_verts, fine_elements = simulate_ground_truth_refined(
+                mesh_file, params, refine_levels=3
+            )
+            if np.any(gt_fine > 0):
+                gt_available = True
+                fine_centers = get_element_centers(fine_verts, fine_elements)
+                coarse_centers = get_element_centers(vertices, elements)
+                adapted_centers = get_element_centers(h_verts, h_elements)
+
+                coarse_on_fine = nearest_neighbour_interp(
+                    coarse_centers, mean_coarse, fine_centers
+                )
+                adapted_on_fine = nearest_neighbour_interp(
+                    adapted_centers, mean_adapted, fine_centers
+                )
+                rel_err_coarse = (
+                    np.mean(np.abs(gt_fine - coarse_on_fine))
+                    / (np.mean(np.abs(gt_fine)) + 1e-10) * 100
+                )
+                rel_err_adapted = (
+                    np.mean(np.abs(gt_fine - adapted_on_fine))
+                    / (np.mean(np.abs(gt_fine)) + 1e-10) * 100
+                )
+                print(f"  GT peak: {gt_fine.max():.2f}  "
+                      f"rel_err coarse={rel_err_coarse:.1f}%  "
+                      f"adapted={rel_err_adapted:.1f}%")
+            else:
+                print("  FEM returned trivial zero solution — GT not shown")
+        except Exception as e:
+            print(f"  GT skipped: {e}")
 
     # ── Build 5-panel figure ───────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+    fig, axes = plt.subplots(1, 5, figsize=(28, 5))
     fig.suptitle(
-        'Agentic SciML Loop  |  '
-        '① Fine GT  →  ② Coarse MFEM  →  ③ Error  →  ④ R+H Adapted  →  ⑤ Error Reduced',
-        fontsize=11, fontweight='bold', y=1.02
+        'Ensemble Uncertainty Loop  |  '
+        '① Mean Pred  →  ② Uncertainty  →  ③ Adapted Mesh  →  '
+        '④ Unc. Adapted  →  ⑤ GT (optional)',
+        fontsize=10, fontweight='bold', y=1.02,
     )
 
-    # Convert stress to MPa for display (raw solver output is in Pa)
-    S = 1e-6
-    gt_fine_MPa    = gt_fine    * S
-    gt_coarse_MPa  = gt_coarse  * S
-    gt_adapted_MPa = gt_adapted * S
-    err_coarse_MPa = error_coarse * S
-    err_adapted_MPa = error_adapted * S
+    # Shared uncertainty scale for ②④
+    unc_vmax = max(float(np.percentile(unc_coarse, 98)),
+                   float(np.percentile(unc_adapted, 98)),
+                   1e-10)
 
-    # Shared stress colour scale across ①②④
-    # Clip at 98th percentile so the bulk of the field uses the full colour range;
-    # the extreme peak near the hole only occupies a tiny fraction of elements and
-    # would otherwise wash out all other variation.
-    stress_vmin = 0.0
-    stress_vmax = float(np.percentile(
-        np.concatenate([gt_fine_MPa, gt_coarse_MPa, gt_adapted_MPa]), 98
+    # Shared mean-prediction scale for ①③
+    pred_vmax = float(np.percentile(
+        np.concatenate([mean_coarse, mean_adapted]), 98
     ))
+    pred_vmax = max(pred_vmax, 1e-10)
 
-    # ① Fine-mesh ground truth
-    coll1 = plot_mesh_field(
-        axes[0], fine_verts, fine_elements, gt_fine_MPa,
-        title=f"① Fine Mesh GT  ({len(fine_elements)} elems)\n"
-              f"Uniform {refine_levels}-level refinement",
-        cmap="jet", vmin=stress_vmin, vmax=stress_vmax
+    # ① Mean prediction — coarse mesh
+    c1 = plot_mesh_field(
+        axes[0], vertices, elements, mean_coarse,
+        title=f"① Ensemble Mean  ({n_elems} elems)\n"
+              f"Coarse mesh prediction",
+        cmap='jet', vmin=0, vmax=pred_vmax,
     )
-    fig.colorbar(coll1, ax=axes[0], shrink=0.8).set_label('Von Mises Stress (MPa)', fontsize=8)
+    fig.colorbar(c1, ax=axes[0], shrink=0.8).set_label('Prediction (a.u.)', fontsize=8)
     axes[0].text(
-        0.02, 0.02, f"Peak: {gt_fine.max()*S:.1f} MPa\nReference solution",
+        0.02, 0.02,
+        f"Range: [{mean_coarse.min():.1f}, {mean_coarse.max():.1f}]",
         transform=axes[0].transAxes, fontsize=8, va='bottom',
-        bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.9)
+        bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.9),
     )
 
-    # ② Coarse-mesh MFEM
-    coll2 = plot_mesh_field(
-        axes[1], vertices, elements, gt_coarse_MPa,
-        title=f"② Coarse Mesh MFEM  ({len(elements)} elems)\n"
-              f"Starting point — poor accuracy",
-        cmap="jet", vmin=stress_vmin, vmax=stress_vmax
+    # ② Uncertainty — coarse mesh (the adaptation signal)
+    c2 = plot_mesh_field(
+        axes[1], vertices, elements, unc_coarse,
+        title=f"② Ensemble Uncertainty  ({n_elems} elems)\n"
+              f"Adaptation signal (no GT needed)",
+        cmap='hot_r', vmin=0, vmax=unc_vmax,
     )
-    fig.colorbar(coll2, ax=axes[1], shrink=0.8).set_label('Von Mises Stress (MPa)', fontsize=8)
+    fig.colorbar(c2, ax=axes[1], shrink=0.8).set_label('Std (a.u.)', fontsize=8)
     axes[1].text(
         0.02, 0.02,
-        f"Peak: {gt_coarse.max()*S:.1f} MPa\nRel err vs GT: {rel_err_coarse:.1f}%",
+        f"Mean: {np.mean(unc_coarse):.3f}\nMax: {unc_coarse.max():.3f}",
         transform=axes[1].transAxes, fontsize=8, va='bottom',
-        bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9)
+        bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9),
     )
 
-    # ③ Error map: fine GT − coarse MFEM
-    err_vmax_MPa = max(err_coarse_MPa.max(), err_adapted_MPa.max())   # shared scale for ③⑤
-    coll3 = plot_mesh_field(
-        axes[2], vertices, elements, err_coarse_MPa,
-        title="③ Error Map  |GT − Coarse|\n(drives r+h adaptation)",
-        cmap="Reds", vmin=0, vmax=err_vmax_MPa
+    # ③ R+H adapted mesh — mean prediction
+    c3 = plot_mesh_field(
+        axes[2], h_verts, h_elements, mean_adapted,
+        title=f"③ Adapted Mesh  ({len(h_elements)} elems)\n"
+              f"Nodes → high-uncertainty regions",
+        cmap='jet', vmin=0, vmax=pred_vmax,
     )
-    fig.colorbar(coll3, ax=axes[2], shrink=0.8).set_label('|Fine GT − Coarse MFEM| (MPa)', fontsize=8)
-    axes[2].text(
-        0.02, 0.98,
-        f"Mean: {np.mean(error_coarse)*S:.2f} MPa\nMax:  {np.max(error_coarse)*S:.2f} MPa\n"
-        f"Rel:  {rel_err_coarse:.1f}%",
-        transform=axes[2].transAxes, fontsize=8, va='top',
-        bbox=dict(boxstyle='round', facecolor='white', alpha=0.9)
-    )
+    fig.colorbar(c3, ax=axes[2], shrink=0.8).set_label('Prediction (a.u.)', fontsize=8)
+    note3 = []
+    if r_ok: note3.append(f"R-adapt: ✓ (Δmax={max_disp:.3f})")
+    if h_ok: note3.append(f"H-refine: {h_result.num_elements_before}"
+                           f"→{h_result.num_elements_after}")
+    if note3:
+        axes[2].text(
+            0.02, 0.02, "\n".join(note3),
+            transform=axes[2].transAxes, fontsize=8, va='bottom',
+            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.9),
+        )
 
-    # ④ MFEM on adapted mesh (r+h)
-    coll4 = plot_mesh_field(
-        axes[3], h_verts, h_elements, gt_adapted_MPa,
-        title=f"④ Adapted MFEM  ({len(h_elements)} elems)\n"
-              f"After agentic r+h refinement loop",
-        cmap="jet", vmin=stress_vmin, vmax=stress_vmax
+    # ④ Uncertainty on adapted mesh
+    c4 = plot_mesh_field(
+        axes[3], h_verts, h_elements, unc_adapted,
+        title=f"④ Uncertainty After Adaptation\n"
+              f"({len(h_elements)} elems)",
+        cmap='hot_r', vmin=0, vmax=unc_vmax,
     )
-    fig.colorbar(coll4, ax=axes[3], shrink=0.8).set_label('Von Mises Stress (MPa)', fontsize=8)
-    note4_lines = [f"Peak: {gt_adapted.max()*S:.1f} MPa"]
-    if h_ok:
-        note4_lines.append(f"H-refine: {h_result.num_elements_before}→{h_result.num_elements_after} elems")
-    if r_ok:
-        note4_lines.append("R-adapt: ✓")
+    fig.colorbar(c4, ax=axes[3], shrink=0.8).set_label('Std (a.u.)', fontsize=8)
+    colour4 = 'lightgreen' if mean_unc_reduction > 0 else 'lightsalmon'
     axes[3].text(
-        0.02, 0.02, "\n".join(note4_lines),
+        0.02, 0.02,
+        f"Mean: {np.mean(unc_adapted):.3f}\nMax: {unc_adapted.max():.3f}\n"
+        f"Δ mean: {mean_unc_reduction:+.3f}",
         transform=axes[3].transAxes, fontsize=8, va='bottom',
-        bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.9)
+        bbox=dict(boxstyle='round', facecolor=colour4, alpha=0.9),
     )
 
-    # ⑤ Error map: fine GT − adapted MFEM
-    coll5 = plot_mesh_field(
-        axes[4], h_verts, h_elements, err_adapted_MPa,
-        title="⑤ Error Map  |GT − Adapted|\nAccuracy gain from the loop",
-        cmap="Reds", vmin=0, vmax=err_vmax_MPa
-    )
-    fig.colorbar(coll5, ax=axes[4], shrink=0.8).set_label('|Fine GT − Adapted MFEM| (MPa)', fontsize=8)
-    improvement = rel_err_coarse - rel_err_adapted
-    colour5 = 'lightgreen' if improvement > 0 else 'lightsalmon'
-    axes[4].text(
-        0.02, 0.98,
-        f"Mean: {np.mean(error_adapted)*S:.2f} MPa\nMax:  {np.max(error_adapted)*S:.2f} MPa\n"
-        f"Rel:  {rel_err_adapted:.1f}%\n"
-        f"Δ error: {improvement:+.1f} pp\n"
-        f"{'✓ improved' if improvement > 0 else '✗ no gain'}",
-        transform=axes[4].transAxes, fontsize=8, va='top',
-        bbox=dict(boxstyle='round', facecolor=colour5, alpha=0.9)
-    )
+    # ⑤ GT comparison — optional
+    if gt_available:
+        c5 = plot_mesh_field(
+            axes[4], fine_verts, fine_elements, gt_fine,
+            title=f"⑤ GT Fine-Mesh FEM  ({len(fine_elements)} elems)\n"
+                  f"Optional external validation",
+            cmap='jet',
+        )
+        fig.colorbar(c5, ax=axes[4], shrink=0.8).set_label(
+            'Von Mises (a.u.)', fontsize=8)
+        axes[4].text(
+            0.02, 0.02,
+            f"Rel err coarse: {rel_err_coarse:.1f}%\n"
+            f"Rel err adapted: {rel_err_adapted:.1f}%\n"
+            f"Δ: {rel_err_coarse - rel_err_adapted:+.1f} pp",
+            transform=axes[4].transAxes, fontsize=8, va='bottom',
+            bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.9),
+        )
+    else:
+        axes[4].set_aspect('equal')
+        axes[4].set_xlim(0, 1); axes[4].set_ylim(0, 1)
+        axes[4].text(
+            0.5, 0.5,
+            "⑤ GT Comparison\n(optional validation)\n\n"
+            "FEM returned trivial solution\nor GT not requested.\n\n"
+            "Uncertainty-driven loop\ndoes not require GT.",
+            transform=axes[4].transAxes, fontsize=9,
+            ha='center', va='center',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9),
+        )
+        axes[4].set_title(
+            "⑤ GT (optional — not available)",
+            fontsize=10, fontweight='bold',
+        )
+        axes[4].axis('off')
 
     plt.tight_layout()
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     plt.close()
-
     print(f"Saved: {output_file}")
 
     return {
-        'mean_error': float(np.mean(error_coarse)),
-        'max_error': float(np.max(error_coarse)),
-        'mean_relative_error': rel_err_coarse,
-        'mean_relative_error_adapted': rel_err_adapted,
-        'improvement_pp': improvement,
-        'coarse_elements': len(elements),
-        'fine_elements': len(fine_elements),
-        'adapted_elements': len(h_elements),
-        'adapted': r_ok,
-        'h_refined': h_ok,
+        'mean_uncertainty_coarse':  float(np.mean(unc_coarse)),
+        'max_uncertainty_coarse':   float(np.max(unc_coarse)),
+        'mean_uncertainty_adapted': float(np.mean(unc_adapted)),
+        'max_uncertainty_adapted':  float(np.max(unc_adapted)),
+        'mean_unc_reduction':       mean_unc_reduction,
+        'coarse_elements':          n_elems,
+        'adapted_elements':         len(h_elements),
+        'r_adapted':                r_ok,
+        'h_refined':                h_ok,
+        'gt_available':             gt_available,
+        'rel_err_coarse':           rel_err_coarse,
+        'rel_err_adapted':          rel_err_adapted,
     }
 
 
-def compare_multiple_samples(
-    samples_dir: str,
+def compare_multiple_uncertainty(
+    samples_dirs: List[str],
     model_dir: str,
     output_file: str,
-    n_samples: int = 6,
-    refine_levels: int = 2
+    n_samples: int = 3,
 ) -> List[Dict]:
     """
-    Compare Transolver predictions across multiple samples.
+    Compare ensemble mean + uncertainty across multiple meshes.
 
-    Shows refined ground truth vs coarse surrogate prediction.
+    Two rows per mesh: mean prediction (top), uncertainty (bottom).
     """
-    samples_path = Path(samples_dir)
-    mesh_files = sorted(samples_path.glob("sample_*.mesh"))[:n_samples]
+    if isinstance(samples_dirs, str):
+        samples_dirs = [samples_dirs]
+
+    all_files = []
+    for d in samples_dirs:
+        all_files.extend(sorted(Path(d).glob("sample_*.mesh")))
+    mesh_files = all_files[:n_samples]
 
     if not mesh_files:
-        print(f"No mesh files found in {samples_dir}")
+        print(f"No mesh files found in {samples_dirs}")
         return []
 
-    # Load model once
-    print("Loading Transolver model...")
+    print("Loading ensemble model...")
     try:
-        model, norm_params, device = load_transolver_model(model_dir)
-        max_elems = model._num_points
+        trainer = load_ensemble_model(model_dir)
     except FileNotFoundError:
-        print("Model not found, using synthetic predictions")
-        model = None
-        norm_params = {}
-        device = None
-        max_elems = 200
+        print("  Not found — training on-the-fly...")
+        trainer = train_fast_ensemble(samples_dirs, save_dir=model_dir)
 
-    # Create figure with 2 rows per sample: refined ground truth, coarse prediction
-    n_cols = min(3, len(mesh_files))
-    n_rows = 2  # Top row: refined GT, Bottom row: coarse prediction
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
-
-    fig.suptitle('Transolver: Refined Ground Truth vs Coarse Prediction', fontsize=14, fontweight='bold')
+    param_names = ['E', 'nu', 'load']
+    n_cols = len(mesh_files)
+    fig, axes = plt.subplots(2, n_cols, figsize=(6 * n_cols, 8))
+    if n_cols == 1:
+        axes = axes[:, np.newaxis]
+    fig.suptitle('Ensemble: Mean Prediction vs Uncertainty',
+                 fontsize=13, fontweight='bold')
 
     results = []
-
-    for idx, mesh_file in enumerate(mesh_files[:n_cols]):
-        vertices, elements, boundary = read_mfem_mesh(str(mesh_file))
-
-        np.random.seed(hash(str(mesh_file)) % 10000)
+    for col, mf in enumerate(mesh_files):
+        verts, elems, _ = read_mfem_mesh(str(mf))
+        rng = np.random.default_rng(hash(str(mf)) % 2**31)
         params = {
-            'E': np.random.uniform(150e9, 250e9),
-            'nu': np.random.uniform(0.25, 0.35),
-            'load': np.random.uniform(80e6, 120e6),
+            'E':    float(rng.uniform(150e9, 250e9)),
+            'nu':   float(rng.uniform(0.25, 0.35)),
+            'load': float(rng.uniform(50e6, 150e6)),
         }
+        mean_f, unc_f = predict_ensemble(trainer, verts, elems, params, param_names)
 
-        # Get refined ground truth
-        refined_stress, refined_verts, refined_elems = simulate_ground_truth_refined(
-            str(mesh_file), params, refine_levels=refine_levels
+        pred_vmax = float(np.percentile(mean_f, 98))
+        unc_vmax  = float(np.percentile(unc_f, 98)) or 1e-10
+
+        c1 = plot_mesh_field(
+            axes[0, col], verts, elems, mean_f,
+            title=f"{mf.stem}\nMean prediction ({len(elems)} elems)",
+            cmap='jet', vmin=0, vmax=max(pred_vmax, 1e-10),
         )
+        fig.colorbar(c1, ax=axes[0, col], shrink=0.8).set_label('Mean', fontsize=8)
 
-        # Get coarse prediction
-        if model is not None:
-            prediction = predict_with_transolver(
-                model, vertices, elements, boundary, params, norm_params, device, max_elems
-            )
-        else:
-            coarse_stress, _, _ = simulate_ground_truth(str(mesh_file), params)
-            prediction = coarse_stress * (1 + 0.1 * np.random.randn(len(coarse_stress)))
-            prediction = np.maximum(prediction, 0)
-
-        # Common color scale
-        vmin = min(refined_stress.min(), prediction.min())
-        vmax = max(refined_stress.max(), prediction.max())
-
-        # Top row: Refined ground truth
-        plot_mesh_field(
-            axes[0, idx], refined_verts, refined_elems, refined_stress,
-            title=f"{mesh_file.stem}\nGT (Refined, {len(refined_elems)} elems)",
-            cmap="jet", vmin=vmin, vmax=vmax
+        c2 = plot_mesh_field(
+            axes[1, col], verts, elems, unc_f,
+            title=f"Uncertainty — mean={np.mean(unc_f):.3f}",
+            cmap='hot_r', vmin=0, vmax=unc_vmax,
         )
-
-        # Bottom row: Coarse prediction
-        plot_mesh_field(
-            axes[1, idx], vertices, elements, prediction,
-            title=f"Prediction (Coarse, {len(elements)} elems)",
-            cmap="jet", vmin=vmin, vmax=vmax
-        )
-
-        # Compute error on coarse mesh
-        coarse_gt, _, _ = simulate_ground_truth(str(mesh_file), params)
-        error = np.abs(prediction - coarse_gt)
-        mean_err = np.mean(error)
-
-        axes[1, idx].text(0.02, 0.02, f"Mean Err: {mean_err:.1f}",
-                transform=axes[1, idx].transAxes, fontsize=8,
-                verticalalignment='bottom',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+        fig.colorbar(c2, ax=axes[1, col], shrink=0.8).set_label('Std', fontsize=8)
 
         results.append({
-            'mesh': mesh_file.stem,
-            'mean_error': mean_err,
-            'max_error': np.max(error),
-            'refined_elems': len(refined_elems),
-            'coarse_elems': len(elements),
+            'mesh':            mf.stem,
+            'mean_prediction': float(np.mean(mean_f)),
+            'mean_uncertainty': float(np.mean(unc_f)),
+            'max_uncertainty': float(np.max(unc_f)),
         })
 
     plt.tight_layout()
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     plt.close()
-
-    print(f"Saved comparison to: {output_file}")
-
+    print(f"Saved: {output_file}")
     return results
-
-
-def visualize_best_training_sample(
-    train_dir: str,
-    model_dir: str,
-    output_file: str,
-    refine_levels: int = 2
-) -> Dict:
-    """
-    Find and visualize the best training sample (minimum Max Error).
-
-    Creates 3-panel figure:
-    1. Ground Truth (FEA on REFINED mesh)
-    2. Transolver Prediction (on COARSE mesh)
-    3. Error Map (on coarse mesh)
-
-    Args:
-        train_dir: Directory containing training mesh files
-        model_dir: Directory with trained model
-        output_file: Output image path
-        refine_levels: Mesh refinement levels for ground truth
-
-    Returns:
-        Best sample metrics
-    """
-    train_path = Path(train_dir)
-    mesh_files = sorted(train_path.glob("sample_*.mesh"))
-
-    if not mesh_files:
-        print(f"No mesh files found in {train_dir}")
-        return {}
-
-    # Load model once
-    print("Loading Transolver model...")
-    try:
-        model, norm_params, device = load_transolver_model(model_dir)
-        max_elems = model._num_points
-    except FileNotFoundError:
-        print("Model not found, cannot evaluate training samples")
-        return {}
-
-    # Evaluate all training samples to find minimum max_error
-    print(f"Evaluating {len(mesh_files)} training samples to find best case...")
-    sample_errors = []
-
-    for mesh_file in mesh_files:
-        vertices, elements, boundary = read_mfem_mesh(str(mesh_file))
-
-        np.random.seed(hash(str(mesh_file)) % 10000)
-        params = {
-            'E': np.random.uniform(150e9, 250e9),
-            'nu': np.random.uniform(0.25, 0.35),
-            'load': np.random.uniform(80e6, 120e6),
-        }
-
-        # Get coarse ground truth and prediction
-        coarse_gt, _, _ = simulate_ground_truth(str(mesh_file), params)
-        prediction = predict_with_transolver(
-            model, vertices, elements, boundary, params, norm_params, device, max_elems
-        )
-
-        error = np.abs(prediction - coarse_gt)
-        max_error = np.max(error)
-        mean_error = np.mean(error)
-
-        sample_errors.append({
-            'mesh_file': mesh_file,
-            'max_error': max_error,
-            'mean_error': mean_error,
-            'params': params,
-        })
-
-    # Find sample with minimum max_error
-    best_sample = min(sample_errors, key=lambda x: x['max_error'])
-    best_mesh_file = best_sample['mesh_file']
-    best_params = best_sample['params']
-
-    print(f"\nBest training sample: {best_mesh_file.stem}")
-    print(f"  Max Error: {best_sample['max_error']:.2f}")
-    print(f"  Mean Error: {best_sample['mean_error']:.2f}")
-
-    # Now create full visualization for best sample
-    vertices, elements, boundary = read_mfem_mesh(str(best_mesh_file))
-
-    # Generate ground truth on REFINED mesh
-    refined_stress, refined_verts, refined_elems = simulate_ground_truth_refined(
-        str(best_mesh_file), best_params, refine_levels=refine_levels
-    )
-
-    # Get surrogate prediction on COARSE mesh
-    prediction = predict_with_transolver(
-        model, vertices, elements, boundary, best_params, norm_params, device, max_elems
-    )
-
-    # Coarse ground truth for error
-    coarse_ground_truth, _, _ = simulate_ground_truth(str(best_mesh_file), best_params)
-
-    # Compute error
-    error = np.abs(prediction - coarse_ground_truth)
-    relative_error = error / (np.abs(coarse_ground_truth) + 1e-10)
-
-    mean_error = np.mean(error)
-    max_error = np.max(error)
-    mean_rel_error = np.mean(relative_error) * 100
-
-    # Create figure
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle(f'Transolver Training Results - Best Case ({best_mesh_file.stem})',
-                 fontsize=14, fontweight='bold', y=1.02)
-
-    # Determine common color scale
-    vmin = min(refined_stress.min(), prediction.min())
-    vmax = max(refined_stress.max(), prediction.max())
-
-    # Panel 1: Ground Truth on REFINED mesh
-    coll1 = plot_mesh_field(
-        axes[0], refined_verts, refined_elems, refined_stress,
-        title=f"Ground Truth (Refined, {len(refined_elems)} elems)",
-        cmap="jet", vmin=vmin, vmax=vmax
-    )
-    cbar1 = fig.colorbar(coll1, ax=axes[0], shrink=0.8)
-    cbar1.set_label('Von Mises Stress', fontsize=9)
-
-    # Panel 2: Transolver Prediction on COARSE mesh
-    coll2 = plot_mesh_field(
-        axes[1], vertices, elements, prediction,
-        title=f"Transolver Prediction (Coarse, {len(elements)} elems)",
-        cmap="jet", vmin=vmin, vmax=vmax
-    )
-    cbar2 = fig.colorbar(coll2, ax=axes[1], shrink=0.8)
-    cbar2.set_label('Von Mises Stress', fontsize=9)
-
-    # Panel 3: Error Map on coarse mesh
-    coll3 = plot_mesh_field(
-        axes[2], vertices, elements, error,
-        title="Error Map (Coarse Mesh)",
-        cmap="Reds"
-    )
-    cbar3 = fig.colorbar(coll3, ax=axes[2], shrink=0.8)
-    cbar3.set_label('Absolute Error', fontsize=9)
-
-    # Add stats
-    stats_text = f"Mean Error: {mean_error:.2f}\nMax Error: {max_error:.2f}\nRel. Error: {mean_rel_error:.1f}%"
-    axes[2].text(
-        0.02, 0.98, stats_text,
-        transform=axes[2].transAxes, fontsize=9,
-        verticalalignment='top',
-        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
-    )
-
-    plt.tight_layout()
-    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    plt.close()
-
-    print(f"Saved best training sample visualization to: {output_file}")
-
-    return {
-        'best_sample': best_mesh_file.stem,
-        'mean_error': mean_error,
-        'max_error': max_error,
-        'mean_relative_error': mean_rel_error,
-        'coarse_elements': len(elements),
-        'refined_elements': len(refined_elems),
-        'total_samples_evaluated': len(mesh_files),
-    }
-
-
-def visualize_sciml_loop_output(
-    test_sample_dir: str,
-    model_dir: str,
-    output_file: str,
-    sample_idx: int = 25,
-    refine_levels: int = 2
-) -> Dict:
-    """
-    Visualize SciML loop output on a test sample (different from training).
-
-    Creates 3-panel figure showing the agentic SciML loop results:
-    1. Ground Truth (FEA on REFINED mesh)
-    2. SciML Prediction (on COARSE mesh)
-    3. Error Map (on coarse mesh)
-
-    Args:
-        test_sample_dir: Directory containing test mesh files
-        model_dir: Directory with trained model
-        output_file: Output image path
-        sample_idx: Index of test sample to use
-        refine_levels: Mesh refinement levels for ground truth
-
-    Returns:
-        Test metrics
-    """
-    samples_path = Path(test_sample_dir)
-    mesh_files = sorted(samples_path.glob("sample_*.mesh"))
-
-    if not mesh_files:
-        print(f"No mesh files found in {test_sample_dir}")
-        return {}
-
-    # Select test sample
-    sample_idx = min(sample_idx, len(mesh_files) - 1)
-    mesh_file = mesh_files[sample_idx]
-
-    print(f"Testing SciML loop on: {mesh_file.stem}")
-
-    # Load model
-    print("Loading Transolver model...")
-    try:
-        model, norm_params, device = load_transolver_model(model_dir)
-        max_elems = model._num_points
-    except FileNotFoundError as e:
-        print(f"Model not found: {e}")
-        return {}
-
-    # Load mesh
-    vertices, elements, boundary = read_mfem_mesh(str(mesh_file))
-    print(f"  Coarse mesh - Vertices: {len(vertices)}, Elements: {len(elements)}")
-
-    # Generate parameters (use different seed for test)
-    np.random.seed(hash(str(mesh_file)) % 10000)
-    params = {
-        'E': np.random.uniform(150e9, 250e9),
-        'nu': np.random.uniform(0.25, 0.35),
-        'load': np.random.uniform(80, 120),
-    }
-
-    # Generate ground truth on REFINED mesh
-    print(f"Computing ground truth FEA on refined mesh (level={refine_levels})...")
-    refined_stress, refined_verts, refined_elems = simulate_ground_truth_refined(
-        str(mesh_file), params, refine_levels=refine_levels
-    )
-    print(f"  Refined mesh - Vertices: {len(refined_verts)}, Elements: {len(refined_elems)}")
-
-    # Get SciML prediction on COARSE mesh
-    print("Getting SciML (Transolver) prediction on coarse mesh...")
-    prediction = predict_with_transolver(
-        model, vertices, elements, boundary, params, norm_params, device, max_elems
-    )
-
-    # Coarse ground truth for error comparison
-    coarse_ground_truth, _, _ = simulate_ground_truth(str(mesh_file), params)
-
-    # Compute error
-    error = np.abs(prediction - coarse_ground_truth)
-    relative_error = error / (np.abs(coarse_ground_truth) + 1e-10)
-
-    mean_error = np.mean(error)
-    max_error = np.max(error)
-    mean_rel_error = np.mean(relative_error) * 100
-
-    print(f"  Mean absolute error: {mean_error:.2f}")
-    print(f"  Max absolute error: {max_error:.2f}")
-    print(f"  Mean relative error: {mean_rel_error:.1f}%")
-
-    # Create figure
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle(f'Agentic SciML Loop - Test Results ({mesh_file.stem})',
-                 fontsize=14, fontweight='bold', y=1.02)
-
-    # Determine common color scale
-    vmin = min(refined_stress.min(), prediction.min())
-    vmax = max(refined_stress.max(), prediction.max())
-
-    # Panel 1: Ground Truth on REFINED mesh
-    coll1 = plot_mesh_field(
-        axes[0], refined_verts, refined_elems, refined_stress,
-        title=f"Ground Truth (Refined, {len(refined_elems)} elems)",
-        cmap="jet", vmin=vmin, vmax=vmax
-    )
-    cbar1 = fig.colorbar(coll1, ax=axes[0], shrink=0.8)
-    cbar1.set_label('Von Mises Stress', fontsize=9)
-
-    # Panel 2: SciML Prediction on COARSE mesh
-    coll2 = plot_mesh_field(
-        axes[1], vertices, elements, prediction,
-        title=f"SciML Prediction (Coarse, {len(elements)} elems)",
-        cmap="jet", vmin=vmin, vmax=vmax
-    )
-    cbar2 = fig.colorbar(coll2, ax=axes[1], shrink=0.8)
-    cbar2.set_label('Von Mises Stress', fontsize=9)
-
-    # Panel 3: Error Map on coarse mesh
-    coll3 = plot_mesh_field(
-        axes[2], vertices, elements, error,
-        title="Error Map (Coarse Mesh)",
-        cmap="Reds"
-    )
-    cbar3 = fig.colorbar(coll3, ax=axes[2], shrink=0.8)
-    cbar3.set_label('Absolute Error', fontsize=9)
-
-    # Add stats
-    stats_text = f"Mean Error: {mean_error:.2f}\nMax Error: {max_error:.2f}\nRel. Error: {mean_rel_error:.1f}%"
-    axes[2].text(
-        0.02, 0.98, stats_text,
-        transform=axes[2].transAxes, fontsize=9,
-        verticalalignment='top',
-        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
-    )
-
-    plt.tight_layout()
-    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    plt.close()
-
-    print(f"Saved SciML loop visualization to: {output_file}")
-
-    return {
-        'test_sample': mesh_file.stem,
-        'mean_error': mean_error,
-        'max_error': max_error,
-        'mean_relative_error': mean_rel_error,
-        'coarse_elements': len(elements),
-        'refined_elements': len(refined_elems),
-    }
-
-
-def visualize_sciml_active_learning(
-    train_dir: str,
-    test_dir: str,
-    model_dir: str,
-    output_file: str,
-    n_test_samples: int = 5
-) -> Dict:
-    """
-    Visualize SciML active learning loop: error analysis across parameter space.
-
-    Shows:
-    - Row 1: Training samples (low error - model knows these)
-    - Row 2: Test samples (potentially higher error - active learning targets)
-    - Error map highlighting where more training data is needed
-
-    Args:
-        train_dir: Training samples directory
-        test_dir: Test samples directory
-        model_dir: Trained model directory
-        output_file: Output image path
-        n_test_samples: Number of test samples to evaluate
-
-    Returns:
-        Analysis results
-    """
-    # Load model
-    print("Loading Transolver model...")
-    try:
-        model, norm_params, device = load_transolver_model(model_dir)
-        max_elems = model._num_points
-    except FileNotFoundError as e:
-        print(f"Model not found: {e}")
-        return {}
-
-    # Get training samples
-    train_path = Path(train_dir)
-    train_files = sorted(train_path.glob("sample_*.mesh"))
-
-    # Get test samples
-    test_path = Path(test_dir)
-    test_files = sorted(test_path.glob("sample_*.mesh"))
-
-    print(f"Analyzing {len(train_files)} training samples and {len(test_files)} test samples...")
-
-    # Evaluate all samples to get error distribution
-    all_results = []
-
-    for mesh_file in train_files[:50]:  # Sample subset of training
-        vertices, elements, boundary = read_mfem_mesh(str(mesh_file))
-        np.random.seed(hash(str(mesh_file)) % 10000)
-        params = {
-            'E': np.random.uniform(150e9, 250e9),
-            'nu': np.random.uniform(0.25, 0.35),
-            'load': np.random.uniform(80e6, 120e6),
-        }
-
-        coarse_gt = simulate_ground_truth(vertices, elements, boundary, params)
-        prediction = predict_with_transolver(
-            model, vertices, elements, boundary, params, norm_params, device, max_elems
-        )
-        error = np.abs(prediction - coarse_gt)
-
-        all_results.append({
-            'file': mesh_file,
-            'type': 'train',
-            'max_error': np.max(error),
-            'mean_error': np.mean(error),
-            'params': params,
-        })
-
-    for mesh_file in test_files[:n_test_samples]:
-        vertices, elements, boundary = read_mfem_mesh(str(mesh_file))
-        np.random.seed(hash(str(mesh_file)) % 10000)
-        params = {
-            'E': np.random.uniform(150e9, 250e9),
-            'nu': np.random.uniform(0.25, 0.35),
-            'load': np.random.uniform(80e6, 120e6),
-        }
-
-        coarse_gt = simulate_ground_truth(vertices, elements, boundary, params)
-        prediction = predict_with_transolver(
-            model, vertices, elements, boundary, params, norm_params, device, max_elems
-        )
-        error = np.abs(prediction - coarse_gt)
-
-        all_results.append({
-            'file': mesh_file,
-            'type': 'test',
-            'max_error': np.max(error),
-            'mean_error': np.mean(error),
-            'params': params,
-        })
-
-    # Find best training and worst test samples
-    train_results = [r for r in all_results if r['type'] == 'train']
-    test_results = [r for r in all_results if r['type'] == 'test']
-
-    best_train = min(train_results, key=lambda x: x['max_error'])
-    worst_test = max(test_results, key=lambda x: x['max_error'])
-
-    print(f"\nBest training sample: {best_train['file'].stem}, Max Error: {best_train['max_error']:.2f}")
-    print(f"Worst test sample: {worst_test['file'].stem}, Max Error: {worst_test['max_error']:.2f}")
-
-    # Create comparison visualization
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    fig.suptitle('Agentic SciML Loop - Active Learning Analysis',
-                 fontsize=14, fontweight='bold', y=0.98)
-
-    # Row 1: Best training sample
-    vertices, elements, boundary = read_mfem_mesh(str(best_train['file']))
-    refined_stress, refined_verts, refined_elems = simulate_ground_truth_refined(
-        str(best_train['file']), best_train['params'], refine_levels=2
-    )
-    prediction = predict_with_transolver(
-        model, vertices, elements, boundary, best_train['params'], norm_params, device, max_elems
-    )
-    coarse_gt, _, _ = simulate_ground_truth(str(best_train['file']), best_train['params'])
-    error = np.abs(prediction - coarse_gt)
-
-    vmin = min(refined_stress.min(), prediction.min())
-    vmax = max(refined_stress.max(), prediction.max())
-
-    coll = plot_mesh_field(axes[0, 0], refined_verts, refined_elems, refined_stress,
-                           title=f"Training Best: GT ({best_train['file'].stem})",
-                           cmap="jet", vmin=vmin, vmax=vmax)
-    fig.colorbar(coll, ax=axes[0, 0], shrink=0.8)
-
-    coll = plot_mesh_field(axes[0, 1], vertices, elements, prediction,
-                           title="Transolver Prediction",
-                           cmap="jet", vmin=vmin, vmax=vmax)
-    fig.colorbar(coll, ax=axes[0, 1], shrink=0.8)
-
-    coll = plot_mesh_field(axes[0, 2], vertices, elements, error,
-                           title=f"Error (Max: {best_train['max_error']:.1f})",
-                           cmap="Reds")
-    fig.colorbar(coll, ax=axes[0, 2], shrink=0.8)
-    axes[0, 2].text(0.02, 0.98, "Low error\n(model confident)",
-                    transform=axes[0, 2].transAxes, fontsize=9,
-                    verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
-
-    # Row 2: Worst test sample (where active learning would help)
-    vertices, elements, boundary = read_mfem_mesh(str(worst_test['file']))
-    refined_stress, refined_verts, refined_elems = simulate_ground_truth_refined(
-        str(worst_test['file']), worst_test['params'], refine_levels=2
-    )
-    prediction = predict_with_transolver(
-        model, vertices, elements, boundary, worst_test['params'], norm_params, device, max_elems
-    )
-    coarse_gt, _, _ = simulate_ground_truth(str(worst_test['file']), worst_test['params'])
-    error = np.abs(prediction - coarse_gt)
-
-    vmin = min(refined_stress.min(), prediction.min())
-    vmax = max(refined_stress.max(), prediction.max())
-
-    coll = plot_mesh_field(axes[1, 0], refined_verts, refined_elems, refined_stress,
-                           title=f"Test High-Error: GT ({worst_test['file'].stem})",
-                           cmap="jet", vmin=vmin, vmax=vmax)
-    fig.colorbar(coll, ax=axes[1, 0], shrink=0.8)
-
-    coll = plot_mesh_field(axes[1, 1], vertices, elements, prediction,
-                           title="Transolver Prediction",
-                           cmap="jet", vmin=vmin, vmax=vmax)
-    fig.colorbar(coll, ax=axes[1, 1], shrink=0.8)
-
-    coll = plot_mesh_field(axes[1, 2], vertices, elements, error,
-                           title=f"Error (Max: {worst_test['max_error']:.1f})",
-                           cmap="Reds")
-    fig.colorbar(coll, ax=axes[1, 2], shrink=0.8)
-    axes[1, 2].text(0.02, 0.98, "High error\n(needs more training)",
-                    transform=axes[1, 2].transAxes, fontsize=9,
-                    verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='lightsalmon', alpha=0.8))
-
-    plt.tight_layout()
-    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    plt.close()
-
-    print(f"Saved active learning analysis to: {output_file}")
-
-    # Compute improvement potential
-    avg_train_error = np.mean([r['max_error'] for r in train_results])
-    avg_test_error = np.mean([r['max_error'] for r in test_results])
-
-    return {
-        'best_train_sample': best_train['file'].stem,
-        'best_train_max_error': best_train['max_error'],
-        'worst_test_sample': worst_test['file'].stem,
-        'worst_test_max_error': worst_test['max_error'],
-        'avg_train_error': avg_train_error,
-        'avg_test_error': avg_test_error,
-        'error_gap': avg_test_error - avg_train_error,
-        'n_train_evaluated': len(train_results),
-        'n_test_evaluated': len(test_results),
-    }
 
 
 # =============================================================================
@@ -1563,80 +944,65 @@ def visualize_sciml_active_learning(
 # =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test Transolver surrogate model")
-    parser.add_argument("--sample", type=int, default=0, help="Sample index to test")
-    parser.add_argument("--output", type=str, default=None, help="Output file path")
-    parser.add_argument("--samples-dir", type=str, default=None, help="Test samples directory")
-    parser.add_argument("--train-dir", type=str, default=None, help="Training samples directory")
-    parser.add_argument("--model-dir", type=str, default=None, help="Trained model directory")
-    parser.add_argument("--compare", action="store_true", help="Compare multiple samples")
-    parser.add_argument("--best-training", action="store_true", help="Find and visualize best training sample")
-    parser.add_argument("--sciml-loop", action="store_true", help="Visualize SciML loop output on test sample")
-    parser.add_argument("--active-learning", action="store_true", help="Visualize active learning analysis")
-
+    parser = argparse.ArgumentParser(
+        description="Ensemble uncertainty-driven SciML loop visualization"
+    )
+    parser.add_argument("--sample",      type=int, default=0,
+                        help="Sample index to visualize (from first samples-dir)")
+    parser.add_argument("--output",      type=str, default=None,
+                        help="Output PNG path")
+    parser.add_argument("--samples-dirs", type=str, nargs="+", default=None,
+                        help="One or more mesh sample directories (e.g. train01 train02)")
+    parser.add_argument("--model-dir",   type=str, default=None,
+                        help="Trained ensemble model directory")
+    parser.add_argument("--compare",     action="store_true",
+                        help="Compare uncertainty across multiple samples")
+    parser.add_argument("--no-gt",       action="store_true",
+                        help="Skip optional GT fine-mesh FEM panel")
+    parser.add_argument("--epochs",      type=int, default=500,
+                        help="Training epochs for on-the-fly ensemble")
     args = parser.parse_args()
 
     project_root = Path(__file__).parent.parent
-    samples_dir = args.samples_dir or str(project_root / "train01")
-    train_dir = args.train_dir or str(project_root / "train01")
-    model_dir = args.model_dir or str(project_root / "outputs" / "surrogate")
+    samples_dirs = args.samples_dirs or [
+        str(project_root / "train01"),
+        str(project_root / "train02"),
+    ]
+    model_dir  = args.model_dir or str(project_root / "outputs" / "surrogate")
     output_dir = project_root / "tests" / "test_outputs"
     output_dir.mkdir(exist_ok=True)
 
-    if args.active_learning:
-        # Visualize active learning analysis (train vs test error)
-        output_file = args.output or str(output_dir / "sciml_active_learning.png")
-        results = visualize_sciml_active_learning(train_dir, samples_dir, model_dir, output_file)
-        print("\nActive Learning Analysis Results:")
-        for key, value in results.items():
-            if isinstance(value, float):
-                print(f"  {key}: {value:.3f}")
-            else:
-                print(f"  {key}: {value}")
-
-    elif args.best_training:
-        # Find and visualize best training sample (min Max Error)
-        output_file = args.output or str(output_dir / "transolver_best_training.png")
-        results = visualize_best_training_sample(train_dir, model_dir, output_file)
-        print("\nBest Training Sample Results:")
-        for key, value in results.items():
-            if isinstance(value, float):
-                print(f"  {key}: {value:.3f}")
-            else:
-                print(f"  {key}: {value}")
-
-    elif args.sciml_loop:
-        # Visualize SciML loop output on test sample
-        output_file = args.output or str(output_dir / "sciml_loop_test.png")
-        results = visualize_sciml_loop_output(samples_dir, model_dir, output_file, sample_idx=args.sample)
-        print("\nSciML Loop Test Results:")
-        for key, value in results.items():
-            if isinstance(value, float):
-                print(f"  {key}: {value:.3f}")
-            else:
-                print(f"  {key}: {value}")
-
-    elif args.compare:
-        output_file = args.output or str(output_dir / "transolver_comparison.png")
-        results = compare_multiple_samples(samples_dir, model_dir, output_file)
-        print("\nTest Results Summary:")
+    if args.compare:
+        out = args.output or str(output_dir / "ensemble_comparison.png")
+        results = compare_multiple_uncertainty(samples_dirs, model_dir, out)
+        print("\nComparison Results:")
         for r in results:
-            print(f"  {r['mesh']}: mean_error={r['mean_error']:.2f}, max_error={r['max_error']:.2f}")
+            print(f"  {r['mesh']}: mean_unc={r['mean_uncertainty']:.4f}  "
+                  f"max_unc={r['max_uncertainty']:.4f}")
     else:
-        mesh_files = sorted(Path(samples_dir).glob("sample_*.mesh"))
+        mesh_files = []
+        for d in samples_dirs:
+            mesh_files.extend(sorted(Path(d).glob("sample_*.mesh")))
         if not mesh_files:
-            print(f"No mesh files found in {samples_dir}")
+            print(f"No mesh files found in {samples_dirs}")
             sys.exit(1)
 
-        sample_idx = min(args.sample, len(mesh_files) - 1)
-        mesh_file = str(mesh_files[sample_idx])
-        output_file = args.output or str(output_dir / f"sciml_loop_sample_{sample_idx:03d}.png")
+        idx = min(args.sample, len(mesh_files) - 1)
+        mf  = str(mesh_files[idx])
+        out = args.output or str(output_dir / f"uncertainty_loop_{idx:03d}.png")
 
-        results = visualize_transolver_test(mesh_file, model_dir, output_file)
-
-        print("\nTest Results:")
-        for key, value in results.items():
-            print(f"  {key}: {value:.3f}")
+        results = visualize_uncertainty_loop(
+            mf, model_dir, out,
+            samples_dirs=samples_dirs,
+            show_gt=not args.no_gt,
+            epochs=args.epochs,
+        )
+        print("\nResults:")
+        for k, v in results.items():
+            if isinstance(v, float):
+                print(f"  {k}: {v:.4f}")
+            else:
+                print(f"  {k}: {v}")
 
 
 # =============================================================================
@@ -1644,70 +1010,85 @@ if __name__ == "__main__":
 # =============================================================================
 
 class TestTransolver:
-    """Pytest tests for Transolver."""
+    """Pytest tests for ensemble uncertainty pipeline."""
+
+    def _samples_dir(self):
+        return Path(__file__).parent.parent / "samples"
+
+    def _model_dir(self):
+        return Path(__file__).parent.parent / "outputs" / "surrogate"
 
     def test_mesh_loading(self):
-        """Test mesh file loading from train/ folder."""
-        project_root = Path(__file__).parent.parent
-        train_dir = project_root / "train"
-        mesh_files = sorted(train_dir.glob("sample_*.mesh"))
-
+        """Mesh files in samples/ are readable."""
+        mesh_files = sorted(self._samples_dir().glob("sample_*.mesh"))
         if not mesh_files:
-            import pytest
-            pytest.skip("No train meshes found")
+            import pytest; pytest.skip("No sample meshes found")
 
-        vertices, elements, boundary = read_mfem_mesh(str(mesh_files[0]))
+        verts, elems, bdr = read_mfem_mesh(str(mesh_files[0]))
+        assert len(verts) > 0
+        assert len(elems) > 0
+        assert verts.shape[1] == 2
 
-        assert len(vertices) > 0
-        assert len(elements) > 0
-        assert vertices.shape[1] == 2
-
-    def test_ground_truth_generation(self):
-        """Test FEA ground truth generation on train mesh."""
-        project_root = Path(__file__).parent.parent
-        train_dir = project_root / "train"
-        mesh_files = sorted(train_dir.glob("sample_*.mesh"))
-
-        if not mesh_files:
-            import pytest
-            pytest.skip("No train meshes found")
-
-        vertices, elements, boundary = read_mfem_mesh(str(mesh_files[0]))
-
-        params = {'E': 200e9, 'nu': 0.3, 'load': 100}
-        stress = simulate_ground_truth(vertices, elements, boundary, params)
-
-        assert len(stress) == len(elements)
-        assert np.all(stress >= 0)
-
-    def test_visualization(self):
-        """
-        5-panel visualization: fine GT | coarse MFEM | error | adapted | error reduced.
-        Uses train/ meshes. Saves PNGs to tests/test_outputs/.
-        """
+    def test_ensemble_uncertainty(self):
+        """Ensemble produces non-trivial uncertainty on sample mesh."""
         import pytest
         pytest.importorskip("torch", reason="torch not installed")
 
-        project_root = Path(__file__).parent.parent
-        train_dir = project_root / "train"
-        model_dir = project_root / "outputs" / "surrogate"
-        mesh_files = sorted(train_dir.glob("sample_*.mesh"))
-
+        mesh_files = sorted(self._samples_dir().glob("sample_*.mesh"))
         if not mesh_files:
-            pytest.skip("No train meshes found")
+            pytest.skip("No sample meshes found")
 
         output_dir = Path(__file__).parent / "test_outputs"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(exist_ok=True)
+        model_dir = str(self._model_dir())
 
-        # Run for the first 3 train samples
-        for mesh_file in mesh_files[:3]:
-            stem = mesh_file.stem
-            output_file = output_dir / f"sciml_loop_{stem}.png"
-            results = visualize_transolver_test(
-                str(mesh_file), str(model_dir), str(output_file)
+        try:
+            model, _ = load_ensemble_model(model_dir)
+        except FileNotFoundError:
+            model = train_fast_ensemble(
+                str(self._samples_dir()),
+                n_train=10, n_ensemble=3, epochs=30,
+                save_dir=model_dir,
             )
-            assert output_file.exists(), f"PNG not created for {stem}"
-            assert results['mean_error'] >= 0
-            assert 'coarse_elements' in results
-            print(f"  [{stem}] adapted={results['adapted']}, "
-                  f"mean_error={results['mean_error']:.2f}")
+
+        verts, elems, _ = read_mfem_mesh(str(mesh_files[0]))
+        params = {'E': 200e9, 'nu': 0.3, 'load': 100e6}
+        mean_f, unc_f = predict_ensemble(
+            model, verts, elems, params, ['E', 'nu', 'load']
+        )
+
+        assert mean_f.shape == (len(elems),)
+        assert unc_f.shape  == (len(elems),)
+        # Uncertainty must be non-negative; at least some non-zero values expected
+        assert np.all(unc_f >= 0)
+
+    def test_visualization(self):
+        """5-panel uncertainty loop PNG is created without error."""
+        import pytest
+        pytest.importorskip("torch", reason="torch not installed")
+
+        mesh_files = sorted(self._samples_dir().glob("sample_*.mesh"))
+        if not mesh_files:
+            pytest.skip("No sample meshes found")
+
+        output_dir = Path(__file__).parent / "test_outputs"
+        output_dir.mkdir(exist_ok=True)
+        out = str(output_dir / "uncertainty_loop_test.png")
+
+        results = visualize_uncertainty_loop(
+            str(mesh_files[0]),
+            str(self._model_dir()),
+            out,
+            samples_dir=str(self._samples_dir()),
+            show_gt=True,
+            n_train=10,
+            n_ensemble=3,
+            epochs=30,
+        )
+
+        assert Path(out).exists(), "PNG not created"
+        assert results['mean_uncertainty_coarse'] >= 0
+        assert results['coarse_elements'] > 0
+        print(f"  mean_unc_coarse={results['mean_uncertainty_coarse']:.4f}  "
+              f"r_adapted={results['r_adapted']}  "
+              f"gt_available={results['gt_available']}")

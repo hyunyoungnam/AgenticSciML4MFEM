@@ -62,15 +62,15 @@ The acquisition function quantifies "informativeness" — regions with high ense
 ### Training the Transolver Surrogate
 
 ```bash
-# Generate mesh samples
+# Generate mesh samples (requires gmsh >= 4.11)
 python samples/generate_samples.py --n 200 --output train01           # single-hole plates
 python samples/generate_two_hole_samples.py --n 200 --output train02  # two-hole plates
 
-# Train on single-hole data only
-python train_transolver.py --train-dir train01 --epochs 500
+# Run the uncertainty-loop visualization (trains ensemble on-the-fly from both dirs)
+python tests/test_transolver.py --samples-dirs train01 train02 --model-dir outputs/surrogate
 
-# Train on both datasets merged (recommended)
-python train_transolver.py --train-dir train01 train02 --epochs 500
+# Compare uncertainty across a few samples
+python tests/test_transolver.py --samples-dirs train01 train02 --model-dir outputs/surrogate --compare
 ```
 
 ### Using the Framework Programmatically
@@ -135,12 +135,15 @@ pip install -e ".[all]"
 
 - Python 3.9+
 - PyTorch (for Transolver surrogate)
-- PyMFEM — required for FEM simulation ground truth
-- gmsh + meshio — required for mesh generation
+- PyMFEM — required for FEM simulation ground truth and mesh format conversion
+- gmsh >= 4.11.0 — required for mesh generation (bundles Mesa; no system libGLU needed on most platforms)
 - scipy (for acquisition functions)
-- (Optional) scikit-learn (for error hotspot clustering)
 
-**Platform note**: mesh generation (`gmsh`, `meshio`) runs on Windows Python; FEM solving (`mfem`) runs on Linux/WSL Python.
+**Headless Linux / WSL2 note**: if `import gmsh` fails with `libGLU.so.1: cannot open shared object file`, run:
+```bash
+sudo apt-get install -y libglu1-mesa
+```
+meshio is **not** required — `.msh` → `.mesh` conversion uses PyMFEM's native Gmsh reader.
 
 ---
 
@@ -160,7 +163,7 @@ The domain is a unit-square plate `[0,1]×[0,1]` with one or two blob-shaped hol
 | Top (y=1) | 3 | Free | zero traction (natural Neumann) |
 | Hole surface | 5 / 6 | Free | traction-free |
 
-Boundary tags are assigned geometrically at runtime, making the pipeline robust against any mesh generation quirks.
+Boundary tags are written at mesh generation time by PyMFEM's native Gmsh reader, which maps gmsh physical curves directly to MFEM boundary attributes. The previous meshio-based conversion is removed — it silently dropped 4 of 5 boundary groups, causing the FEM solver to receive a zero load vector.
 
 ### Solver Details
 
@@ -206,21 +209,20 @@ print(f"von Mises range: {vm.min()*1e-6:.1f} .. {vm.max()*1e-6:.1f} MPa")
 
 ## Example Output
 
-Each test run produces a 5-panel SciML loop visualization comparing fine-mesh ground truth, coarse MFEM, error maps, and the r+h adapted result.
+Each test run produces a 5-panel uncertainty-driven SciML loop visualization:
 
-### Single-hole plate (train01)
+| Panel | Content |
+|-------|---------|
+| ① | Ensemble mean prediction on coarse mesh |
+| ② | Ensemble uncertainty (adaptation signal — no GT needed) |
+| ③ | R+H adapted mesh (nodes clustered toward high-uncertainty region) |
+| ④ | Ensemble uncertainty on adapted mesh |
+| ⑤ | Fine-mesh FEM ground truth (optional validation) |
 
-![SciML loop — single hole](tests/test_outputs/sciml_loop_train01_best.png)
+![Uncertainty loop — train01/sample_000](tests/test_outputs/uncertainty_loop_000.png)
 
-`train01/sample_006` — SCF ≈ 4.95 (irregular blob hole under 80–120 MPa uniaxial tension).  
-Fine GT: 818 MPa peak · Coarse: 502 MPa · Adapted (343 elems): 660 MPa · Rel. error: 13.8%
-
-### Double-hole plate (train02)
-
-![SciML loop — double hole](tests/test_outputs/sciml_loop_train02_best.png)
-
-`train02/sample_007` — two interacting blob holes, SCF ≈ 3.63.  
-Fine GT: 901 MPa peak · Coarse: 412 MPa · Adapted (1009 elems): 674 MPa · Rel. error: 11.3% → 11.0% (+0.4 pp)
+Trained on 400 samples (200 single-hole + 200 double-hole), 500 epochs, 3-member ensemble.  
+Coarse rel. error: ~20% · GT peak: ~600 MPa (SCF ≈ 3× applied load at hole boundary)
 
 ---
 
@@ -243,9 +245,9 @@ Fine GT: 901 MPa peak · Coarse: 412 MPa · Adapted (1009 elems): 674 MPa · Rel
 │  │  3. TRAIN Transolver SURROGATE                                  ││
 │  │     └─ Physics-Attention operator on unstructured mesh coords   ││
 │  │                          ↓                                      ││
-│  │  4. EVALUATE & COMPUTE ACQUISITION SCORES                       ││
+│  │  4. EVALUATE VIA ENSEMBLE UNCERTAINTY (no GT needed)             ││
 │  │     ├─ Predict on candidate parameter configurations            ││
-│  │     ├─ Compute uncertainty (ensemble disagreement)              ││
+│  │     ├─ Compute uncertainty = ensemble std across members        ││
 │  │     └─ Score candidates with acquisition function               ││
 │  │                          ↓                                      ││
 │  │  5. SELECT INFORMATIVE SAMPLES                                  ││
@@ -260,7 +262,10 @@ Fine GT: 901 MPa peak · Coarse: 412 MPa · Adapted (1009 elems): 674 MPa · Rel
 │  │     ├─ Uncertainty < threshold? → LOW_UNCERTAINTY               ││
 │  │     └─ Efficiency dropping? → DIMINISHING_RETURNS               ││
 │  │                          ↓                                      ││
-│  │  7. RUN NEW SIMULATIONS & LOOP                                  ││
+│  │  7. R-ADAPT BASE MESH (uncertainty → TMOP node relocation)      ││
+│  │     └─ Adapted mesh used for all future simulations            ││
+│  │                          ↓                                      ││
+│  8. RUN NEW SIMULATIONS & LOOP                                  ││
 │  └─────────────────────────────────────────────────────────────────┘│
 │                          ↓                                          │
 │  8. SAVE: Dataset, Trained Surrogate, Metrics                       │
@@ -310,25 +315,28 @@ hybrid = HybridAcquisition([
 
 ## Usage Examples
 
-### Training the Surrogate
+### Training the Ensemble Surrogate
 
 ```bash
-# Smoke test: 5 samples, 10 epochs
-python train_transolver.py --max-samples 5 --epochs 10
+# Train on all available samples from both directories (recommended)
+python tests/test_transolver.py \
+    --samples-dirs train01 train02 \
+    --model-dir outputs/surrogate \
+    --epochs 500
 
-# Full training on single-hole dataset
-python train_transolver.py --train-dir train01 --epochs 500 --batch-size 16
-
-# Full training on two-hole dataset
-python train_transolver.py --train-dir train02 --epochs 500
+# Train on single-hole data only
+python tests/test_transolver.py \
+    --samples-dirs train01 \
+    --model-dir outputs/surrogate \
+    --epochs 500
 ```
 
-The training script:
-1. Runs PyMFEM on each mesh file to generate von Mises stress ground truth
-2. Trains Transolver: `(element centroids, physics params) → von Mises stress field`
-3. Saves the model to `outputs/surrogate/transolver_model.pt`
+The training pipeline:
+1. Runs PyMFEM on each mesh file to generate von Mises stress ground truth (no analytical approximation)
+2. Trains a 3-member Transolver ensemble: `(element centroids, physics params) → von Mises field`
+3. Saves model + normalizer params to `outputs/surrogate/ensemble_model.pt` and `normalizer_params.json`
 
-Parameter vector per sample: `[E (GPa), ν, σ₀ (MPa)]`
+Parameter vector per sample: `[E (Pa), ν, σ₀ (Pa)]` — normalized internally before inference.
 
 ### Analyzing Learning Efficiency
 
@@ -426,14 +434,15 @@ meshforge/
 
 ## R-Adaptivity (Error-Driven Mesh Adaptation)
 
-Meshforge uses MFEM's **TMOP (Target-Matrix Optimization Paradigm)** for r-adaptivity — redistributing mesh nodes to cluster in regions where the surrogate model has high prediction error.
+Meshforge uses MFEM's **TMOP (Target-Matrix Optimization Paradigm)** for r-adaptivity — redistributing mesh nodes to cluster in regions of high ensemble uncertainty. This closes the active learning loop spatially: parameter-space uncertainty selects new simulations, while spatial uncertainty relocates mesh nodes.
 
 ### How It Works
 
-1. **Error Field**: The surrogate model provides pointwise prediction errors at each mesh node
-2. **Target Size**: High-error regions get smaller target element sizes (attract nodes)
+1. **Uncertainty Field**: Ensemble std across members gives a per-node spatial uncertainty signal — no GT comparison needed
+2. **Target Size**: High-uncertainty regions get smaller target element sizes (attract nodes)
 3. **TMOP Optimization**: Nodes are relocated while maintaining mesh validity
 4. **Barrier Functions**: Prevent element inversion during adaptation
+5. **Persistent Adaptation**: The adapted base mesh is saved and used for all future iterations
 
 ### Usage
 
@@ -444,8 +453,9 @@ from meshforge.mesh.mfem_manager import MFEMManager
 manager = MFEMManager("mesh.mesh")
 coords = manager.get_nodes()
 
-# Get error field from surrogate vs FEM ground truth
-error_field = np.abs(surrogate_prediction - fem_ground_truth)
+# Get uncertainty field from ensemble (no GT needed)
+result = ensemble_model.predict(param_array, coords)
+uncertainty_field = np.mean(result.uncertainty, axis=-1)  # (N_nodes,)
 
 config = AdaptivityConfig(
     size_scale_min=0.3,
@@ -454,7 +464,7 @@ config = AdaptivityConfig(
 )
 
 adaptivity = TMOPAdaptivity(config)
-result = adaptivity.adapt(manager, error_field)
+result = adaptivity.adapt(manager, uncertainty_field)
 
 if result.success:
     print(f"Quality: {result.quality_before['min_quality']:.3f} → "
@@ -566,19 +576,29 @@ manager.refine_by_error(element_error, threshold_fraction=0.5)
 | `n_candidates` | int | 1000 | Candidates to consider per iteration |
 | `uncertainty_threshold` | float | 0.05 | Stop when uncertainty drops below |
 
-### Transolver Hyperparameters (`train_transolver.py`)
+### Transolver Hyperparameters (`TransolverConfig`)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--epochs` | 500 | Training epochs |
-| `--batch-size` | 16 | Batch size |
-| `--d-model` | 128 | Model hidden dimension |
-| `--n-layers` | 4 | Number of Transolver layers |
-| `--slice-num` | 32 | Number of physics-attention slices (S) |
-| `--n-heads` | 8 | Attention heads |
-| `--lr` | 1e-3 | Learning rate |
-| `--patience` | 50 | Early stopping patience |
-| `--max-samples` | None | Cap number of training samples |
+| `epochs` | 1000 | Maximum training epochs (early stopping via `patience`) |
+| `patience` | 50 | Early stopping patience (epochs without test-loss improvement) |
+| `batch_size` | 4 | Gradient accumulation batch size (variable-N meshes, no padding) |
+| `d_model` | 64 | Model hidden dimension |
+| `n_layers` | 2 | Number of Transolver layers |
+| `slice_num` | 8 | Physics-attention slices (S); complexity O(S² + NS) |
+| `n_heads` | 4 | Attention heads |
+| `learning_rate` | 1e-3 | AdamW learning rate |
+
+### CLI (`test_transolver.py`)
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--samples-dirs` | `train01 train02` | One or more mesh sample directories |
+| `--model-dir` | `outputs/surrogate` | Where to load/save the ensemble model |
+| `--epochs` | 500 | Training epochs for on-the-fly ensemble |
+| `--sample` | 0 | Sample index for single-mesh visualization |
+| `--compare` | — | Compare uncertainty across first 3 meshes |
+| `--no-gt` | — | Skip fine-mesh GT panel ⑤ |
 
 ---
 

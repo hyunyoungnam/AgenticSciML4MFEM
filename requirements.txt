@@ -10,8 +10,14 @@ anthropic>=0.18.0
 # Async support
 aiohttp>=3.9.0
 
-# Surrogate model (DeepONet)
+# Surrogate model
 deepxde>=1.11.0
+
+# Mesh generation
+# gmsh>=4.11.0 bundles Mesa so it no longer requires system libGLU.
+# On Linux without a GPU stack (WSL2, headless servers) install:
+#   sudo apt-get install -y libglu1-mesa
+gmsh>=4.11.0
 
 # Testing
 pytest>=7.0.0

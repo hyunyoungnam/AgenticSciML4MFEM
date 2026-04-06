@@ -226,8 +226,7 @@ class AdaptiveOrchestrator:
         # Initialize acquisition function
         self._acquisition_fn = get_acquisition_function(config.acquisition_strategy)
 
-        # R-adaptivity deferred - not wired into the loop yet
-        self._adaptivity: Optional[TMOPAdaptivity] = None
+        self._adaptivity = TMOPAdaptivity() if is_tmop_available() else None
 
         # Setup RNG
         np.random.seed(config.random_seed)
@@ -355,6 +354,17 @@ class AdaptiveOrchestrator:
                 # Phase 5: Run simulations for new samples
                 logger.info("Phase 5: Running FEM simulations...")
                 self._run_simulations(new_params)
+
+                # Phase 6: Adapt base mesh toward high-uncertainty spatial regions
+                if self._adaptivity is not None and self.surrogate is not None and new_params:
+                    logger.info("Phase 6: Applying r-adaptivity to base mesh...")
+                    node_uncertainty = self._get_node_uncertainty(new_params[0])
+                    adapted_manager = MFEMManager(str(self.config.base_mesh_path))
+                    adapted_coords, _ = self._apply_r_adaptivity(adapted_manager, node_uncertainty)
+                    adapted_manager.update_nodes(adapted_coords)
+                    adapted_manager.save(self.config.base_mesh_path)
+                    self._coordinates = adapted_coords
+                    logger.info(f"  Base mesh adapted ({len(adapted_coords)} nodes)")
 
             # Final stopping criterion if loop completed
             if stopping_criterion is None:
@@ -753,6 +763,25 @@ class AdaptiveOrchestrator:
 
         return manager, quality
 
+    def _get_node_uncertainty(self, params: Dict[str, float]) -> np.ndarray:
+        """
+        Compute scalar uncertainty at each mesh node for one parameter config.
+
+        Collapses ensemble uncertainty (N_nodes, output_dim) → (N_nodes,) by
+        averaging across output dimensions.  Used to drive r-adaptivity.
+
+        Args:
+            params: Parameter dictionary for the configuration to probe
+
+        Returns:
+            (N_nodes,) array of uncertainty values
+        """
+        param_array = np.array([[params[name] for name in self.config.parameter_names]])
+        result = self.surrogate.predict(param_array, self._coordinates)
+        if result.uncertainty is None:
+            return np.zeros(len(self._coordinates))
+        return np.mean(result.uncertainty, axis=-1).flatten()
+
     def _train_surrogate(self) -> TrainingResult:
         """Train surrogate model on current dataset."""
         training_config = TrainingConfig(
@@ -768,20 +797,22 @@ class AdaptiveOrchestrator:
 
         self.trainer = SurrogateTrainer(training_config)
 
-        # Prepare training data
         try:
-            parameters, coordinates, outputs = self.dataset.prepare_training_data(
+            parameters, coordinates_list, outputs_list = self.dataset.prepare_training_data(
                 output_field="displacement",
-                valid_only=True
+                valid_only=True,
             )
         except ValueError as e:
             return TrainingResult(success=False, error_message=str(e))
 
-        # Store coordinates for acquisition function evaluation
-        self._coordinates = coordinates
+        # Use the current base mesh as the representative coordinate set for
+        # acquisition function probing and uncertainty estimation.  Loading it
+        # here (rather than from the dataset) means it automatically reflects
+        # any r-adaptivity applied at the end of the previous iteration.
+        base_manager = MFEMManager(str(self.config.base_mesh_path))
+        self._coordinates = base_manager.get_nodes()
 
-        # Train
-        result = self.trainer.train(parameters, coordinates, outputs)
+        result = self.trainer.train(parameters, coordinates_list, outputs_list)
 
         if result.success:
             self.surrogate = self.trainer.model
@@ -789,8 +820,11 @@ class AdaptiveOrchestrator:
         return result
 
     def _evaluate_surrogate(self) -> UncertaintyAnalysis:
-        """Evaluate surrogate model and identify weak regions."""
+        """Evaluate surrogate model and identify weak regions using ensemble uncertainty."""
         if self.surrogate is None:
+            return UncertaintyAnalysis()
+
+        if self._coordinates is None:
             return UncertaintyAnalysis()
 
         # Initialize evaluator
@@ -800,24 +834,12 @@ class AdaptiveOrchestrator:
             parameter_bounds=self.config.parameter_bounds,
         )
 
-        # Get validation data
-        try:
-            parameters, coordinates, outputs = self.dataset.prepare_training_data(
-                output_field="displacement",
-                valid_only=True
-            )
-        except ValueError:
-            return UncertaintyAnalysis()
-
-        # Analyze errors on existing data
-        analysis = self.evaluator.analyze_errors(
-            parameters=parameters,
-            coordinates=coordinates,
-            true_outputs=outputs,
-            error_threshold=self.config.convergence_threshold,
+        # Probe ensemble uncertainty across parameter space — no ground truth needed
+        return self.evaluator.analyze_uncertainty(
+            coordinates=self._coordinates,
+            n_probe_samples=100,
+            uncertainty_threshold=self.config.convergence_threshold,
         )
-
-        return analysis
 
     def get_dataset(self) -> FEMDataset:
         """Get the current dataset."""

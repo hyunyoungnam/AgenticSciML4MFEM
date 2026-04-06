@@ -212,10 +212,13 @@ class FEMDataset:
     def prepare_training_data(
         self,
         output_field: str = "displacement",
-        valid_only: bool = True
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        valid_only: bool = True,
+    ) -> Tuple[np.ndarray, List[np.ndarray], List[np.ndarray]]:
         """
         Prepare data for surrogate model training.
+
+        Each sample carries its own coordinate array so samples solved on
+        different meshes (e.g. after r-adaptivity) can coexist in the dataset.
 
         Args:
             output_field: Which output field to use as target
@@ -223,48 +226,35 @@ class FEMDataset:
 
         Returns:
             Tuple of (parameters, coordinates, outputs)
-            - parameters: (N_samples, n_params)
-            - coordinates: (N_points, coord_dim) - from first sample
-            - outputs: (N_samples, N_points, output_dim)
+            - parameters:  (N_samples, n_params)
+            - coordinates: List of (N_i, coord_dim) — one array per sample
+            - outputs:     List of (N_i, output_dim) — one array per sample
         """
         samples = self.get_valid_samples() if valid_only else list(self)
 
         if not samples:
             raise ValueError("No samples available for training")
 
-        # Get parameter names from config
         param_names = self.config.parameter_names
-
-        # Collect data
         parameters = []
+        coordinates = []
         outputs = []
-        coordinates = None
 
         for sample in samples:
-            # Get parameters
-            params = sample.get_parameter_vector(param_names)
-            parameters.append(params)
+            parameters.append(sample.get_parameter_vector(param_names))
 
-            # Get output field
             output = sample.get_output_field(output_field)
             if output is None:
                 raise ValueError(
                     f"Sample {sample.sample_id} missing field '{output_field}'"
                 )
+            # Ensure output is 2-D: (N_points, output_dim)
+            if output.ndim == 1:
+                output = output[:, np.newaxis]
             outputs.append(output)
+            coordinates.append(sample.coordinates)
 
-            # Use coordinates from first sample
-            if coordinates is None:
-                coordinates = sample.coordinates
-
-        parameters = np.array(parameters)
-        outputs = np.array(outputs)
-
-        # Ensure outputs have correct shape (N, N_points, output_dim)
-        if outputs.ndim == 2:
-            outputs = outputs[:, :, np.newaxis]
-
-        return parameters, coordinates, outputs
+        return np.array(parameters), coordinates, outputs
 
     def compute_statistics(self) -> DatasetStatistics:
         """Compute dataset statistics."""
