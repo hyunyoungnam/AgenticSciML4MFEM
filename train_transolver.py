@@ -34,9 +34,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import torch
 
-from meshforge.mesh.mfem_manager import MFEMManager
-from meshforge.solvers.mfem_solver import MFEMSolver
-from meshforge.solvers.base import (
+from piano.mesh.mfem_manager import MFEMManager
+from piano.solvers.mfem_solver import MFEMSolver
+from piano.solvers.base import (
     BoundaryCondition,
     BoundaryConditionType,
     MaterialProperties,
@@ -278,8 +278,8 @@ def train_transolver(
     Returns:
         dict with model_path, best_val_loss, epochs_trained
     """
-    from meshforge.surrogate.base import TransolverConfig
-    from meshforge.surrogate.transolver import TransolverModel
+    from piano.surrogate.base import TransolverConfig
+    from piano.surrogate.transolver import TransolverModel
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Training on device: {device}")

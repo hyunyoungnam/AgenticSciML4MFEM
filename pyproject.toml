@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "meshforge"
-version = "0.1.0"
-description = "Automated MFEM mesh generation for AI/ML training datasets using multi-agent systems"
+name = "piano"
+version = "0.2.0"
+description = "Physics-Informed Agentic Neural Operator — self-improving FEM surrogate via active learning and PINO loss"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
 requires-python = ">=3.9"
@@ -14,20 +14,19 @@ authors = [
     {name = "Q. Jiang"}
 ]
 keywords = [
-    "mfem",
-    "mesh",
-    "fea",
-    "finite-element-analysis",
-    "mesh-morphing",
-    "tmop",
-    "mesh-optimization",
-    "dataset-generation",
-    "machine-learning",
+    "pino",
+    "physics-informed",
+    "neural-operator",
+    "transolver",
     "active-learning",
+    "surrogate-model",
+    "finite-element-analysis",
+    "mfem",
+    "computational-mechanics",
+    "scientific-machine-learning",
+    "sciml",
     "multi-agent",
     "llm",
-    "transolver",
-    "neural-operator",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -49,7 +48,6 @@ dependencies = [
     "openai>=1.0.0",
     "anthropic>=0.18.0",
     "aiohttp>=3.9.0",
-    "mfem>=4.6",  # Required for TMOP mesh morphing
 ]
 
 [project.optional-dependencies]
@@ -59,6 +57,7 @@ dev = [
 ]
 viz = [
     "pyvista>=0.40.0",
+    "matplotlib>=3.7.0",
 ]
 mfem = [
     "mfem>=4.6",
@@ -72,23 +71,24 @@ all = [
     "torch>=2.0.0",
     "einops>=0.7.0",
     "pyvista>=0.40.0",
+    "matplotlib>=3.7.0",
 ]
 
 [project.scripts]
-meshforge = "meshforge.cli:main"
+piano = "piano.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/qjiang/meshforge"
-Repository = "https://github.com/qjiang/meshforge"
-Documentation = "https://github.com/qjiang/meshforge#readme"
-Issues = "https://github.com/qjiang/meshforge/issues"
+Homepage = "https://github.com/AgenticSciML/PIANO"
+Repository = "https://github.com/AgenticSciML/PIANO"
+Documentation = "https://github.com/AgenticSciML/PIANO#readme"
+Issues = "https://github.com/AgenticSciML/PIANO/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["meshforge*"]
+include = ["piano*"]
 
 [tool.setuptools.package-data]
-meshforge = ["configs/*.yaml", "configs/*.md", "knowledge/*.json", "morphing/*.py"]
+piano = ["configs/*.yaml", "configs/*.md", "knowledge/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

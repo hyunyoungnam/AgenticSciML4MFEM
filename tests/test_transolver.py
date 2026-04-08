@@ -127,8 +127,8 @@ def adapt_mesh_r(mesh_file: str,
         (adapted_verts, AdaptivityResult|None, tmp_mesh_path|None)
     """
     try:
-        from meshforge.mesh.mfem_manager import MFEMManager
-        from meshforge.morphing.r_adaptivity import TMOPAdaptivity, AdaptivityConfig
+        from piano.mesh.mfem_manager import MFEMManager
+        from piano.morphing.r_adaptivity import TMOPAdaptivity, AdaptivityConfig
 
         mgr = MFEMManager(mesh_file)
         if mgr.num_nodes != len(node_uncertainty):
@@ -164,8 +164,8 @@ def adapt_mesh_h(mesh_file: str,
         (h_verts, h_elements, HRefinementResult|None, tmp_mesh_path|None)
     """
     try:
-        from meshforge.mesh.mfem_manager import MFEMManager
-        from meshforge.morphing.h_refinement import HRefinement, HRefinementConfig
+        from piano.mesh.mfem_manager import MFEMManager
+        from piano.morphing.h_refinement import HRefinement, HRefinementConfig
 
         mgr = MFEMManager(mesh_file)
         if mgr.num_elements != len(elem_uncertainty):
@@ -234,9 +234,9 @@ def simulate_ground_truth(mesh_file: str,
         Returns all-zeros von_mises if the solver fails or produces a
         trivial solution — callers should check ``np.any(von_mises > 0)``.
     """
-    from meshforge.mesh.mfem_manager import MFEMManager
-    from meshforge.solvers.mfem_solver import MFEMSolver
-    from meshforge.solvers.base import (
+    from piano.mesh.mfem_manager import MFEMManager
+    from piano.solvers.mfem_solver import MFEMSolver
+    from piano.solvers.base import (
         PhysicsConfig, PhysicsType, MaterialProperties,
         BoundaryCondition, BoundaryConditionType,
     )
@@ -278,7 +278,7 @@ def simulate_ground_truth_refined(mesh_file: str, params: Dict,
                                   refine_levels: int = 2
                                   ) -> Tuple[np.ndarray, np.ndarray, list]:
     """Uniformly refine mesh N levels then run FEM."""
-    from meshforge.mesh.mfem_manager import MFEMManager
+    from piano.mesh.mfem_manager import MFEMManager
 
     mgr = MFEMManager(mesh_file)
     mgr.refine_uniformly(times=refine_levels)
@@ -306,9 +306,9 @@ def load_ensemble_model(model_dir: str):
     Raises FileNotFoundError if the model file does not exist.
     """
     import json, torch
-    from meshforge.surrogate.base import TransolverConfig, EnsembleConfig
-    from meshforge.surrogate.ensemble import EnsembleModel
-    from meshforge.surrogate.trainer import SurrogateTrainer, TrainingConfig, Normalizer
+    from piano.surrogate.base import TransolverConfig, EnsembleConfig
+    from piano.surrogate.ensemble import EnsembleModel
+    from piano.surrogate.trainer import SurrogateTrainer, TrainingConfig, Normalizer
 
     path = Path(model_dir) / "ensemble_model.pt"
     if not path.exists():
@@ -374,9 +374,9 @@ def train_fast_ensemble(
     Returns:
         SurrogateTrainer with trained model and normalizers
     """
-    from meshforge.data.dataset import FEMDataset, FEMSample, DatasetConfig
-    from meshforge.surrogate.trainer import SurrogateTrainer, TrainingConfig
-    from meshforge.surrogate.base import TransolverConfig
+    from piano.data.dataset import FEMDataset, FEMSample, DatasetConfig
+    from piano.surrogate.trainer import SurrogateTrainer, TrainingConfig
+    from piano.surrogate.base import TransolverConfig
 
     if isinstance(samples_dirs, str):
         samples_dirs = [samples_dirs]
@@ -493,7 +493,7 @@ def predict_ensemble(
         mean_field:  (N_elem,) ensemble mean von Mises prediction (Pa scale)
         uncertainty: (N_elem,) ensemble std (Pa scale) — the adaptation signal
     """
-    from meshforge.surrogate.trainer import SurrogateTrainer
+    from piano.surrogate.trainer import SurrogateTrainer
 
     centers   = get_element_centers(vertices, elements)   # (N_elem, 2)
     param_arr = np.array([[params[k] for k in param_names]], dtype=np.float32)
