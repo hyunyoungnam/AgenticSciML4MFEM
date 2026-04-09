@@ -339,39 +339,50 @@ def create_fine_mesh(
 # ---------------------------------------------------------------------------
 
 def generate_all(
-    output_dir:       str,
-    n_samples:        int   = 200,
-    mesh_size_far:    float = 0.07,
-    mesh_size_hole:   float = 0.025,
-    refinement_depth: float = 0.08,
-    seed:             int   = 42,
+    output_dir:              str,
+    n_samples:               int   = 200,
+    mesh_size_far:           float = 0.07,
+    mesh_size_hole:          float = 0.025,
+    refinement_depth:        float = 0.08,
+    seed:                    int   = 42,
+    start_index:             int   = 0,
+    clear:                   bool  = True,
+    near_boundary_fraction:  float = 0.0,
 ) -> None:
     """
     Generate n_samples fine plate-with-hole meshes in output_dir.
 
-    Each mesh has randomised hole shape, position, and size drawn from the
-    same distribution as train01 / train02.
+    Args:
+        start_index:            First sample index (use >0 to append to existing dir).
+        clear:                  Delete existing sample_*.mesh files before generating.
+        near_boundary_fraction: Fraction of samples whose hole is placed close to
+                                an edge (margin_factor=1.1 instead of 1.5).
     """
     np.random.seed(seed)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Clear existing files
-    for f in Path(output_dir).glob("sample_*.mesh"):
-        os.remove(f)
+    if clear:
+        for f in Path(output_dir).glob("sample_*.mesh"):
+            os.remove(f)
 
-    print(f"Generating {n_samples} fine meshes → {output_dir}/")
-    print(f"  mesh_size_far={mesh_size_far}  "
-          f"mesh_size_hole={mesh_size_hole}  "
-          f"refinement_depth={refinement_depth}")
+    mode_str = f"  near_boundary_fraction={near_boundary_fraction:.0%}" if near_boundary_fraction > 0 else ""
+    print(f"Generating {n_samples} fine meshes → {output_dir}/  (start={start_index})")
+    print(f"  mesh_size_far={mesh_size_far}  mesh_size_hole={mesh_size_hole}"
+          f"  refinement_depth={refinement_depth}{mode_str}")
 
     n_elems_all = []
     for i in range(n_samples):
         base_radius = 0.12 + 0.10 * np.random.random()
-        margin      = base_radius * 1.5 + 0.10
+        # Near-boundary: place hole much closer to an edge
+        near = (np.random.random() < near_boundary_fraction)
+        margin_factor = 1.1 if near else 1.5
+        margin_offset = 0.02 if near else 0.10
+        margin = base_radius * margin_factor + margin_offset
         cx = margin + (1 - 2 * margin) * np.random.random()
         cy = margin + (1 - 2 * margin) * np.random.random()
 
-        filename = os.path.join(output_dir, f"sample_{i:03d}.mesh")
+        idx      = start_index + i
+        filename = os.path.join(output_dir, f"sample_{idx:03d}.mesh")
         try:
             n_e = create_fine_mesh(
                 filename,
@@ -380,12 +391,13 @@ def generate_all(
                 mesh_size_far=mesh_size_far,
                 mesh_size_hole=mesh_size_hole,
                 refinement_depth=refinement_depth,
-                seed=2000 + i,
+                seed=2000 + idx,
             )
             n_elems_all.append(n_e)
             if (i + 1) % 20 == 0 or i == 0:
+                nb_tag = " [near-bdr]" if near else ""
                 print(f"  [{i+1:3d}/{n_samples}]  {Path(filename).name}  "
-                      f"r={base_radius:.3f}  elems={n_e}")
+                      f"r={base_radius:.3f}  elems={n_e}{nb_tag}")
         except Exception as e:
             print(f"  [{i+1:3d}/{n_samples}]  {Path(filename).name}  FAILED: {e}")
 
@@ -404,29 +416,32 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Generate fine plate-with-hole triangle meshes (no gmsh required)"
     )
-    parser.add_argument("--n",                type=int,   default=200,
-                        help="Number of samples (default: 200)")
-    parser.add_argument("--output",           type=str,   default=None,
-                        help="Output directory (default: train_fine next to this script)")
-    parser.add_argument("--mesh-size-far",    type=float, default=0.07,
-                        help="Mesh size far from hole (default: 0.07)")
-    parser.add_argument("--mesh-size-hole",   type=float, default=0.025,
-                        help="Mesh size near hole (default: 0.025)")
-    parser.add_argument("--refinement-depth", type=float, default=0.08,
-                        help="Depth of refinement zone around hole (default: 0.08)")
-    parser.add_argument("--seed",             type=int,   default=42,
-                        help="Global random seed (default: 42)")
+    parser.add_argument("--n",                       type=int,   default=200)
+    parser.add_argument("--output",                  type=str,   default=None)
+    parser.add_argument("--mesh-size-far",           type=float, default=0.07)
+    parser.add_argument("--mesh-size-hole",          type=float, default=0.025)
+    parser.add_argument("--refinement-depth",        type=float, default=0.08)
+    parser.add_argument("--seed",                    type=int,   default=42)
+    parser.add_argument("--start-index",             type=int,   default=0,
+                        help="First sample index (for appending to existing dir)")
+    parser.add_argument("--no-clear",                action="store_true",
+                        help="Do not delete existing sample_*.mesh files")
+    parser.add_argument("--near-boundary-fraction",  type=float, default=0.0,
+                        help="Fraction of samples with hole near edge (0–1)")
     args = parser.parse_args()
 
-    script_dir  = Path(__file__).parent
+    script_dir   = Path(__file__).parent
     project_root = script_dir.parent
-    output_dir  = args.output or str(project_root / "train_fine")
+    output_dir   = args.output or str(project_root / "train_fine")
 
     generate_all(
-        output_dir       = output_dir,
-        n_samples        = args.n,
-        mesh_size_far    = args.mesh_size_far,
-        mesh_size_hole   = args.mesh_size_hole,
-        refinement_depth = args.refinement_depth,
-        seed             = args.seed,
+        output_dir             = output_dir,
+        n_samples              = args.n,
+        mesh_size_far          = args.mesh_size_far,
+        mesh_size_hole         = args.mesh_size_hole,
+        refinement_depth       = args.refinement_depth,
+        seed                   = args.seed,
+        start_index            = args.start_index,
+        clear                  = not args.no_clear,
+        near_boundary_fraction = args.near_boundary_fraction,
     )

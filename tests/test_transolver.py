@@ -33,9 +33,10 @@ TRAIN02      = PROJECT_ROOT / "train02"
 TRAIN_FINE   = PROJECT_ROOT / "train_fine"
 
 PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
-    "E":    (150e9, 250e9),
-    "nu":   (0.25,  0.35),
-    "load": (50e6,  150e6),
+    "E":      (150e9,  250e9),
+    "nu":     (0.25,   0.35),
+    "load_x": (50e6,   150e6),   # x-traction on right face
+    "load_y": (-100e6, 100e6),   # y-traction on top face (0 = uniaxial, ≠0 = biaxial)
 }
 PARAM_NAMES = list(PARAM_BOUNDS.keys())
 
@@ -55,7 +56,8 @@ def tiny_trainer():
     N_POINTS   = 64
 
     params  = rng.uniform(
-        [150e9, 0.25, 50e6], [250e9, 0.35, 150e6], size=(N_SAMPLES, 3)
+        [150e9, 0.25, 50e6, -100e6], [250e9, 0.35, 150e6, 100e6],
+        size=(N_SAMPLES, 4)
     ).astype(np.float32)
     coords  = rng.uniform(0, 1, size=(N_POINTS, 2)).astype(np.float32)
     outputs = [
@@ -97,7 +99,7 @@ def test_femdataset_add_and_query():
     for i in range(6):
         ds.add_sample(FEMSample(
             sample_id=f"s{i:03d}",
-            parameters={"E": 200e9, "nu": 0.3, "load": 1e8},
+            parameters={"E": 200e9, "nu": 0.3, "load_x": 1e8, "load_y": 0.0},
             coordinates=coords,
             von_mises=vm,
             is_valid=True,
@@ -106,7 +108,7 @@ def test_femdataset_add_and_query():
     assert len(ds) == 6
     assert len(ds.get_valid_samples()) == 6
 
-    region = {"E": (190e9, 210e9), "nu": (0.25, 0.35), "load": (0.5e8, 1.5e8)}
+    region = {"E": (190e9, 210e9), "nu": (0.25, 0.35), "load_x": (0.5e8, 1.5e8)}
     assert len(ds.get_samples_in_region(region)) == 6
 
 
@@ -121,9 +123,10 @@ def test_femdataset_prepare_training_data():
         ds.add_sample(FEMSample(
             sample_id=f"s{i}",
             parameters={
-                "E":    float(rng.uniform(150e9, 250e9)),
-                "nu":   float(rng.uniform(0.25, 0.35)),
-                "load": float(rng.uniform(50e6, 150e6)),
+                "E":      float(rng.uniform(150e9, 250e9)),
+                "nu":     float(rng.uniform(0.25, 0.35)),
+                "load_x": float(rng.uniform(50e6, 150e6)),
+                "load_y": float(rng.uniform(-100e6, 100e6)),
             },
             coordinates=rng.random((40, 2)).astype(np.float32),
             von_mises=rng.random((40, 1)).astype(np.float32),
@@ -131,7 +134,7 @@ def test_femdataset_prepare_training_data():
         ))
 
     params_arr, coords_list, outputs_list = ds.prepare_training_data("von_mises")
-    assert params_arr.shape == (8, 3)
+    assert params_arr.shape == (8, 4)
     assert len(coords_list) == 8
     assert all(c.shape == (40, 2) for c in coords_list)
 
@@ -143,7 +146,7 @@ def test_femsample_output_fields():
     vm     = np.full((20, 1), 5.0, dtype=np.float32)
     sample = FEMSample(
         sample_id="x",
-        parameters={"E": 200e9, "nu": 0.3, "load": 1e8},
+        parameters={"E": 200e9, "nu": 0.3, "load_x": 1e8, "load_y": 0.0},
         coordinates=coords,
         von_mises=vm,
         is_valid=True,
@@ -153,7 +156,7 @@ def test_femsample_output_fields():
     assert field is not None and field.shape == (20, 1)
 
     pvec = sample.get_parameter_vector(PARAM_NAMES)
-    assert pvec.shape == (3,)
+    assert pvec.shape == (4,)
     assert pvec[0] == pytest.approx(200e9)
 
 
@@ -171,7 +174,7 @@ def test_surrogate_prediction_shape(tiny_trainer):
     trainer, coords = tiny_trainer
     rng    = np.random.default_rng(7)
     params = rng.uniform(
-        [150e9, 0.25, 50e6], [250e9, 0.35, 150e6], size=(1, 3)
+        [150e9, 0.25, 50e6, -100e6], [250e9, 0.35, 150e6, 100e6], size=(1, 4)
     ).astype(np.float32)
 
     mean, unc = trainer.predict_with_uncertainty(params, coords)
@@ -197,8 +200,8 @@ def test_training_history_recorded(tiny_trainer):
 
     rng    = np.random.default_rng(99)
     coords = rng.random((30, 2)).astype(np.float32)
-    params = rng.uniform([150e9, 0.25, 50e6], [250e9, 0.35, 150e6],
-                         size=(6, 3)).astype(np.float32)
+    params = rng.uniform([150e9, 0.25, 50e6, -100e6], [250e9, 0.35, 150e6, 100e6],
+                         size=(6, 4)).astype(np.float32)
     out    = [rng.random((30, 1)).astype(np.float32) for _ in range(6)]
 
     cfg = TrainingConfig(
@@ -237,7 +240,7 @@ def test_surrogate_evaluator_on_data(tiny_trainer):
     trainer, coords = tiny_trainer
     rng         = np.random.default_rng(11)
     params      = rng.uniform(
-        [150e9, 0.25, 50e6], [250e9, 0.35, 150e6], size=(1, 3)
+        [150e9, 0.25, 50e6, -100e6], [250e9, 0.35, 150e6, 100e6], size=(1, 4)
     ).astype(np.float32)
     true_outputs = rng.uniform(0, 1e8, size=(coords.shape[0],)).astype(np.float32)
 
@@ -287,8 +290,8 @@ def test_spatial_error_field(tiny_trainer):
 
     trainer, coords = tiny_trainer
     rng       = np.random.default_rng(5)
-    params    = rng.uniform([150e9, 0.25, 50e6], [250e9, 0.35, 150e6],
-                             size=(3,)).astype(np.float32)
+    params    = rng.uniform([150e9, 0.25, 50e6, -100e6], [250e9, 0.35, 150e6, 100e6],
+                             size=(4,)).astype(np.float32)
     true_vals = rng.uniform(0, 1e8, size=(coords.shape[0],)).astype(np.float32)
 
     analyzer    = SpatialErrorAnalyzer(trainer.model, coords)
@@ -303,8 +306,8 @@ def test_spatial_error_hotspots(tiny_trainer):
 
     trainer, coords = tiny_trainer
     rng       = np.random.default_rng(14)
-    params    = rng.uniform([150e9, 0.25, 50e6], [250e9, 0.35, 150e6],
-                             size=(3,)).astype(np.float32)
+    params    = rng.uniform([150e9, 0.25, 50e6, -100e6], [250e9, 0.35, 150e6, 100e6],
+                             size=(4,)).astype(np.float32)
     true_vals = rng.uniform(0, 1e8, size=(coords.shape[0],)).astype(np.float32)
 
     analyzer = SpatialErrorAnalyzer(trainer.model, coords)
@@ -318,8 +321,8 @@ def test_spatial_error_full_analysis(tiny_trainer):
 
     trainer, coords = tiny_trainer
     rng       = np.random.default_rng(6)
-    params    = rng.uniform([150e9, 0.25, 50e6], [250e9, 0.35, 150e6],
-                             size=(3,)).astype(np.float32)
+    params    = rng.uniform([150e9, 0.25, 50e6, -100e6], [250e9, 0.35, 150e6, 100e6],
+                             size=(4,)).astype(np.float32)
     true_vals = rng.uniform(0, 1e8, size=(coords.shape[0],)).astype(np.float32)
 
     analysis = SpatialErrorAnalyzer(trainer.model, coords).analyze(
@@ -335,8 +338,8 @@ def test_error_decomposer(tiny_trainer):
 
     trainer, coords = tiny_trainer
     rng       = np.random.default_rng(8)
-    params    = rng.uniform([150e9, 0.25, 50e6], [250e9, 0.35, 150e6],
-                             size=(1, 3)).astype(np.float32)
+    params    = rng.uniform([150e9, 0.25, 50e6, -100e6], [250e9, 0.35, 150e6, 100e6],
+                             size=(1, 4)).astype(np.float32)
     true_vals = rng.uniform(0, 1e8, size=(coords.shape[0],)).astype(np.float32)
 
     result = ErrorDecomposer(trainer.model).decompose(params, coords, true_vals)
@@ -350,7 +353,7 @@ def test_error_decomposer(tiny_trainer):
 
 def _make_candidates(rng: np.random.Generator, n: int = 20) -> np.ndarray:
     return rng.uniform(
-        [150e9, 0.25, 50e6], [250e9, 0.35, 150e6], size=(n, 3)
+        [150e9, 0.25, 50e6, -100e6], [250e9, 0.35, 150e6, 100e6], size=(n, 4)
     ).astype(np.float32)
 
 
@@ -479,22 +482,32 @@ def test_train_fine_mesh_loads():
 # 7. MFEMSolver + EvaluationPipeline  (mfem marker)
 # ===========================================================================
 
-def _physics_config(load: float = 1e8):
+def _physics_config(E: float = 200e9, nu: float = 0.3,
+                    load_x: float = 1e8, load_y: float = 0.0):
+    """Build PhysicsConfig for 2-D linear elasticity.
+
+    load_x: x-traction on right face  (boundary 2)
+    load_y: y-traction on top face    (boundary 3) — 0 = uniaxial, ≠0 = biaxial
+    """
     from piano.solvers.base import (
         PhysicsConfig, PhysicsType, MaterialProperties,
         BoundaryCondition, BoundaryConditionType,
     )
+    bcs = [
+        BoundaryCondition(BoundaryConditionType.SYMMETRY,
+                          boundary_id=4, direction=0),   # left:   ux = 0
+        BoundaryCondition(BoundaryConditionType.SYMMETRY,
+                          boundary_id=1, direction=1),   # bottom: uy = 0
+        BoundaryCondition(BoundaryConditionType.TRACTION,
+                          boundary_id=2, value=np.array([load_x, 0.])),
+    ]
+    if load_y != 0.0:
+        bcs.append(BoundaryCondition(BoundaryConditionType.TRACTION,
+                                     boundary_id=3, value=np.array([0., load_y])))
     return PhysicsConfig(
         physics_type=PhysicsType.LINEAR_ELASTICITY,
-        material=MaterialProperties(E=200e9, nu=0.3),
-        boundary_conditions=[
-            BoundaryCondition(BoundaryConditionType.SYMMETRY,
-                              boundary_id=4, direction=0),
-            BoundaryCondition(BoundaryConditionType.SYMMETRY,
-                              boundary_id=1, direction=1),
-            BoundaryCondition(BoundaryConditionType.TRACTION,
-                              boundary_id=2, value=np.array([load, 0.])),
-        ],
+        material=MaterialProperties(E=E, nu=nu),
+        boundary_conditions=bcs,
     )
 
 
@@ -589,15 +602,21 @@ def test_evaluation_pipeline_with_solver(tmp_path):
 import argparse
 
 
-def _collect_mesh_files(dirs: List[str], limit: int) -> List[Path]:
+def _collect_mesh_files(dirs: List[str], limit: Optional[int] = None) -> List[Path]:
     files = []
     for d in dirs:
         files.extend(sorted(Path(d).glob("sample_*.mesh")))
-    return files[:limit]
+    return files if limit is None else files[:limit]
 
 
-def _run_fem(mesh_path: str, params: Dict) -> Tuple[np.ndarray, np.ndarray, list]:
-    """Run MFEM solver; returns (von_mises, vertices, elements) or zeros."""
+def _run_fem(mesh_path: str, params: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+    """Run MFEM solver; returns (displacement, von_mises, vertices, elements).
+
+    displacement : (N_nodes, 2)  — nodal ux, uy  (training target + PINO input)
+    von_mises    : (N_elements,) — element-centre von Mises (GT reference only)
+    vertices     : (N_nodes, 2)  — node coordinates
+    elements     : list of element connectivity
+    """
     import ctypes
     from piano.mesh.mfem_manager import MFEMManager
     from piano.solvers.mfem_solver import MFEMSolver
@@ -612,65 +631,81 @@ def _run_fem(mesh_path: str, params: Dict) -> Tuple[np.ndarray, np.ndarray, list
     _retag_boundaries(mgr.mesh, verts)
 
     solver = MFEMSolver(order=1)
-    solver.setup(mgr, _physics_config(params["load"]))
+    solver.setup(mgr, _physics_config(
+        E=params.get("E", 200e9), nu=params.get("nu", 0.3),
+        load_x=params.get("load_x", params.get("load", 1e8)),
+        load_y=params.get("load_y", 0.0),
+    ))
     with tempfile.TemporaryDirectory() as tmp:
         result = solver.solve(tmp)
 
     vertices = mgr.get_nodes()
     elements = [list(e[e >= 0]) for e in mgr.get_elements()]
+    n_nodes  = len(vertices)
+    n_elems  = len(elements)
     if not result.success:
-        return np.zeros(len(elements)), vertices, elements
-    return result.solution_data.get("von_mises",
-                                    np.zeros(len(elements))), vertices, elements
+        return (np.zeros((n_nodes, 2)),
+                np.zeros(n_elems),
+                vertices, elements)
+    disp = result.solution_data.get("displacement", np.zeros((n_nodes, 2)))
+    vm   = result.solution_data.get("von_mises",    np.zeros(n_elems))
+    return disp, vm, vertices, elements
 
 
 def _build_dataset(mesh_files: List[Path], rng: np.random.Generator):
-    """Run FEM on mesh_files and return (FEMDataset, centers list, vm list)."""
+    """Run FEM on mesh_files; train target is displacement (ux, uy) at nodes.
+
+    Stores FEMSample.displacement = (N_nodes, 2) so that
+    prepare_training_data("displacement") gives output_dim=2, enabling PINO.
+    """
     from piano.data.dataset import FEMDataset, FEMSample, DatasetConfig
 
     ds = FEMDataset(DatasetConfig(parameter_names=PARAM_NAMES,
                                    parameter_bounds=PARAM_BOUNDS))
-    centers_all, vm_all = [], []
 
     for i, mf in enumerate(mesh_files):
         params = {
-            "E":    float(rng.uniform(150e9, 250e9)),
-            "nu":   float(rng.uniform(0.25, 0.35)),
-            "load": float(rng.uniform(50e6, 150e6)),
+            "E":      float(rng.uniform(150e9, 250e9)),
+            "nu":     float(rng.uniform(0.25, 0.35)),
+            "load_x": float(rng.uniform(50e6,  150e6)),
+            "load_y": float(rng.uniform(-100e6, 100e6)),
         }
         try:
-            vm, verts, elems = _run_fem(str(mf), params)
-            if not np.any(vm > 0):
+            disp, vm, verts, _ = _run_fem(str(mf), params)
+            if not np.any(disp != 0):
                 raise RuntimeError("trivial solution")
-            ctrs = np.array([np.mean(verts[e], axis=0) for e in elems],
-                            dtype=np.float32)
             ds.add_sample(FEMSample(
                 sample_id=f"s{i:03d}",
                 parameters=params,
-                coordinates=ctrs,
-                von_mises=vm[:, np.newaxis].astype(np.float32),
+                coordinates=verts.astype(np.float32),       # node coords
+                displacement=disp.astype(np.float32),        # (N_nodes, 2)
                 is_valid=True,
             ))
-            centers_all.append(ctrs)
-            vm_all.append(vm)
             print(f"  [{i+1}/{len(mesh_files)}] {mf.stem}  "
-                  f"peak VM={vm.max():.2e}")
+                  f"|u|_max={np.linalg.norm(disp, axis=1).max():.3e}  "
+                  f"VM_max={vm.max():.2e}")
         except Exception as e:
             print(f"  [{i+1}/{len(mesh_files)}] {mf.stem} skipped: {e}")
 
-    return ds, centers_all, vm_all
+    return ds
 
 
 def _train_ensemble(ds, n_ensemble: int = 3, epochs: int = 80):
-    """Train ensemble and return (trainer, training_result) so history is available."""
+    """Train ensemble on displacement field (ux, uy) — enables PINO loss.
+
+    output_dim=2  →  trainer activates PINO (equilibrium + energy-norm terms).
+    Capacity raised to d_model=128 / n_layers=4; LR lowered to 5e-4.
+    """
     from piano.surrogate.trainer import SurrogateTrainer, TrainingConfig
     from piano.surrogate.base import TransolverConfig
 
-    params_arr, coords_list, outputs_list = ds.prepare_training_data("von_mises")
+    params_arr, coords_list, outputs_list = ds.prepare_training_data("displacement")
     cfg = TrainingConfig(
         surrogate_config=TransolverConfig(
-            d_model=64, n_heads=4, n_layers=2, slice_num=8,
-            epochs=epochs, patience=50, batch_size=4,
+            d_model=128, n_heads=8, n_layers=4, slice_num=16,
+            epochs=epochs, patience=50, batch_size=8,
+            learning_rate=5e-4,
+            pino_weight=0.1, pino_eq_weight=0.1,
         ),
         use_ensemble=True,
         n_ensemble=n_ensemble,
@@ -690,9 +725,10 @@ def run_visualization(
     samples_dirs: List[str],
     sample_idx:   int,
     output_file:  str,
-    n_train:      int = 8,
+    n_train:      int = -1,
     n_ensemble:   int = 3,
     epochs:       int = 80,
+    n_test:       int = 20,
 ) -> None:
     """
     5-panel SciML loop visualization in a 2-row layout.
@@ -706,8 +742,9 @@ def run_visualization(
       ④ Acquisition scores (sorted bar chart, top-5 highlighted)
       ⑤ Training convergence (train loss + test loss vs epoch)
 
-    Pass multiple directories to --samples-dirs to combine train01, train02,
-    and train_fine for a larger training set.
+    The last n_test files are held out as a strictly separate test set —
+    the Transolver never sees them during training.  n_train=-1 means
+    "use all available training samples" (everything except the test set).
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -720,19 +757,28 @@ def run_visualization(
     from piano.surrogate.acquisition import UncertaintySampling
 
     rng       = np.random.default_rng(42)
-    all_files = _collect_mesh_files(samples_dirs, n_train + 1)
+    all_files = _collect_mesh_files(samples_dirs)
     if not all_files:
         raise FileNotFoundError(f"No sample_*.mesh found in {samples_dirs}")
 
-    train_files = all_files[:n_train]
-    test_file   = all_files[min(sample_idx, len(all_files) - 1)]
+    # ── Strict train / test split ────────────────────────────────────────
+    # Hold out last n_test files; they are NEVER included in training.
+    n_test_actual = min(n_test, max(1, len(all_files) // 5))
+    test_pool     = all_files[-n_test_actual:]
+    train_pool    = all_files[:-n_test_actual]
+
+    train_files = train_pool if n_train < 0 else train_pool[:n_train]
+    test_file   = test_pool[sample_idx % len(test_pool)]
 
     dirs_label = " + ".join(Path(d).name for d in samples_dirs)
-    print(f"Training dirs : {dirs_label}  ({len(train_files)} meshes)")
-    print(f"Test mesh     : {test_file.name}")
+    print(f"Training dirs : {dirs_label}")
+    print(f"  total files : {len(all_files)}  "
+          f"→  train pool: {len(train_pool)}  |  test pool: {len(test_pool)}")
+    print(f"  training on : {len(train_files)} meshes")
+    print(f"Test mesh     : {test_file.name}  (held-out, never seen during training)")
 
     # ── Dataset & training ────────────────────────────────────────────────
-    ds, _, _ = _build_dataset(train_files, rng)
+    ds = _build_dataset(train_files, rng)
     valid = ds.get_valid_samples()
     if len(valid) < 3:
         raise RuntimeError(f"Need ≥3 valid FEM samples, got {len(valid)}")
@@ -741,50 +787,75 @@ def run_visualization(
 
     # ── Test mesh FEM + prediction ────────────────────────────────────────
     test_params = {
-        "E":    float(rng.uniform(150e9, 250e9)),
-        "nu":   float(rng.uniform(0.25, 0.35)),
-        "load": float(rng.uniform(50e6, 150e6)),
+        "E":      float(rng.uniform(150e9, 250e9)),
+        "nu":     float(rng.uniform(0.25, 0.35)),
+        "load_x": float(rng.uniform(50e6,  150e6)),
+        "load_y": float(rng.uniform(-100e6, 100e6)),
     }
-    vm_gt, verts, elems = _run_fem(str(test_file), test_params)
-    centers   = np.array([np.mean(verts[e], axis=0) for e in elems],
-                         dtype=np.float32)
+    # disp_gt: (N_nodes, 2) — GT displacement at nodes
+    # vm_gt:   (N_elements,) — GT von Mises at element centres (reference only)
+    disp_gt, vm_gt, verts, elems = _run_fem(str(test_file), test_params)
     param_arr = np.array([[test_params[k] for k in PARAM_NAMES]],
                          dtype=np.float32)
 
-    mean_pred, unc = trainer.predict_with_uncertainty(param_arr, centers)
-    mean_pred = mean_pred.flatten()
-    unc       = unc.flatten() if unc is not None else np.zeros(len(centers))
+    # Predict: mean_pred (N_nodes, 2), unc (N_nodes, 2) or None
+    mean_pred, unc_raw = trainer.predict_with_uncertainty(param_arr, verts.astype(np.float32))
+    # mean_pred may come back as (1, N_nodes, 2) or (N_nodes, 2)
+    if mean_pred.ndim == 3:
+        mean_pred = mean_pred[0]           # (N_nodes, 2)
 
-    # Normalise uncertainty to [0, 1] for display
-    unc_norm = (unc - unc.min()) / (unc.max() - unc.min() + 1e-10)
+    # Displacement magnitude at nodes for display
+    disp_mag_pred = np.linalg.norm(mean_pred, axis=-1)    # (N_nodes,)
+    disp_mag_gt   = np.linalg.norm(disp_gt,   axis=1)     # (N_nodes,)
+
+    # Uncertainty: norm of per-component std across ensemble → scalar per node
+    if unc_raw is not None:
+        if unc_raw.ndim == 3:
+            unc_raw = unc_raw[0]
+        unc_nodes = np.linalg.norm(unc_raw, axis=-1) if unc_raw.ndim == 2 else unc_raw.flatten()
+    else:
+        unc_nodes = np.zeros(len(verts))
+
+    # Interpolate nodal scalar fields to element centres for PolyCollection display
+    def _node_to_elem(field_nodes: np.ndarray) -> np.ndarray:
+        return np.array([field_nodes[e].mean() for e in elems])
+
+    disp_mag_pred_e = _node_to_elem(disp_mag_pred)
+    unc_e           = _node_to_elem(unc_nodes)
+    error_nodes     = np.abs(disp_mag_pred - disp_mag_gt)
+    error_e         = _node_to_elem(error_nodes)
+
+    # Normalise to [0, 1] for clean colour display
+    def _norm(x):
+        lo, hi = x.min(), x.max()
+        return (x - lo) / (hi - lo + 1e-10)
+
+    unc_norm  = _norm(unc_e)
 
     # ── Surrogate evaluator ───────────────────────────────────────────────
     evaluator = SurrogateEvaluator(trainer.model, PARAM_NAMES, PARAM_BOUNDS)
     analysis  = evaluator.analyze_uncertainty(
-        centers, n_probe_samples=30,
+        verts.astype(np.float32), n_probe_samples=30,
         uncertainty_threshold=float(np.mean(unc_norm))
     )
 
     # ── Acquisition scores ────────────────────────────────────────────────
     N_CAND      = 50
     candidates  = rng.uniform(
-        [150e9, 0.25, 50e6], [250e9, 0.35, 150e6], size=(N_CAND, 3)
+        [150e9, 0.25, 50e6, -100e6], [250e9, 0.35, 150e6, 100e6], size=(N_CAND, 4)
     ).astype(np.float32)
     acq_result  = UncertaintySampling().select_batch(
-        candidates, trainer.model, centers, batch_size=5
+        candidates, trainer.model, verts.astype(np.float32), batch_size=5
     )
     scores      = acq_result.scores
-    # Normalise scores to [0, 1]
-    scores_norm = (scores - scores.min()) / (scores.max() - scores.min() + 1e-10)
-    sort_idx    = np.argsort(scores_norm)           # ascending for bar chart
+    scores_norm = _norm(scores)
+    sort_idx    = np.argsort(scores_norm)
     top5_set    = set(acq_result.best_indices.tolist())
 
-    # ── Spatial error analysis ────────────────────────────────────────────
-    analyzer    = SpatialErrorAnalyzer(trainer.model, centers)
-    error_field = analyzer.compute_error_field(param_arr.flatten(), vm_gt)
-    # Normalise error field to [0, 1]
-    err_norm    = (error_field - error_field.min()) / (
-                   error_field.max() - error_field.min() + 1e-10)
+    # ── Spatial error analysis (scalar displacement magnitude error) ───────
+    analyzer    = SpatialErrorAnalyzer(trainer.model, verts.astype(np.float32))
+    error_field = analyzer.compute_error_field(param_arr.flatten(), disp_mag_gt)
+    err_norm    = _norm(error_e)          # use element-level field for display
     hotspots    = analyzer.identify_hotspots(error_field, threshold_percentile=85)
 
     # ── Training history ─────────────────────────────────────────────────
@@ -832,42 +903,42 @@ def run_visualization(
         ax.tick_params(labelsize=7)
         return pc
 
-    # ① Ensemble mean (normalised to [0,1] for clean colour display)
-    mean_norm = (mean_pred - mean_pred.min()) / (
-                 mean_pred.max() - mean_pred.min() + 1e-10)
+    # ① Ensemble mean displacement magnitude (normalised)
+    mean_norm = _norm(disp_mag_pred_e)
     c1 = _mesh_field(ax_mean, mean_norm,
-                     f"① Ensemble Mean\n({len(elems)} elems  ·  "
-                     f"peak={mean_pred.max():.2e} Pa)",
+                     f"① Ensemble Mean  |u|\n({len(elems)} elems  ·  "
+                     f"peak={disp_mag_pred.max():.3e} m)",
                      "jet")
     cb1 = fig.colorbar(c1, ax=ax_mean, shrink=0.85)
-    cb1.set_label("Norm. Von Mises", fontsize=8)
+    cb1.set_label("Norm. |u| predicted", fontsize=8)
     cb1.ax.tick_params(labelsize=7)
     ax_mean.text(0.02, 0.02,
-                 f"E={test_params['E']/1e9:.0f} GPa\n"
-                 f"ν={test_params['nu']:.3f}\n"
-                 f"load={test_params['load']/1e6:.0f} MPa",
+                 f"E={test_params['E']/1e9:.0f} GPa  ν={test_params['nu']:.3f}\n"
+                 f"Fx={test_params['load_x']/1e6:.0f} MPa\n"
+                 f"Fy={test_params['load_y']/1e6:.0f} MPa",
                  transform=ax_mean.transAxes, fontsize=7, va="bottom",
                  bbox=dict(boxstyle="round", facecolor="lightcyan", alpha=0.85))
 
-    # ② Uncertainty (normalised)
+    # ② Uncertainty: norm of ensemble std across displacement components
     c2 = _mesh_field(ax_unc, unc_norm,
                      f"② Ensemble Uncertainty\n"
                      f"(weak regions: {len(analysis.weak_regions)})",
                      "hot_r")
     cb2 = fig.colorbar(c2, ax=ax_unc, shrink=0.85)
-    cb2.set_label("Norm. Std", fontsize=8)
+    cb2.set_label("Norm. ‖σ_ens‖", fontsize=8)
     cb2.ax.tick_params(labelsize=7)
     ax_unc.text(0.02, 0.02,
                 f"mean={np.mean(unc_norm):.3f}\nmax={unc_norm.max():.3f}",
                 transform=ax_unc.transAxes, fontsize=7, va="bottom",
                 bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.85))
 
-    # ③ Error field (normalised) + hotspot markers
+    # ③ Error field: |pred |u| − GT |u|| + hotspot markers
     c3 = _mesh_field(ax_err, err_norm,
-                     f"③ Error Field\n({len(hotspots)} hotspots at 85th pct)",
+                     f"③ Error  ||u|_pred − |u|_GT|\n"
+                     f"({len(hotspots)} hotspots at 85th pct)",
                      "Reds")
     cb3 = fig.colorbar(c3, ax=ax_err, shrink=0.85)
-    cb3.set_label("Norm. |pred − GT|", fontsize=8)
+    cb3.set_label("Norm. |u| error", fontsize=8)
     cb3.ax.tick_params(labelsize=7)
     for hs in hotspots[:6]:
         ax_err.plot(hs.center[0], hs.center[1], "b+", ms=9, mew=1.8, zorder=5)
@@ -943,16 +1014,18 @@ if __name__ == "__main__":
         description="PIANO SciML pipeline — uncertainty-driven visualization"
     )
     parser.add_argument("--sample",       type=int, default=0,
-                        help="Test mesh index (from first samples-dir)")
+                        help="Test mesh index within the held-out test pool (default 0)")
     parser.add_argument("--samples-dirs", type=str, nargs="+", default=None,
-                        help="Training mesh dirs — pass multiple to combine datasets "
+                        help="Mesh dirs — pass multiple to combine datasets "
                              "(e.g. train_fine train01 train02)")
     parser.add_argument("--output",       type=str, default=None,
                         help="Output PNG path")
-    parser.add_argument("--n-train",      type=int, default=8,
-                        help="Max training meshes to use")
-    parser.add_argument("--epochs",       type=int, default=80,
-                        help="Ensemble training epochs")
+    parser.add_argument("--n-train",      type=int, default=-1,
+                        help="Training meshes to use (-1 = all available, default)")
+    parser.add_argument("--n-test",       type=int, default=20,
+                        help="Held-out test meshes kept separate from training (default 20)")
+    parser.add_argument("--epochs",       type=int, default=300,
+                        help="Ensemble training epochs (default 300)")
     args = parser.parse_args()
 
     # Default: train_fine if available, else fall back to train01 + train02
@@ -975,4 +1048,5 @@ if __name__ == "__main__":
         output_file=out,
         n_train=args.n_train,
         epochs=args.epochs,
+        n_test=args.n_test,
     )

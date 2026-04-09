@@ -51,18 +51,40 @@ The surrogate improves along two independent axes simultaneously:
 
 ---
 
-## Example Output
+## Example Outputs
 
-![PIANO SciML Loop](tests/test_outputs/sciml_loop.png)
+PIANO trains on three geometry families, each solved with randomised material properties (E, ν) and biaxial loads (Fx, Fy). All panels show displacement magnitude |u| predicted by the 3-member ensemble, trained on 20 FEM samples with PINO loss active.
 
-**Top row — plate-with-hole domain** (trained on 20 fine-mesh FEM samples):
-- **① Ensemble Mean** — normalised von Mises prediction over the test mesh (782 triangle elements with local hole refinement)
-- **② Uncertainty** — ensemble std; high values near the hole boundary identify where the model is least confident and adaptation is needed
-- **③ Error Field** — absolute prediction error vs PyMFEM ground truth; blue `+` markers show the 8 spatial hotspots where the surrogate makes the largest errors
+### Single hole (`train_fine/`)
 
-**Bottom row — active learning analytics:**
-- **④ Acquisition Scores** — 50 candidate parameter sets sorted by `UncertaintySampling` score; red bars (top-5) are the next FEM simulations the orchestrator would request
-- **⑤ Training Convergence** — MSE loss vs epoch (log scale); the train/test gap reflects the small sample count (20 meshes) — adding more samples from `train_fine/` closes this gap
+![Single hole](tests/test_outputs/sciml_single_hole.png)
+
+Plate [0,1]² with one blob-shaped void (local hole refinement, ~800 elements). Stress concentration forms a smooth gradient around the hole. Uncertainty peaks near the hole boundary where the field gradient is steepest.
+
+---
+
+### Double hole (`train02/`)
+
+![Double hole](tests/test_outputs/sciml_double_hole.png)
+
+Two non-overlapping blob holes. The ligament (material bridge between holes) concentrates stress and drives higher uncertainty in the inter-hole region — exactly the region the acquisition function prioritises for the next FEM simulation.
+
+---
+
+### Hole cluster (`train03/`)
+
+![Hole cluster](tests/test_outputs/sciml_cluster.png)
+
+3–5 randomly placed blob holes (~1300 elements). Complex multi-hole interaction fields test the surrogate's ability to generalise across topologically varied geometries. Near-boundary holes (30% of samples) add edge-interaction stress patterns to the training distribution.
+
+---
+
+**Panel legend (all figures):**
+- **① Ensemble Mean |u|** — normalised displacement magnitude; captures load path and stress concentration geometry
+- **② Ensemble Uncertainty** — norm of ensemble std across displacement components; high values identify where more FEM data is needed
+- **③ Error Field** — `||u|_pred − |u|_GT|`; blue `+` markers are the top spatial hotspots at the 85th percentile
+- **④ Acquisition Scores** — 50 candidate parameter sets sorted by `UncertaintySampling`; red bars (top-5) are the next simulations the orchestrator would request
+- **⑤ Training Convergence** — displacement MSE loss vs epoch (log scale); PINO physics loss is active alongside data loss
 
 ---
 
