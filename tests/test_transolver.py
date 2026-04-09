@@ -1,220 +1,522 @@
 """
-Ensemble Uncertainty Visualization.
+tests/test_transolver.py — Comprehensive test for the PIANO SciML pipeline.
 
-Tests the ensemble surrogate pipeline:
-  1. Train a small EnsembleModel on FEM samples (or on-the-fly if none exist)
-  2. Predict mean field + per-node uncertainty on a coarse mesh
-  3. Drive r-adaptivity with the uncertainty signal (no GT needed)
-  4. Show how uncertainty changes after mesh adaptation
-  5. Optionally compare against fine-mesh GT when FEM produces valid results
+Sections:
+  1. FEMDataset / FEMSample                    (pure Python)
+  2. SurrogateTrainer + EnsembleModel           (pure PyTorch)
+  3. SurrogateEvaluator                         (pure PyTorch)
+  4. SpatialErrorAnalyzer + ErrorDecomposer     (pure PyTorch)
+  5. AcquisitionFunctions                       (pure PyTorch)
+  6. MFEMManager                                (mfem marker)
+  7. MFEMSolver + EvaluationPipeline            (mfem marker)
+  8. End-to-end visualization                   (standalone __main__)
 
-New 5-panel layout:
-  ① Ensemble mean prediction on coarse mesh
-  ② Ensemble uncertainty (std across members) — the adaptation signal
-  ③ R-adapted mesh (nodes clustered toward high-uncertainty regions)
-  ④ Ensemble uncertainty on adapted mesh
-  ⑤ GT comparison (optional — shown only when FEM returns non-trivial results)
-
-Usage:
-    python tests/test_transolver.py
-    python tests/test_transolver.py --sample 3
-    python tests/test_transolver.py --compare
-    python tests/test_transolver.py --no-gt
+Run:
+    pytest tests/test_transolver.py -v
+    pytest tests/test_transolver.py -v -m "not mfem"
+    python tests/test_transolver.py [--sample N] [--compare]
 """
 
-import os
 import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-import argparse
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.collections import PolyCollection
-import matplotlib.colors as mcolors
+PROJECT_ROOT = Path(__file__).parent.parent
+TRAIN01      = PROJECT_ROOT / "train01"
+TRAIN02      = PROJECT_ROOT / "train02"
+TRAIN_FINE   = PROJECT_ROOT / "train_fine"
+
+PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "E":    (150e9, 250e9),
+    "nu":   (0.25,  0.35),
+    "load": (50e6,  150e6),
+}
+PARAM_NAMES = list(PARAM_BOUNDS.keys())
 
 
-# =============================================================================
-# Mesh I/O
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Shared fixture: 2-member ensemble trained on synthetic data (< 5 s)
+# ---------------------------------------------------------------------------
 
-def read_mfem_mesh(filepath: str) -> Tuple[np.ndarray, list, list]:
-    """Read MFEM .mesh file → (vertices, elements, boundary)."""
-    vertices, elements, boundary = [], [], []
+@pytest.fixture(scope="module")
+def tiny_trainer():
+    """Train a 2-member ensemble on 12 synthetic samples (5 epochs)."""
+    from piano.surrogate.trainer import SurrogateTrainer, TrainingConfig
+    from piano.surrogate.base import TransolverConfig
 
-    with open(filepath, 'r') as f:
-        lines = f.readlines()
+    rng        = np.random.default_rng(0)
+    N_SAMPLES  = 12
+    N_POINTS   = 64
 
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
+    params  = rng.uniform(
+        [150e9, 0.25, 50e6], [250e9, 0.35, 150e6], size=(N_SAMPLES, 3)
+    ).astype(np.float32)
+    coords  = rng.uniform(0, 1, size=(N_POINTS, 2)).astype(np.float32)
+    outputs = [
+        rng.uniform(0, 1e8, size=(N_POINTS, 1)).astype(np.float32)
+        for _ in range(N_SAMPLES)
+    ]
 
-        if line == "elements":
-            i += 1
-            n = int(lines[i].strip()); i += 1
-            for _ in range(n):
-                parts = lines[i].strip().split(); i += 1
-                t = int(parts[1])
-                if t == 2:
-                    elements.append([int(parts[2]), int(parts[3]), int(parts[4])])
-                elif t == 3:
-                    elements.append([int(parts[2]), int(parts[3]),
-                                     int(parts[4]), int(parts[5])])
-
-        elif line == "boundary":
-            i += 1
-            n = int(lines[i].strip()); i += 1
-            for _ in range(n):
-                parts = lines[i].strip().split(); i += 1
-                boundary.append((int(parts[0]), int(parts[2]), int(parts[3])))
-
-        elif line == "vertices":
-            i += 1
-            n = int(lines[i].strip()); i += 1
-            i += 1  # skip dimension line
-            for _ in range(n):
-                coords = [float(x) for x in lines[i].strip().split()]; i += 1
-                vertices.append(coords[:2])
-        else:
-            i += 1
-
-    return np.array(vertices), elements, boundary
+    cfg = TrainingConfig(
+        surrogate_config=TransolverConfig(
+            d_model=32, n_heads=2, n_layers=1, slice_num=4,
+            epochs=5, patience=10, batch_size=4,
+        ),
+        use_ensemble=True,
+        n_ensemble=2,
+        train_test_split=0.2,
+        random_seed=0,
+    )
+    trainer = SurrogateTrainer(cfg)
+    result  = trainer.train(params, [coords] * N_SAMPLES, outputs)
+    assert result.success, f"Fixture training failed: {result.error_message}"
+    return trainer, coords
 
 
-def get_element_centers(vertices: np.ndarray, elements: list) -> np.ndarray:
-    """Centroid of each element → (N_elem, 2)."""
-    return np.array([np.mean(vertices[e], axis=0) for e in elements])
+# ===========================================================================
+# 1. FEMDataset / FEMSample
+# ===========================================================================
+
+def test_femdataset_add_and_query():
+    from piano.data.dataset import FEMDataset, FEMSample, DatasetConfig
+
+    ds = FEMDataset(DatasetConfig(parameter_names=PARAM_NAMES,
+                                  parameter_bounds=PARAM_BOUNDS))
+    assert len(ds) == 0
+
+    rng    = np.random.default_rng(2)
+    coords = rng.random((50, 2)).astype(np.float32)
+    vm     = rng.random((50, 1)).astype(np.float32)
+
+    for i in range(6):
+        ds.add_sample(FEMSample(
+            sample_id=f"s{i:03d}",
+            parameters={"E": 200e9, "nu": 0.3, "load": 1e8},
+            coordinates=coords,
+            von_mises=vm,
+            is_valid=True,
+        ))
+
+    assert len(ds) == 6
+    assert len(ds.get_valid_samples()) == 6
+
+    region = {"E": (190e9, 210e9), "nu": (0.25, 0.35), "load": (0.5e8, 1.5e8)}
+    assert len(ds.get_samples_in_region(region)) == 6
 
 
-def node_to_elem_field(elements: list, node_field: np.ndarray) -> np.ndarray:
-    """Average per-node values to element centers."""
-    return np.array([np.mean(node_field[e]) for e in elements])
+def test_femdataset_prepare_training_data():
+    from piano.data.dataset import FEMDataset, FEMSample, DatasetConfig
+
+    ds  = FEMDataset(DatasetConfig(parameter_names=PARAM_NAMES,
+                                    parameter_bounds=PARAM_BOUNDS))
+    rng = np.random.default_rng(3)
+
+    for i in range(8):
+        ds.add_sample(FEMSample(
+            sample_id=f"s{i}",
+            parameters={
+                "E":    float(rng.uniform(150e9, 250e9)),
+                "nu":   float(rng.uniform(0.25, 0.35)),
+                "load": float(rng.uniform(50e6, 150e6)),
+            },
+            coordinates=rng.random((40, 2)).astype(np.float32),
+            von_mises=rng.random((40, 1)).astype(np.float32),
+            is_valid=True,
+        ))
+
+    params_arr, coords_list, outputs_list = ds.prepare_training_data("von_mises")
+    assert params_arr.shape == (8, 3)
+    assert len(coords_list) == 8
+    assert all(c.shape == (40, 2) for c in coords_list)
 
 
-def elem_to_node_field(vertices: np.ndarray, elements: list,
-                       elem_field: np.ndarray) -> np.ndarray:
-    """Average per-element values to nodes."""
-    total = np.zeros(len(vertices))
-    count = np.zeros(len(vertices))
-    for i, elem in enumerate(elements):
-        for v in elem:
-            total[v] += elem_field[i]
-            count[v] += 1
-    return total / np.maximum(count, 1)
+def test_femsample_output_fields():
+    from piano.data.dataset import FEMSample
+
+    coords = np.ones((20, 2), dtype=np.float32)
+    vm     = np.full((20, 1), 5.0, dtype=np.float32)
+    sample = FEMSample(
+        sample_id="x",
+        parameters={"E": 200e9, "nu": 0.3, "load": 1e8},
+        coordinates=coords,
+        von_mises=vm,
+        is_valid=True,
+    )
+
+    field = sample.get_output_field("von_mises")
+    assert field is not None and field.shape == (20, 1)
+
+    pvec = sample.get_parameter_vector(PARAM_NAMES)
+    assert pvec.shape == (3,)
+    assert pvec[0] == pytest.approx(200e9)
 
 
-# =============================================================================
-# Mesh Adaptation
-# =============================================================================
+# ===========================================================================
+# 2. SurrogateTrainer + EnsembleModel
+# ===========================================================================
 
-def adapt_mesh_r(mesh_file: str,
-                 node_uncertainty: np.ndarray
-                 ) -> Tuple[Optional[np.ndarray], object, Optional[str]]:
-    """
-    Apply TMOP r-adaptivity driven by per-node uncertainty.
-
-    Args:
-        mesh_file:        Path to MFEM .mesh file
-        node_uncertainty: (N_nodes,) scalar uncertainty per node
-
-    Returns:
-        (adapted_verts, AdaptivityResult|None, tmp_mesh_path|None)
-    """
-    try:
-        from piano.mesh.mfem_manager import MFEMManager
-        from piano.morphing.r_adaptivity import TMOPAdaptivity, AdaptivityConfig
-
-        mgr = MFEMManager(mesh_file)
-        if mgr.num_nodes != len(node_uncertainty):
-            print(f"  R-adaptivity skipped: node count mismatch "
-                  f"({mgr.num_nodes} vs {len(node_uncertainty)})")
-            return None, None, None
-
-        result = TMOPAdaptivity(
-            AdaptivityConfig(max_iterations=100, verbosity=0)
-        ).adapt(mgr, node_uncertainty)
-
-        if result.success:
-            with tempfile.NamedTemporaryFile(suffix=".mesh", delete=False) as f:
-                tmp = f.name
-            mgr._extract_mesh_data()
-            saved = mgr.save(tmp)
-            return result.coords_adapted, result, str(saved) if saved else None
-
-        return None, None, None
-
-    except Exception as e:
-        print(f"  R-adaptivity failed: {e}")
-        return None, None, None
+def test_surrogate_trainer_success(tiny_trainer):
+    trainer, _ = tiny_trainer
+    assert trainer.model is not None
+    assert trainer.model.is_trained
 
 
-def adapt_mesh_h(mesh_file: str,
-                 elem_uncertainty: np.ndarray
-                 ) -> Tuple[Optional[np.ndarray], Optional[list], object, Optional[str]]:
-    """
-    Apply h-refinement driven by per-element uncertainty.
+def test_surrogate_prediction_shape(tiny_trainer):
+    trainer, coords = tiny_trainer
+    rng    = np.random.default_rng(7)
+    params = rng.uniform(
+        [150e9, 0.25, 50e6], [250e9, 0.35, 150e6], size=(1, 3)
+    ).astype(np.float32)
 
-    Returns:
-        (h_verts, h_elements, HRefinementResult|None, tmp_mesh_path|None)
-    """
-    try:
-        from piano.mesh.mfem_manager import MFEMManager
-        from piano.morphing.h_refinement import HRefinement, HRefinementConfig
-
-        mgr = MFEMManager(mesh_file)
-        if mgr.num_elements != len(elem_uncertainty):
-            print(f"  H-refinement skipped: element count mismatch "
-                  f"({mgr.num_elements} vs {len(elem_uncertainty)})")
-            return None, None, None, None
-
-        result = HRefinement(
-            HRefinementConfig(error_threshold=0.3, max_refinement_levels=3,
-                              max_elements=3000)
-        ).refine(mgr, elem_uncertainty)
-
-        if result.success:
-            h_verts = mgr.get_nodes()
-            h_elements = [list(e[e >= 0]) for e in mgr.get_elements()]
-            with tempfile.NamedTemporaryFile(suffix='.mesh', delete=False) as f:
-                tmp = f.name
-            mgr.save(tmp)
-            return h_verts, h_elements, result, tmp
-
-        return None, None, result, None
-
-    except Exception as e:
-        print(f"  H-refinement failed: {e}")
-        return None, None, None, None
+    mean, unc = trainer.predict_with_uncertainty(params, coords)
+    assert mean.shape[0] == coords.shape[0]
+    assert unc is not None
+    assert unc.shape[0] == coords.shape[0]
 
 
-# =============================================================================
-# FEM Simulation (optional GT)
-# =============================================================================
+def test_normalizer_roundtrip():
+    from piano.surrogate.trainer import Normalizer
 
-def _retag_boundaries_mfem(mfem_mesh, verts: np.ndarray) -> None:
+    rng  = np.random.default_rng(3)
+    data = rng.uniform(0, 1000, size=(100, 3)).astype(np.float64)
+    n    = Normalizer()
+    np.testing.assert_allclose(n.inverse_transform(n.fit_transform(data)),
+                                data, rtol=1e-5)
+
+
+def test_training_history_recorded(tiny_trainer):
+    """TrainingResult must contain a history dict with train_losses."""
+    from piano.surrogate.trainer import SurrogateTrainer, TrainingConfig
+    from piano.surrogate.base import TransolverConfig
+
+    rng    = np.random.default_rng(99)
+    coords = rng.random((30, 2)).astype(np.float32)
+    params = rng.uniform([150e9, 0.25, 50e6], [250e9, 0.35, 150e6],
+                         size=(6, 3)).astype(np.float32)
+    out    = [rng.random((30, 1)).astype(np.float32) for _ in range(6)]
+
+    cfg = TrainingConfig(
+        surrogate_config=TransolverConfig(
+            d_model=16, n_heads=2, n_layers=1, slice_num=4,
+            epochs=3, patience=10, batch_size=4,
+        ),
+        use_ensemble=True, n_ensemble=2,
+        train_test_split=0.2, random_seed=1,
+    )
+    result = SurrogateTrainer(cfg).train(params, [coords] * 6, out)
+    assert result.success
+    assert isinstance(result.history, dict)
+
+
+# ===========================================================================
+# 3. SurrogateEvaluator
+# ===========================================================================
+
+def test_surrogate_evaluator_analyze_uncertainty(tiny_trainer):
+    from piano.surrogate.evaluator import SurrogateEvaluator
+
+    trainer, coords = tiny_trainer
+    evaluator = SurrogateEvaluator(trainer.model, PARAM_NAMES, PARAM_BOUNDS)
+    analysis  = evaluator.analyze_uncertainty(
+        coords, n_probe_samples=10, uncertainty_threshold=0.0
+    )
+    assert hasattr(analysis, "overall_uncertainty")
+    assert hasattr(analysis, "weak_regions")
+    assert isinstance(analysis.weak_regions, list)
+
+
+def test_surrogate_evaluator_on_data(tiny_trainer):
+    from piano.surrogate.evaluator import SurrogateEvaluator
+
+    trainer, coords = tiny_trainer
+    rng         = np.random.default_rng(11)
+    params      = rng.uniform(
+        [150e9, 0.25, 50e6], [250e9, 0.35, 150e6], size=(1, 3)
+    ).astype(np.float32)
+    true_outputs = rng.uniform(0, 1e8, size=(coords.shape[0],)).astype(np.float32)
+
+    evaluator = SurrogateEvaluator(trainer.model, PARAM_NAMES, PARAM_BOUNDS)
+    metrics   = evaluator.evaluate_on_data(params, coords, true_outputs)
+    assert isinstance(metrics, dict)
+    assert len(metrics) > 0
+
+
+def test_surrogate_evaluator_suggest_samples(tiny_trainer):
+    from piano.surrogate.evaluator import SurrogateEvaluator
+
+    trainer, coords = tiny_trainer
+    evaluator   = SurrogateEvaluator(trainer.model, PARAM_NAMES, PARAM_BOUNDS)
+    suggestions = evaluator.suggest_samples_active(
+        budget=3, coordinates=coords, acquisition_type="uncertainty"
+    )
+    assert len(suggestions) <= 3
+    assert all(isinstance(s, dict) for s in suggestions)
+
+
+def test_weak_region_contains_and_sample():
+    from piano.surrogate.evaluator import WeakRegion
+
+    region = WeakRegion(
+        parameter_ranges={"E": (190e9, 210e9), "nu": (0.28, 0.32), "load": (80e6, 120e6)},
+        metric="uncertainty",
+        metric_value=0.5,
+        priority=1.0,
+        sample_count=0,
+        suggested_samples=3,
+    )
+    assert region.contains({"E": 200e9, "nu": 0.30, "load": 100e6})
+    assert not region.contains({"E": 300e9, "nu": 0.30, "load": 100e6})
+
+    samples = region.sample_uniform(n_samples=3)
+    assert len(samples) == 3
+    assert all(region.contains(s) for s in samples)
+
+
+# ===========================================================================
+# 4. SpatialErrorAnalyzer + ErrorDecomposer
+# ===========================================================================
+
+def test_spatial_error_field(tiny_trainer):
+    from piano.surrogate.error_analysis import SpatialErrorAnalyzer
+
+    trainer, coords = tiny_trainer
+    rng       = np.random.default_rng(5)
+    params    = rng.uniform([150e9, 0.25, 50e6], [250e9, 0.35, 150e6],
+                             size=(3,)).astype(np.float32)
+    true_vals = rng.uniform(0, 1e8, size=(coords.shape[0],)).astype(np.float32)
+
+    analyzer    = SpatialErrorAnalyzer(trainer.model, coords)
+    error_field = analyzer.compute_error_field(params, true_vals)
+
+    assert error_field.shape[0] <= coords.shape[0]
+    assert np.all(error_field >= 0)
+
+
+def test_spatial_error_hotspots(tiny_trainer):
+    from piano.surrogate.error_analysis import SpatialErrorAnalyzer
+
+    trainer, coords = tiny_trainer
+    rng       = np.random.default_rng(14)
+    params    = rng.uniform([150e9, 0.25, 50e6], [250e9, 0.35, 150e6],
+                             size=(3,)).astype(np.float32)
+    true_vals = rng.uniform(0, 1e8, size=(coords.shape[0],)).astype(np.float32)
+
+    analyzer = SpatialErrorAnalyzer(trainer.model, coords)
+    error_field = analyzer.compute_error_field(params, true_vals)
+    hotspots    = analyzer.identify_hotspots(error_field, threshold_percentile=80)
+    assert isinstance(hotspots, list)
+
+
+def test_spatial_error_full_analysis(tiny_trainer):
+    from piano.surrogate.error_analysis import SpatialErrorAnalyzer
+
+    trainer, coords = tiny_trainer
+    rng       = np.random.default_rng(6)
+    params    = rng.uniform([150e9, 0.25, 50e6], [250e9, 0.35, 150e6],
+                             size=(3,)).astype(np.float32)
+    true_vals = rng.uniform(0, 1e8, size=(coords.shape[0],)).astype(np.float32)
+
+    analysis = SpatialErrorAnalyzer(trainer.model, coords).analyze(
+        params, true_vals, parameter_names=PARAM_NAMES, hotspot_threshold=80
+    )
+    assert hasattr(analysis, "error_field")
+    assert hasattr(analysis, "hotspots")
+    assert hasattr(analysis, "global_stats")
+
+
+def test_error_decomposer(tiny_trainer):
+    from piano.surrogate.error_analysis import ErrorDecomposer
+
+    trainer, coords = tiny_trainer
+    rng       = np.random.default_rng(8)
+    params    = rng.uniform([150e9, 0.25, 50e6], [250e9, 0.35, 150e6],
+                             size=(1, 3)).astype(np.float32)
+    true_vals = rng.uniform(0, 1e8, size=(coords.shape[0],)).astype(np.float32)
+
+    result = ErrorDecomposer(trainer.model).decompose(params, coords, true_vals)
+    assert isinstance(result, dict)
+    assert len(result) > 0
+
+
+# ===========================================================================
+# 5. Acquisition functions
+# ===========================================================================
+
+def _make_candidates(rng: np.random.Generator, n: int = 20) -> np.ndarray:
+    return rng.uniform(
+        [150e9, 0.25, 50e6], [250e9, 0.35, 150e6], size=(n, 3)
+    ).astype(np.float32)
+
+
+def test_uncertainty_sampling(tiny_trainer):
+    from piano.surrogate.acquisition import UncertaintySampling
+
+    trainer, coords = tiny_trainer
+    candidates = _make_candidates(np.random.default_rng(9))
+
+    result = UncertaintySampling().select_batch(
+        candidates, trainer.model, coords, batch_size=3
+    )
+    assert len(result.best_indices) == 3
+    assert result.scores.shape[0] == len(candidates)
+
+
+def test_expected_improvement(tiny_trainer):
+    from piano.surrogate.acquisition import ExpectedImprovement
+
+    trainer, coords = tiny_trainer
+    candidates = _make_candidates(np.random.default_rng(10))
+
+    result = ExpectedImprovement().select_batch(
+        candidates, trainer.model, coords, batch_size=3
+    )
+    assert len(result.best_indices) == 3
+
+
+def test_query_by_committee(tiny_trainer):
+    from piano.surrogate.acquisition import QueryByCommittee
+
+    trainer, coords = tiny_trainer
+    candidates = _make_candidates(np.random.default_rng(12))
+
+    result = QueryByCommittee().select_batch(
+        candidates, trainer.model, coords, batch_size=3
+    )
+    assert len(result.best_indices) == 3
+
+
+def test_acquisition_diversity_no_duplicates(tiny_trainer):
+    from piano.surrogate.acquisition import UncertaintySampling
+
+    trainer, coords = tiny_trainer
+    candidates = _make_candidates(np.random.default_rng(13), n=30)
+
+    result = UncertaintySampling().select_batch(
+        candidates, trainer.model, coords,
+        batch_size=5, diversity_weight=0.5
+    )
+    assert len(result.best_indices) == 5
+    assert len(set(result.best_indices.tolist())) == 5
+
+
+def test_acquisition_factory():
+    from piano.surrogate.acquisition import get_acquisition_function, AcquisitionType
+
+    for atype in AcquisitionType:
+        acq = get_acquisition_function(atype)
+        assert acq is not None
+
+
+# ===========================================================================
+# 6. MFEMManager  (mfem marker)
+# ===========================================================================
+
+@pytest.mark.mfem
+def test_mfem_manager_load():
+    pytest.importorskip("mfem.ser")
+    from piano.mesh.mfem_manager import MFEMManager
+
+    mgr = MFEMManager(str(TRAIN01 / "sample_000.mesh"))
+    assert mgr.num_nodes > 0
+    assert mgr.num_elements > 0
+    assert mgr.dimension == 2
+    assert mgr.get_nodes().shape[1] == 2
+    assert len(mgr.get_elements()) == mgr.num_elements
+
+
+@pytest.mark.mfem
+def test_mfem_manager_save(tmp_path):
+    pytest.importorskip("mfem.ser")
+    from piano.mesh.mfem_manager import MFEMManager
+
+    mgr   = MFEMManager(str(TRAIN01 / "sample_001.mesh"))
+    saved = mgr.save(str(tmp_path / "copy.mesh"))
+    assert saved.exists()
+
+
+@pytest.mark.mfem
+def test_mfem_manager_boundary_attributes():
+    pytest.importorskip("mfem.ser")
+    from piano.mesh.mfem_manager import MFEMManager
+
+    mgr   = MFEMManager(str(TRAIN01 / "sample_002.mesh"))
+    attrs = mgr.get_boundary_attributes()
+    assert attrs.ndim == 1
+    assert len(attrs) > 0
+
+
+@pytest.mark.mfem
+def test_train_fine_mesh_loads():
+    """train_fine meshes (scipy Delaunay) must load correctly and have right boundary tags."""
+    pytest.importorskip("mfem.ser")
+    import mfem.ser as mfem
+    from collections import Counter
+
+    assert TRAIN_FINE.exists(), f"train_fine/ not found at {TRAIN_FINE}"
+
+    for stem in ["sample_000.mesh", "sample_050.mesh", "sample_099.mesh"]:
+        path = TRAIN_FINE / stem
+        m    = mfem.Mesh(str(path), 1, 1)
+        assert m.GetNV() > 400,  f"{stem}: too few nodes ({m.GetNV()})"
+        assert m.GetNE() > 700,  f"{stem}: too few elements ({m.GetNE()})"
+
+        tags = Counter(m.GetBdrAttribute(i) for i in range(m.GetNBE()))
+        # Each outer side ≥ 8 edges; hole ≥ 20 edges
+        for side in (1, 2, 3, 4):
+            assert tags.get(side, 0) >= 8, \
+                f"{stem}: boundary tag {side} has only {tags.get(side,0)} edges"
+        assert tags.get(5, 0) >= 20, \
+            f"{stem}: hole tag (5) has only {tags.get(5,0)} edges"
+
+
+# ===========================================================================
+# 7. MFEMSolver + EvaluationPipeline  (mfem marker)
+# ===========================================================================
+
+def _physics_config(load: float = 1e8):
+    from piano.solvers.base import (
+        PhysicsConfig, PhysicsType, MaterialProperties,
+        BoundaryCondition, BoundaryConditionType,
+    )
+    return PhysicsConfig(
+        physics_type=PhysicsType.LINEAR_ELASTICITY,
+        material=MaterialProperties(E=200e9, nu=0.3),
+        boundary_conditions=[
+            BoundaryCondition(BoundaryConditionType.SYMMETRY,
+                              boundary_id=4, direction=0),
+            BoundaryCondition(BoundaryConditionType.SYMMETRY,
+                              boundary_id=1, direction=1),
+            BoundaryCondition(BoundaryConditionType.TRACTION,
+                              boundary_id=2, value=np.array([load, 0.])),
+        ],
+    )
+
+
+def _retag_boundaries(mfem_mesh, verts: np.ndarray) -> None:
+    """Tag: bottom=1, right=2, top=3, left=4, hole=5."""
     eps = 1e-10
     for i in range(mfem_mesh.GetNBE()):
         iv = mfem_mesh.GetBdrElement(i).GetVerticesArray()
         xs = [verts[iv[j]][0] for j in range(len(iv))]
         ys = [verts[iv[j]][1] for j in range(len(iv))]
-        if all(y < eps for y in ys):           tag = 1
-        elif all(x > 1.0 - eps for x in xs):  tag = 2
-        elif all(y > 1.0 - eps for y in ys):  tag = 3
-        elif all(x < eps for x in xs):         tag = 4
-        else:                                   tag = 5
+        if   all(y < eps for y in ys):        tag = 1
+        elif all(x > 1.0 - eps for x in xs): tag = 2
+        elif all(y > 1.0 - eps for y in ys): tag = 3
+        elif all(x < eps for x in xs):        tag = 4
+        else:                                  tag = 5
         mfem_mesh.GetBdrElement(i).SetAttribute(tag)
     mfem_mesh.SetAttributes()
 
 
-def _extract_verts_ctypes(mfem_mesh) -> np.ndarray:
+def _extract_verts(mfem_mesh) -> np.ndarray:
     import ctypes
-    nv = mfem_mesh.GetNV()
+    nv    = mfem_mesh.GetNV()
     verts = np.zeros((nv, 2))
     for i in range(nv):
         v = mfem_mesh.GetVertex(i)
@@ -223,216 +525,149 @@ def _extract_verts_ctypes(mfem_mesh) -> np.ndarray:
     return verts
 
 
-def simulate_ground_truth(mesh_file: str,
-                          params: Dict
-                          ) -> Tuple[np.ndarray, np.ndarray, list]:
-    """
-    Run PyMFEM linear-elasticity FEM.
-
-    Returns:
-        (von_mises per element, vertices, elements)
-        Returns all-zeros von_mises if the solver fails or produces a
-        trivial solution — callers should check ``np.any(von_mises > 0)``.
-    """
+@pytest.mark.mfem
+def test_mfem_solver_elasticity(tmp_path):
+    pytest.importorskip("mfem.ser")
     from piano.mesh.mfem_manager import MFEMManager
     from piano.solvers.mfem_solver import MFEMSolver
-    from piano.solvers.base import (
-        PhysicsConfig, PhysicsType, MaterialProperties,
-        BoundaryCondition, BoundaryConditionType,
-    )
 
-    manager = MFEMManager(mesh_file)
-    verts = _extract_verts_ctypes(manager.mesh)
-    _retag_boundaries_mfem(manager.mesh, verts)
+    mgr   = MFEMManager(str(TRAIN01 / "sample_000.mesh"))
+    verts = _extract_verts(mgr.mesh)
+    _retag_boundaries(mgr.mesh, verts)
 
-    physics = PhysicsConfig(
-        physics_type=PhysicsType.LINEAR_ELASTICITY,
-        material=MaterialProperties(E=params['E'], nu=params['nu']),
-        boundary_conditions=[
-            BoundaryCondition(BoundaryConditionType.SYMMETRY,
-                              boundary_id=4, direction=0),
-            BoundaryCondition(BoundaryConditionType.SYMMETRY,
-                              boundary_id=1, direction=1),
-            BoundaryCondition(BoundaryConditionType.TRACTION,
-                              boundary_id=2,
-                              value=np.array([params['load'], 0.])),
-        ],
-    )
     solver = MFEMSolver(order=1)
-    solver.setup(manager, physics)
+    solver.setup(mgr, _physics_config())
+    result = solver.solve(str(tmp_path))
 
+    assert result.success, result.error_message
+    vm = result.solution_data.get("von_mises")
+    assert vm is not None and vm.shape[0] == mgr.num_elements
+    assert np.any(vm > 0), "All-zero von Mises — solver did not converge"
+
+
+@pytest.mark.mfem
+def test_evaluation_pipeline_quick():
+    pytest.importorskip("mfem.ser")
+    from piano.mesh.mfem_manager import MFEMManager
+    from piano.evaluation.pipeline import EvaluationPipeline, EvaluationStage
+
+    mgr    = MFEMManager(str(TRAIN01 / "sample_002.mesh"))
+    result = EvaluationPipeline(run_solver=False).quick_evaluate("q001", mgr)
+
+    assert result.stage   == EvaluationStage.COMPLETE
+    assert result.success
+    assert result.preflight_result is not None
+    assert result.overall_score    > 0
+
+
+@pytest.mark.mfem
+def test_evaluation_pipeline_with_solver(tmp_path):
+    pytest.importorskip("mfem.ser")
+    from piano.mesh.mfem_manager import MFEMManager
+    from piano.solvers.mfem_solver import MFEMSolver
+    from piano.evaluation.pipeline import EvaluationPipeline, EvaluationStage
+
+    mgr   = MFEMManager(str(TRAIN01 / "sample_003.mesh"))
+    verts = _extract_verts(mgr.mesh)
+    _retag_boundaries(mgr.mesh, verts)
+
+    pipeline = EvaluationPipeline(
+        run_solver=True,
+        solver=MFEMSolver(order=1),
+        physics=_physics_config(),
+    )
+    result = pipeline.evaluate("s003", mgr, output_dir=str(tmp_path))
+
+    assert result.stage == EvaluationStage.COMPLETE
+    assert result.solver_completed
+
+
+# ===========================================================================
+# 8. End-to-end visualization  (standalone __main__)
+# ===========================================================================
+
+import argparse
+
+
+def _collect_mesh_files(dirs: List[str], limit: int) -> List[Path]:
+    files = []
+    for d in dirs:
+        files.extend(sorted(Path(d).glob("sample_*.mesh")))
+    return files[:limit]
+
+
+def _run_fem(mesh_path: str, params: Dict) -> Tuple[np.ndarray, np.ndarray, list]:
+    """Run MFEM solver; returns (von_mises, vertices, elements) or zeros."""
+    import ctypes
+    from piano.mesh.mfem_manager import MFEMManager
+    from piano.solvers.mfem_solver import MFEMSolver
+
+    mgr   = MFEMManager(mesh_path)
+    nv    = mgr.mesh.GetNV()
+    verts = np.zeros((nv, 2))
+    for i in range(nv):
+        v = mgr.mesh.GetVertex(i)
+        p = ctypes.cast(int(v), ctypes.POINTER(ctypes.c_double))
+        verts[i] = [p[0], p[1]]
+    _retag_boundaries(mgr.mesh, verts)
+
+    solver = MFEMSolver(order=1)
+    solver.setup(mgr, _physics_config(params["load"]))
     with tempfile.TemporaryDirectory() as tmp:
         result = solver.solve(tmp)
 
-    vertices = manager.get_nodes()
-    elements = [list(e[e >= 0]) for e in manager.get_elements()]
-
+    vertices = mgr.get_nodes()
+    elements = [list(e[e >= 0]) for e in mgr.get_elements()]
     if not result.success:
         return np.zeros(len(elements)), vertices, elements
-
-    return result.solution_data.get('von_mises',
+    return result.solution_data.get("von_mises",
                                     np.zeros(len(elements))), vertices, elements
 
 
-def simulate_ground_truth_refined(mesh_file: str, params: Dict,
-                                  refine_levels: int = 2
-                                  ) -> Tuple[np.ndarray, np.ndarray, list]:
-    """Uniformly refine mesh N levels then run FEM."""
-    from piano.mesh.mfem_manager import MFEMManager
-
-    mgr = MFEMManager(mesh_file)
-    mgr.refine_uniformly(times=refine_levels)
-
-    with tempfile.NamedTemporaryFile(suffix='.mesh', delete=False) as f:
-        fine_tmp = f.name
-    mgr.save(fine_tmp)
-    try:
-        return simulate_ground_truth(fine_tmp, params)
-    finally:
-        os.unlink(fine_tmp)
-
-
-# =============================================================================
-# Ensemble Model
-# =============================================================================
-
-def load_ensemble_model(model_dir: str):
-    """
-    Load a trained EnsembleModel from ``model_dir/ensemble_model.pt``.
-
-    Returns a SurrogateTrainer with normalizers restored from the sidecar
-    ``normalizer_params.json`` so that predictions are properly denormalized.
-
-    Raises FileNotFoundError if the model file does not exist.
-    """
-    import json, torch
-    from piano.surrogate.base import TransolverConfig, EnsembleConfig
-    from piano.surrogate.ensemble import EnsembleModel
-    from piano.surrogate.trainer import SurrogateTrainer, TrainingConfig, Normalizer
-
-    path = Path(model_dir) / "ensemble_model.pt"
-    if not path.exists():
-        raise FileNotFoundError(f"Ensemble model not found: {path}")
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-
-    mc = checkpoint['ensemble_config']['member_config']
-    member_cfg = TransolverConfig(**{k: v for k, v in mc.items()
-                                     if k != 'checkpoint_dir'})
-    ens_cfg = EnsembleConfig(
-        n_members=checkpoint['ensemble_config']['n_members'],
-        member_config=member_cfg,
-    )
-    model = EnsembleModel(ens_cfg)
-    model.build(checkpoint['input_dim'],
-                checkpoint['coord_dim'],
-                checkpoint['num_points'])
-    model.load_state_dict(checkpoint['state_dict'])
-    model._is_trained = True
-    model.eval()
-
-    # Reconstruct trainer shell with saved normalizers
-    trainer = SurrogateTrainer(TrainingConfig())
-    trainer._model = model
-
-    norm_path = Path(model_dir) / "normalizer_params.json"
-    if norm_path.exists():
-        with open(norm_path) as f:
-            np_dict = json.load(f)
-        if 'input_mean' in np_dict:
-            n = Normalizer()
-            n.mean = np.array(np_dict['input_mean'])
-            n.std  = np.array(np_dict['input_std'])
-            trainer._input_normalizer = n
-        if 'output_mean' in np_dict:
-            n = Normalizer()
-            n.mean = np.array(np_dict['output_mean'])
-            n.std  = np.array(np_dict['output_std'])
-            trainer._output_normalizer = n
-
-    return trainer
-
-
-def train_fast_ensemble(
-    samples_dirs: List[str],
-    n_ensemble: int = 3,
-    epochs: int = 80,
-    params_seed: int = 42,
-    save_dir: Optional[str] = None,
-):
-    """
-    Train an EnsembleModel on all FEM samples from one or more directories.
-
-    Args:
-        samples_dirs: One or more directories containing sample_*.mesh files
-        n_ensemble:   Ensemble members
-        epochs:       Training epochs
-        params_seed:  RNG seed for material/load parameters
-        save_dir:     Save trained model here if provided
-
-    Returns:
-        SurrogateTrainer with trained model and normalizers
-    """
+def _build_dataset(mesh_files: List[Path], rng: np.random.Generator):
+    """Run FEM on mesh_files and return (FEMDataset, centers list, vm list)."""
     from piano.data.dataset import FEMDataset, FEMSample, DatasetConfig
+
+    ds = FEMDataset(DatasetConfig(parameter_names=PARAM_NAMES,
+                                   parameter_bounds=PARAM_BOUNDS))
+    centers_all, vm_all = [], []
+
+    for i, mf in enumerate(mesh_files):
+        params = {
+            "E":    float(rng.uniform(150e9, 250e9)),
+            "nu":   float(rng.uniform(0.25, 0.35)),
+            "load": float(rng.uniform(50e6, 150e6)),
+        }
+        try:
+            vm, verts, elems = _run_fem(str(mf), params)
+            if not np.any(vm > 0):
+                raise RuntimeError("trivial solution")
+            ctrs = np.array([np.mean(verts[e], axis=0) for e in elems],
+                            dtype=np.float32)
+            ds.add_sample(FEMSample(
+                sample_id=f"s{i:03d}",
+                parameters=params,
+                coordinates=ctrs,
+                von_mises=vm[:, np.newaxis].astype(np.float32),
+                is_valid=True,
+            ))
+            centers_all.append(ctrs)
+            vm_all.append(vm)
+            print(f"  [{i+1}/{len(mesh_files)}] {mf.stem}  "
+                  f"peak VM={vm.max():.2e}")
+        except Exception as e:
+            print(f"  [{i+1}/{len(mesh_files)}] {mf.stem} skipped: {e}")
+
+    return ds, centers_all, vm_all
+
+
+def _train_ensemble(ds, n_ensemble: int = 3, epochs: int = 80):
+    """Train ensemble and return (trainer, training_result) so history is available."""
     from piano.surrogate.trainer import SurrogateTrainer, TrainingConfig
     from piano.surrogate.base import TransolverConfig
 
-    if isinstance(samples_dirs, str):
-        samples_dirs = [samples_dirs]
-
-    mesh_files = []
-    for d in samples_dirs:
-        mesh_files.extend(sorted(Path(d).glob("sample_*.mesh")))
-
-    if not mesh_files:
-        raise FileNotFoundError(f"No sample_*.mesh found in {samples_dirs}")
-
-    rng = np.random.default_rng(params_seed)
-
-    dataset = FEMDataset(DatasetConfig(
-        parameter_names=['E', 'nu', 'load'],
-        parameter_bounds={
-            'E':    (150e9, 250e9),
-            'nu':   (0.25, 0.35),
-            'load': (50e6, 150e6),
-        },
-    ))
-
-    dirs_str = ", ".join(samples_dirs)
-    print(f"  Collecting FEM data from {len(mesh_files)} meshes ({dirs_str})...")
-    for i, mf in enumerate(mesh_files):
-        params = {
-            'E':    float(rng.uniform(150e9, 250e9)),
-            'nu':   float(rng.uniform(0.25, 0.35)),
-            'load': float(rng.uniform(50e6, 150e6)),
-        }
-        try:
-            von_mises, verts_fem, elems_fem = simulate_ground_truth(str(mf), params)
-            if not np.any(von_mises > 0):
-                raise RuntimeError(f"FEM returned trivial solution for {mf.stem}")
-
-            # Use element centres as coordinates so coords/outputs have same N
-            centers = get_element_centers(verts_fem, elems_fem)
-            sample = FEMSample(
-                sample_id=f"s{i:03d}",
-                parameters=params,
-                coordinates=centers,               # (N_elem, 2)
-                von_mises=von_mises[:, np.newaxis], # (N_elem, 1)
-                is_valid=True,
-            )
-            dataset.add_sample(sample)
-        except Exception as e:
-            print(f"    Skipping {mf.stem}: {e}")
-
-    valid = dataset.get_valid_samples()
-    if len(valid) < 3:
-        raise RuntimeError(f"Need ≥3 valid samples, got {len(valid)}")
-
-    print(f"  {len(valid)} valid samples — training {n_ensemble}-member ensemble "
-          f"for {epochs} epochs...")
-
-    training_cfg = TrainingConfig(
+    params_arr, coords_list, outputs_list = ds.prepare_training_data("von_mises")
+    cfg = TrainingConfig(
         surrogate_config=TransolverConfig(
             d_model=64, n_heads=4, n_layers=2, slice_num=8,
             epochs=epochs, patience=50, batch_size=4,
@@ -440,655 +675,304 @@ def train_fast_ensemble(
         use_ensemble=True,
         n_ensemble=n_ensemble,
         train_test_split=0.2,
-        random_seed=params_seed,
-        save_dir=Path(save_dir) if save_dir else None,
+        random_seed=42,
     )
-    trainer = SurrogateTrainer(training_cfg)
-
-    params_arr, coords_list, outputs_list = dataset.prepare_training_data('von_mises')
-    result = trainer.train(params_arr, coords_list, outputs_list)
-
+    trainer = SurrogateTrainer(cfg)
+    result  = trainer.train(params_arr, coords_list, outputs_list)
     if not result.success:
         raise RuntimeError(f"Ensemble training failed: {result.error_message}")
-
-    print(f"  Done — train_loss={result.train_loss:.4f}  "
+    print(f"  train_loss={result.train_loss:.4f}  "
           f"test_loss={result.test_loss:.4f}")
-
-    if save_dir:
-        out = Path(save_dir) / "ensemble_model.pt"
-        trainer.model.save(out)
-        print(f"  Saved ensemble → {out}")
-        # Save normalizer params so the model can be loaded with proper normalization
-        import json
-        norm_params = trainer._get_normalization_params()
-        with open(Path(save_dir) / "normalizer_params.json", "w") as f:
-            json.dump(norm_params, f)
-
-    return trainer
+    return trainer, result
 
 
-def predict_ensemble(
-    trainer,
-    vertices: np.ndarray,
-    elements: list,
-    params: Dict,
-    param_names: List[str],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Run ensemble prediction on a mesh with proper normalization.
-
-    Uses element centres as query coordinates (consistent with training).
-    Delegates to ``SurrogateTrainer.predict_with_uncertainty()`` so that
-    input parameters are normalized before inference and outputs are
-    denormalized before returning.
-
-    Args:
-        trainer:     SurrogateTrainer (wraps EnsembleModel + normalizers)
-        vertices:    (N_nodes, 2)
-        elements:    element connectivity list
-        params:      parameter dict (raw, un-normalized)
-        param_names: ordered list of parameter keys
-
-    Returns:
-        mean_field:  (N_elem,) ensemble mean von Mises prediction (Pa scale)
-        uncertainty: (N_elem,) ensemble std (Pa scale) — the adaptation signal
-    """
-    from piano.surrogate.trainer import SurrogateTrainer
-
-    centers   = get_element_centers(vertices, elements)   # (N_elem, 2)
-    param_arr = np.array([[params[k] for k in param_names]], dtype=np.float32)
-
-    mean, unc = trainer.predict_with_uncertainty(param_arr, centers)
-
-    mean_field  = mean.flatten()
-    uncertainty = unc.flatten() if unc is not None else np.zeros(len(centers))
-
-    return mean_field, uncertainty
-
-
-# =============================================================================
-# Plotting Utilities
-# =============================================================================
-
-def plot_mesh_field(
-    ax,
-    vertices: np.ndarray,
-    elements: list,
-    field: np.ndarray,
-    title: str = "",
-    cmap: str = "viridis",
-    vmin: float = None,
-    vmax: float = None,
-) -> PolyCollection:
-    """Plot a scalar element-centred field on the mesh."""
-    polygons = [vertices[elem] for elem in elements]
-
-    if vmin is None: vmin = float(np.min(field))
-    if vmax is None: vmax = float(np.max(field))
-    if vmin == vmax:
-        vmax = vmin + 1e-10
-
-    coll = PolyCollection(
-        polygons,
-        array=field,
-        cmap=cmap,
-        norm=mcolors.Normalize(vmin=vmin, vmax=vmax),
-        edgecolors='black',
-        linewidths=0.2,
-    )
-    ax.add_collection(coll)
-    ax.set_xlim(vertices[:, 0].min() - 0.05, vertices[:, 0].max() + 0.05)
-    ax.set_ylim(vertices[:, 1].min() - 0.05, vertices[:, 1].max() + 0.05)
-    ax.set_aspect('equal')
-    ax.set_title(title, fontsize=10, fontweight='bold')
-    ax.set_xlabel('x'); ax.set_ylabel('y')
-    return coll
-
-
-def nearest_neighbour_interp(src_centers, src_values, tgt_centers):
-    diff    = tgt_centers[:, np.newaxis, :] - src_centers[np.newaxis, :, :]
-    sq_dist = np.sum(diff ** 2, axis=-1)
-    return src_values[np.argmin(sq_dist, axis=1)]
-
-
-# =============================================================================
-# Main Visualization: Uncertainty-Driven Loop
-# =============================================================================
-
-def visualize_uncertainty_loop(
-    mesh_file: str,
-    model_dir: str,
-    output_file: str,
-    samples_dirs: Optional[List[str]] = None,
-    params: Optional[Dict] = None,
-    show_gt: bool = True,
-    n_ensemble: int = 3,
-    epochs: int = 80,
-) -> Dict:
-    """
-    5-panel uncertainty-driven SciML loop visualization.
-
-    ① Ensemble mean prediction  (coarse mesh)
-    ② Ensemble uncertainty      (coarse mesh) — the adaptation signal
-    ③ R-adapted mesh            (nodes toward high-uncertainty)
-    ④ Ensemble uncertainty      (adapted mesh)
-    ⑤ GT comparison             (optional fine-mesh FEM)
-
-    Panel ⑤ is shown only when ``show_gt=True`` AND the FEM solver returns a
-    non-trivial solution.  Otherwise the panel displays a note explaining that
-    GT is optional validation and was not available for this run.
-
-    Args:
-        mesh_file:   Path to the coarse test mesh
-        model_dir:   Directory with ``ensemble_model.pt`` (or where to save one)
-        output_file: Output PNG path
-        samples_dir: Directory with training meshes (used if no model found)
-        params:      Material/load parameters (random if None)
-        show_gt:     Whether to attempt fine-mesh FEM for panel ⑤
-        n_train:     Training meshes for on-the-fly ensemble
-        n_ensemble:  Ensemble size for on-the-fly training
-        epochs:      Training epochs for on-the-fly ensemble
-
-    Returns:
-        Dict of metrics
-    """
-    print(f"Loading coarse mesh: {mesh_file}")
-    vertices, elements, boundary = read_mfem_mesh(mesh_file)
-    n_nodes, n_elems = len(vertices), len(elements)
-    print(f"  {n_nodes} nodes, {n_elems} elements")
-
-    if params is None:
-        rng = np.random.default_rng(hash(mesh_file) % 2**31)
-        params = {
-            'E':    float(rng.uniform(150e9, 250e9)),
-            'nu':   float(rng.uniform(0.25, 0.35)),
-            'load': float(rng.uniform(50e6, 150e6)),
-        }
-    param_names = ['E', 'nu', 'load']
-
-    # ── Load or train ensemble ─────────────────────────────────────────────
-    print("Loading ensemble model...")
-    try:
-        trainer = load_ensemble_model(model_dir)
-        print(f"  Loaded from {model_dir}")
-    except FileNotFoundError:
-        print("  Not found — training on-the-fly...")
-        if samples_dirs is None:
-            samples_dirs = [str(Path(mesh_file).parent)]
-        trainer = train_fast_ensemble(
-            samples_dirs,
-            n_ensemble=n_ensemble,
-            epochs=epochs,
-            save_dir=model_dir,
-        )
-
-    # ── ① Ensemble mean prediction on coarse mesh ─────────────────────────
-    print("Running ensemble on coarse mesh...")
-    mean_coarse, unc_coarse = predict_ensemble(
-        trainer, vertices, elements, params, param_names
-    )
-    print(f"  Mean prediction range: [{mean_coarse.min():.2f}, {mean_coarse.max():.2f}]")
-    print(f"  Uncertainty range:     [{unc_coarse.min():.4f}, {unc_coarse.max():.4f}]")
-
-    # ── ② → ③  R-adaptivity driven by uncertainty ─────────────────────────
-    print("Applying TMOP r-adaptivity (driven by ensemble uncertainty)...")
-    node_unc_coarse = elem_to_node_field(vertices, elements, unc_coarse)
-    r_verts, r_result, r_tmp = adapt_mesh_r(mesh_file, node_unc_coarse)
-    r_ok = r_result is not None and r_result.success
-
-    if r_ok:
-        max_disp = np.linalg.norm(r_verts - vertices, axis=1).max()
-        print(f"  R-adapt OK — max node displacement: {max_disp:.4f}")
-    else:
-        r_verts = vertices.copy()
-        r_tmp = None
-        print("  R-adapt unavailable")
-
-    # ── H-refinement chained on r-adapted mesh ────────────────────────────
-    print("Applying h-refinement (driven by ensemble uncertainty)...")
-    h_src = r_tmp if r_tmp else mesh_file
-    h_verts, h_elements, h_result, h_tmp = adapt_mesh_h(h_src, unc_coarse)
-    h_ok = h_result is not None and h_result.success
-
-    if h_ok:
-        print(f"  H-refine OK — elements: "
-              f"{h_result.num_elements_before} → {h_result.num_elements_after}")
-    else:
-        h_verts    = r_verts.copy()
-        h_elements = elements
-        print("  H-refine unavailable")
-
-    if r_tmp:
-        try: os.unlink(r_tmp)
-        except OSError: pass
-
-    # ── ④ Uncertainty on adapted mesh ─────────────────────────────────────
-    print("Running ensemble on adapted mesh...")
-    mean_adapted, unc_adapted = predict_ensemble(
-        trainer, h_verts, h_elements, params, param_names
-    )
-    print(f"  Adapted uncertainty range: "
-          f"[{unc_adapted.min():.4f}, {unc_adapted.max():.4f}]")
-    mean_unc_reduction = float(np.mean(unc_coarse) - np.mean(unc_adapted))
-
-    if h_tmp:
-        try: os.unlink(h_tmp)
-        except OSError: pass
-
-    # ── ⑤ GT comparison (optional) ────────────────────────────────────────
-    gt_available = False
-    gt_fine, fine_verts, fine_elements = None, None, None
-    rel_err_coarse = rel_err_adapted = float('nan')
-
-    if show_gt:
-        print("Computing optional GT (fine-mesh FEM)...")
-        try:
-            gt_fine, fine_verts, fine_elements = simulate_ground_truth_refined(
-                mesh_file, params, refine_levels=3
-            )
-            if np.any(gt_fine > 0):
-                gt_available = True
-                fine_centers = get_element_centers(fine_verts, fine_elements)
-                coarse_centers = get_element_centers(vertices, elements)
-                adapted_centers = get_element_centers(h_verts, h_elements)
-
-                coarse_on_fine = nearest_neighbour_interp(
-                    coarse_centers, mean_coarse, fine_centers
-                )
-                adapted_on_fine = nearest_neighbour_interp(
-                    adapted_centers, mean_adapted, fine_centers
-                )
-                rel_err_coarse = (
-                    np.mean(np.abs(gt_fine - coarse_on_fine))
-                    / (np.mean(np.abs(gt_fine)) + 1e-10) * 100
-                )
-                rel_err_adapted = (
-                    np.mean(np.abs(gt_fine - adapted_on_fine))
-                    / (np.mean(np.abs(gt_fine)) + 1e-10) * 100
-                )
-                print(f"  GT peak: {gt_fine.max():.2f}  "
-                      f"rel_err coarse={rel_err_coarse:.1f}%  "
-                      f"adapted={rel_err_adapted:.1f}%")
-            else:
-                print("  FEM returned trivial zero solution — GT not shown")
-        except Exception as e:
-            print(f"  GT skipped: {e}")
-
-    # ── Build 5-panel figure ───────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 5, figsize=(28, 5))
-    fig.suptitle(
-        'Ensemble Uncertainty Loop  |  '
-        '① Mean Pred  →  ② Uncertainty  →  ③ Adapted Mesh  →  '
-        '④ Unc. Adapted  →  ⑤ GT (optional)',
-        fontsize=10, fontweight='bold', y=1.02,
-    )
-
-    # Shared uncertainty scale for ②④
-    unc_vmax = max(float(np.percentile(unc_coarse, 98)),
-                   float(np.percentile(unc_adapted, 98)),
-                   1e-10)
-
-    # Shared mean-prediction scale for ①③
-    pred_vmax = float(np.percentile(
-        np.concatenate([mean_coarse, mean_adapted]), 98
-    ))
-    pred_vmax = max(pred_vmax, 1e-10)
-
-    # ① Mean prediction — coarse mesh
-    c1 = plot_mesh_field(
-        axes[0], vertices, elements, mean_coarse,
-        title=f"① Ensemble Mean  ({n_elems} elems)\n"
-              f"Coarse mesh prediction",
-        cmap='jet', vmin=0, vmax=pred_vmax,
-    )
-    fig.colorbar(c1, ax=axes[0], shrink=0.8).set_label('Prediction (a.u.)', fontsize=8)
-    axes[0].text(
-        0.02, 0.02,
-        f"Range: [{mean_coarse.min():.1f}, {mean_coarse.max():.1f}]",
-        transform=axes[0].transAxes, fontsize=8, va='bottom',
-        bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.9),
-    )
-
-    # ② Uncertainty — coarse mesh (the adaptation signal)
-    c2 = plot_mesh_field(
-        axes[1], vertices, elements, unc_coarse,
-        title=f"② Ensemble Uncertainty  ({n_elems} elems)\n"
-              f"Adaptation signal (no GT needed)",
-        cmap='hot_r', vmin=0, vmax=unc_vmax,
-    )
-    fig.colorbar(c2, ax=axes[1], shrink=0.8).set_label('Std (a.u.)', fontsize=8)
-    axes[1].text(
-        0.02, 0.02,
-        f"Mean: {np.mean(unc_coarse):.3f}\nMax: {unc_coarse.max():.3f}",
-        transform=axes[1].transAxes, fontsize=8, va='bottom',
-        bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9),
-    )
-
-    # ③ R+H adapted mesh — mean prediction
-    c3 = plot_mesh_field(
-        axes[2], h_verts, h_elements, mean_adapted,
-        title=f"③ Adapted Mesh  ({len(h_elements)} elems)\n"
-              f"Nodes → high-uncertainty regions",
-        cmap='jet', vmin=0, vmax=pred_vmax,
-    )
-    fig.colorbar(c3, ax=axes[2], shrink=0.8).set_label('Prediction (a.u.)', fontsize=8)
-    note3 = []
-    if r_ok: note3.append(f"R-adapt: ✓ (Δmax={max_disp:.3f})")
-    if h_ok: note3.append(f"H-refine: {h_result.num_elements_before}"
-                           f"→{h_result.num_elements_after}")
-    if note3:
-        axes[2].text(
-            0.02, 0.02, "\n".join(note3),
-            transform=axes[2].transAxes, fontsize=8, va='bottom',
-            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.9),
-        )
-
-    # ④ Uncertainty on adapted mesh
-    c4 = plot_mesh_field(
-        axes[3], h_verts, h_elements, unc_adapted,
-        title=f"④ Uncertainty After Adaptation\n"
-              f"({len(h_elements)} elems)",
-        cmap='hot_r', vmin=0, vmax=unc_vmax,
-    )
-    fig.colorbar(c4, ax=axes[3], shrink=0.8).set_label('Std (a.u.)', fontsize=8)
-    colour4 = 'lightgreen' if mean_unc_reduction > 0 else 'lightsalmon'
-    axes[3].text(
-        0.02, 0.02,
-        f"Mean: {np.mean(unc_adapted):.3f}\nMax: {unc_adapted.max():.3f}\n"
-        f"Δ mean: {mean_unc_reduction:+.3f}",
-        transform=axes[3].transAxes, fontsize=8, va='bottom',
-        bbox=dict(boxstyle='round', facecolor=colour4, alpha=0.9),
-    )
-
-    # ⑤ GT comparison — optional
-    if gt_available:
-        c5 = plot_mesh_field(
-            axes[4], fine_verts, fine_elements, gt_fine,
-            title=f"⑤ GT Fine-Mesh FEM  ({len(fine_elements)} elems)\n"
-                  f"Optional external validation",
-            cmap='jet',
-        )
-        fig.colorbar(c5, ax=axes[4], shrink=0.8).set_label(
-            'Von Mises (a.u.)', fontsize=8)
-        axes[4].text(
-            0.02, 0.02,
-            f"Rel err coarse: {rel_err_coarse:.1f}%\n"
-            f"Rel err adapted: {rel_err_adapted:.1f}%\n"
-            f"Δ: {rel_err_coarse - rel_err_adapted:+.1f} pp",
-            transform=axes[4].transAxes, fontsize=8, va='bottom',
-            bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.9),
-        )
-    else:
-        axes[4].set_aspect('equal')
-        axes[4].set_xlim(0, 1); axes[4].set_ylim(0, 1)
-        axes[4].text(
-            0.5, 0.5,
-            "⑤ GT Comparison\n(optional validation)\n\n"
-            "FEM returned trivial solution\nor GT not requested.\n\n"
-            "Uncertainty-driven loop\ndoes not require GT.",
-            transform=axes[4].transAxes, fontsize=9,
-            ha='center', va='center',
-            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9),
-        )
-        axes[4].set_title(
-            "⑤ GT (optional — not available)",
-            fontsize=10, fontweight='bold',
-        )
-        axes[4].axis('off')
-
-    plt.tight_layout()
-    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {output_file}")
-
-    return {
-        'mean_uncertainty_coarse':  float(np.mean(unc_coarse)),
-        'max_uncertainty_coarse':   float(np.max(unc_coarse)),
-        'mean_uncertainty_adapted': float(np.mean(unc_adapted)),
-        'max_uncertainty_adapted':  float(np.max(unc_adapted)),
-        'mean_unc_reduction':       mean_unc_reduction,
-        'coarse_elements':          n_elems,
-        'adapted_elements':         len(h_elements),
-        'r_adapted':                r_ok,
-        'h_refined':                h_ok,
-        'gt_available':             gt_available,
-        'rel_err_coarse':           rel_err_coarse,
-        'rel_err_adapted':          rel_err_adapted,
-    }
-
-
-def compare_multiple_uncertainty(
+def run_visualization(
     samples_dirs: List[str],
-    model_dir: str,
-    output_file: str,
-    n_samples: int = 3,
-) -> List[Dict]:
+    sample_idx:   int,
+    output_file:  str,
+    n_train:      int = 8,
+    n_ensemble:   int = 3,
+    epochs:       int = 80,
+) -> None:
     """
-    Compare ensemble mean + uncertainty across multiple meshes.
+    5-panel SciML loop visualization in a 2-row layout.
 
-    Two rows per mesh: mean prediction (top), uncertainty (bottom).
+    Row 1 — plate-with-hole domain:
+      ① Ensemble mean prediction
+      ② Ensemble uncertainty
+      ③ Error field with hotspots
+
+    Row 2 — analytics:
+      ④ Acquisition scores (sorted bar chart, top-5 highlighted)
+      ⑤ Training convergence (train loss + test loss vs epoch)
+
+    Pass multiple directories to --samples-dirs to combine train01, train02,
+    and train_fine for a larger training set.
     """
-    if isinstance(samples_dirs, str):
-        samples_dirs = [samples_dirs]
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    from matplotlib.collections import PolyCollection
+    import matplotlib.colors as mcolors
+    from piano.surrogate.evaluator import SurrogateEvaluator
+    from piano.surrogate.error_analysis import SpatialErrorAnalyzer
+    from piano.surrogate.acquisition import UncertaintySampling
 
-    all_files = []
-    for d in samples_dirs:
-        all_files.extend(sorted(Path(d).glob("sample_*.mesh")))
-    mesh_files = all_files[:n_samples]
+    rng       = np.random.default_rng(42)
+    all_files = _collect_mesh_files(samples_dirs, n_train + 1)
+    if not all_files:
+        raise FileNotFoundError(f"No sample_*.mesh found in {samples_dirs}")
 
-    if not mesh_files:
-        print(f"No mesh files found in {samples_dirs}")
-        return []
+    train_files = all_files[:n_train]
+    test_file   = all_files[min(sample_idx, len(all_files) - 1)]
 
-    print("Loading ensemble model...")
-    try:
-        trainer = load_ensemble_model(model_dir)
-    except FileNotFoundError:
-        print("  Not found — training on-the-fly...")
-        trainer = train_fast_ensemble(samples_dirs, save_dir=model_dir)
+    dirs_label = " + ".join(Path(d).name for d in samples_dirs)
+    print(f"Training dirs : {dirs_label}  ({len(train_files)} meshes)")
+    print(f"Test mesh     : {test_file.name}")
 
-    param_names = ['E', 'nu', 'load']
-    n_cols = len(mesh_files)
-    fig, axes = plt.subplots(2, n_cols, figsize=(6 * n_cols, 8))
-    if n_cols == 1:
-        axes = axes[:, np.newaxis]
-    fig.suptitle('Ensemble: Mean Prediction vs Uncertainty',
-                 fontsize=13, fontweight='bold')
+    # ── Dataset & training ────────────────────────────────────────────────
+    ds, _, _ = _build_dataset(train_files, rng)
+    valid = ds.get_valid_samples()
+    if len(valid) < 3:
+        raise RuntimeError(f"Need ≥3 valid FEM samples, got {len(valid)}")
+    print(f"Training {n_ensemble}-member ensemble ({len(valid)} valid samples)…")
+    trainer, train_result = _train_ensemble(ds, n_ensemble=n_ensemble, epochs=epochs)
 
-    results = []
-    for col, mf in enumerate(mesh_files):
-        verts, elems, _ = read_mfem_mesh(str(mf))
-        rng = np.random.default_rng(hash(str(mf)) % 2**31)
-        params = {
-            'E':    float(rng.uniform(150e9, 250e9)),
-            'nu':   float(rng.uniform(0.25, 0.35)),
-            'load': float(rng.uniform(50e6, 150e6)),
-        }
-        mean_f, unc_f = predict_ensemble(trainer, verts, elems, params, param_names)
+    # ── Test mesh FEM + prediction ────────────────────────────────────────
+    test_params = {
+        "E":    float(rng.uniform(150e9, 250e9)),
+        "nu":   float(rng.uniform(0.25, 0.35)),
+        "load": float(rng.uniform(50e6, 150e6)),
+    }
+    vm_gt, verts, elems = _run_fem(str(test_file), test_params)
+    centers   = np.array([np.mean(verts[e], axis=0) for e in elems],
+                         dtype=np.float32)
+    param_arr = np.array([[test_params[k] for k in PARAM_NAMES]],
+                         dtype=np.float32)
 
-        pred_vmax = float(np.percentile(mean_f, 98))
-        unc_vmax  = float(np.percentile(unc_f, 98)) or 1e-10
+    mean_pred, unc = trainer.predict_with_uncertainty(param_arr, centers)
+    mean_pred = mean_pred.flatten()
+    unc       = unc.flatten() if unc is not None else np.zeros(len(centers))
 
-        c1 = plot_mesh_field(
-            axes[0, col], verts, elems, mean_f,
-            title=f"{mf.stem}\nMean prediction ({len(elems)} elems)",
-            cmap='jet', vmin=0, vmax=max(pred_vmax, 1e-10),
+    # Normalise uncertainty to [0, 1] for display
+    unc_norm = (unc - unc.min()) / (unc.max() - unc.min() + 1e-10)
+
+    # ── Surrogate evaluator ───────────────────────────────────────────────
+    evaluator = SurrogateEvaluator(trainer.model, PARAM_NAMES, PARAM_BOUNDS)
+    analysis  = evaluator.analyze_uncertainty(
+        centers, n_probe_samples=30,
+        uncertainty_threshold=float(np.mean(unc_norm))
+    )
+
+    # ── Acquisition scores ────────────────────────────────────────────────
+    N_CAND      = 50
+    candidates  = rng.uniform(
+        [150e9, 0.25, 50e6], [250e9, 0.35, 150e6], size=(N_CAND, 3)
+    ).astype(np.float32)
+    acq_result  = UncertaintySampling().select_batch(
+        candidates, trainer.model, centers, batch_size=5
+    )
+    scores      = acq_result.scores
+    # Normalise scores to [0, 1]
+    scores_norm = (scores - scores.min()) / (scores.max() - scores.min() + 1e-10)
+    sort_idx    = np.argsort(scores_norm)           # ascending for bar chart
+    top5_set    = set(acq_result.best_indices.tolist())
+
+    # ── Spatial error analysis ────────────────────────────────────────────
+    analyzer    = SpatialErrorAnalyzer(trainer.model, centers)
+    error_field = analyzer.compute_error_field(param_arr.flatten(), vm_gt)
+    # Normalise error field to [0, 1]
+    err_norm    = (error_field - error_field.min()) / (
+                   error_field.max() - error_field.min() + 1e-10)
+    hotspots    = analyzer.identify_hotspots(error_field, threshold_percentile=85)
+
+    # ── Training history ─────────────────────────────────────────────────
+    history     = train_result.history      # keys: train_loss, test_loss
+    train_loss  = history.get("train_loss", [])
+    test_loss   = history.get("test_loss",  [])
+    epochs_ax   = np.arange(1, len(train_loss) + 1)
+
+    # ── Figure layout (2 rows × 3 cols) ──────────────────────────────────
+    fig = plt.figure(figsize=(20, 11))
+    gs  = gridspec.GridSpec(
+        2, 3,
+        figure=fig,
+        hspace=0.42, wspace=0.35,
+        left=0.06, right=0.97, top=0.91, bottom=0.08,
+    )
+    ax_mean = fig.add_subplot(gs[0, 0])
+    ax_unc  = fig.add_subplot(gs[0, 1])
+    ax_err  = fig.add_subplot(gs[0, 2])
+    ax_acq  = fig.add_subplot(gs[1, 0:2])   # acquisition spans 2 cols
+    ax_conv = fig.add_subplot(gs[1, 2])
+
+    fig.suptitle(
+        f"PIANO SciML Loop  ·  test: {test_file.stem}  ·  "
+        f"training: {dirs_label}  ({len(valid)} samples, {len(epochs_ax)} epochs)",
+        fontsize=11, fontweight="bold",
+    )
+
+    # ── Helper: plot a 2-D mesh field ─────────────────────────────────────
+    def _mesh_field(ax, field, title, cmap, vmin=0.0, vmax=1.0):
+        polys = [verts[e] for e in elems]
+        v0 = float(field.min()) if vmin is None else vmin
+        v1 = max(float(field.max()), v0 + 1e-10) if vmax is None else vmax
+        pc = PolyCollection(
+            polys, array=field, cmap=cmap,
+            norm=mcolors.Normalize(vmin=v0, vmax=v1),
+            edgecolors="k", linewidths=0.15,
         )
-        fig.colorbar(c1, ax=axes[0, col], shrink=0.8).set_label('Mean', fontsize=8)
+        ax.add_collection(pc)
+        ax.set_xlim(verts[:, 0].min() - .04, verts[:, 0].max() + .04)
+        ax.set_ylim(verts[:, 1].min() - .04, verts[:, 1].max() + .04)
+        ax.set_aspect("equal")
+        ax.set_title(title, fontsize=9, fontweight="bold")
+        ax.set_xlabel("x", fontsize=8); ax.set_ylabel("y", fontsize=8)
+        ax.tick_params(labelsize=7)
+        return pc
 
-        c2 = plot_mesh_field(
-            axes[1, col], verts, elems, unc_f,
-            title=f"Uncertainty — mean={np.mean(unc_f):.3f}",
-            cmap='hot_r', vmin=0, vmax=unc_vmax,
+    # ① Ensemble mean (normalised to [0,1] for clean colour display)
+    mean_norm = (mean_pred - mean_pred.min()) / (
+                 mean_pred.max() - mean_pred.min() + 1e-10)
+    c1 = _mesh_field(ax_mean, mean_norm,
+                     f"① Ensemble Mean\n({len(elems)} elems  ·  "
+                     f"peak={mean_pred.max():.2e} Pa)",
+                     "jet")
+    cb1 = fig.colorbar(c1, ax=ax_mean, shrink=0.85)
+    cb1.set_label("Norm. Von Mises", fontsize=8)
+    cb1.ax.tick_params(labelsize=7)
+    ax_mean.text(0.02, 0.02,
+                 f"E={test_params['E']/1e9:.0f} GPa\n"
+                 f"ν={test_params['nu']:.3f}\n"
+                 f"load={test_params['load']/1e6:.0f} MPa",
+                 transform=ax_mean.transAxes, fontsize=7, va="bottom",
+                 bbox=dict(boxstyle="round", facecolor="lightcyan", alpha=0.85))
+
+    # ② Uncertainty (normalised)
+    c2 = _mesh_field(ax_unc, unc_norm,
+                     f"② Ensemble Uncertainty\n"
+                     f"(weak regions: {len(analysis.weak_regions)})",
+                     "hot_r")
+    cb2 = fig.colorbar(c2, ax=ax_unc, shrink=0.85)
+    cb2.set_label("Norm. Std", fontsize=8)
+    cb2.ax.tick_params(labelsize=7)
+    ax_unc.text(0.02, 0.02,
+                f"mean={np.mean(unc_norm):.3f}\nmax={unc_norm.max():.3f}",
+                transform=ax_unc.transAxes, fontsize=7, va="bottom",
+                bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.85))
+
+    # ③ Error field (normalised) + hotspot markers
+    c3 = _mesh_field(ax_err, err_norm,
+                     f"③ Error Field\n({len(hotspots)} hotspots at 85th pct)",
+                     "Reds")
+    cb3 = fig.colorbar(c3, ax=ax_err, shrink=0.85)
+    cb3.set_label("Norm. |pred − GT|", fontsize=8)
+    cb3.ax.tick_params(labelsize=7)
+    for hs in hotspots[:6]:
+        ax_err.plot(hs.center[0], hs.center[1], "b+", ms=9, mew=1.8, zorder=5)
+    ax_err.text(0.02, 0.02,
+                f"mean={np.mean(err_norm):.3f}\nmax={err_norm.max():.3f}",
+                transform=ax_err.transAxes, fontsize=7, va="bottom",
+                bbox=dict(boxstyle="round", facecolor="lightsalmon", alpha=0.85))
+
+    # ④ Acquisition scores — sorted bar chart (low → high left → right)
+    bar_colors = [
+        "#d62728" if sort_idx[i] in top5_set else "#aec7e8"
+        for i in range(len(sort_idx))
+    ]
+    ax_acq.bar(np.arange(N_CAND), scores_norm[sort_idx],
+               color=bar_colors, width=0.85, zorder=2)
+    ax_acq.axhline(scores_norm[sort_idx[-5]], color="#d62728",
+                   ls="--", lw=1.2, label="top-5 threshold")
+    ax_acq.set_xlabel("Candidate index (sorted by score)", fontsize=9)
+    ax_acq.set_ylabel("Normalised acquisition score", fontsize=9)
+    ax_acq.set_title("④ Acquisition Scores  (UncertaintySampling, 50 candidates)",
+                     fontsize=9, fontweight="bold")
+    ax_acq.tick_params(labelsize=8)
+    ax_acq.set_xlim(-0.5, N_CAND - 0.5)
+    ax_acq.set_ylim(0, 1.08)
+    ax_acq.grid(axis="y", alpha=0.3, zorder=1)
+    ax_acq.legend(fontsize=8)
+    # Annotate top-5 bars with E / ν values
+    for rank, raw_idx in enumerate(sort_idx[-5:]):
+        bar_x = list(sort_idx).index(raw_idx)   # position in sorted chart
+        ax_acq.text(
+            bar_x, scores_norm[raw_idx] + 0.02,
+            f"E={candidates[raw_idx,0]/1e9:.0f}\nν={candidates[raw_idx,1]:.2f}",
+            ha="center", va="bottom", fontsize=6.5, color="#d62728",
         )
-        fig.colorbar(c2, ax=axes[1, col], shrink=0.8).set_label('Std', fontsize=8)
 
-        results.append({
-            'mesh':            mf.stem,
-            'mean_prediction': float(np.mean(mean_f)),
-            'mean_uncertainty': float(np.mean(unc_f)),
-            'max_uncertainty': float(np.max(unc_f)),
-        })
+    # ⑤ Training convergence
+    if len(train_loss) > 0:
+        ax_conv.semilogy(epochs_ax, train_loss, lw=1.8,
+                         color="#1f77b4", label="Train loss")
+    if len(test_loss) > 0:
+        ax_conv.semilogy(epochs_ax, test_loss,  lw=1.8,
+                         color="#ff7f0e", ls="--", label="Test loss")
+    ax_conv.set_xlabel("Epoch", fontsize=9)
+    ax_conv.set_ylabel("MSE loss (log scale)", fontsize=9)
+    ax_conv.set_title("⑤ Training Convergence", fontsize=9, fontweight="bold")
+    ax_conv.tick_params(labelsize=8)
+    ax_conv.legend(fontsize=8)
+    ax_conv.grid(alpha=0.3)
+    if len(train_loss) > 0:
+        ax_conv.text(0.97, 0.97,
+                     f"final train: {train_loss[-1]:.4f}\n"
+                     f"final test : {test_loss[-1]:.4f}" if test_loss else
+                     f"final train: {train_loss[-1]:.4f}",
+                     transform=ax_conv.transAxes, fontsize=7.5,
+                     ha="right", va="top",
+                     bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
 
-    plt.tight_layout()
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    plt.savefig(output_file, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"Saved: {output_file}")
-    return results
+    print(f"Saved → {output_file}")
+    print(f"\nSummary:")
+    print(f"  Weak regions  : {len(analysis.weak_regions)}")
+    print(f"  Error hotspots: {len(hotspots)}")
+    print(f"  Top-5 acq idx : {acq_result.best_indices.tolist()}")
+    if train_loss:
+        print(f"  Final train / test loss: "
+              f"{train_loss[-1]:.4f} / {test_loss[-1] if test_loss else 'n/a':.4f}")
 
-
-# =============================================================================
-# Main
-# =============================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Ensemble uncertainty-driven SciML loop visualization"
+        description="PIANO SciML pipeline — uncertainty-driven visualization"
     )
-    parser.add_argument("--sample",      type=int, default=0,
-                        help="Sample index to visualize (from first samples-dir)")
-    parser.add_argument("--output",      type=str, default=None,
-                        help="Output PNG path")
+    parser.add_argument("--sample",       type=int, default=0,
+                        help="Test mesh index (from first samples-dir)")
     parser.add_argument("--samples-dirs", type=str, nargs="+", default=None,
-                        help="One or more mesh sample directories (e.g. train01 train02)")
-    parser.add_argument("--model-dir",   type=str, default=None,
-                        help="Trained ensemble model directory")
-    parser.add_argument("--compare",     action="store_true",
-                        help="Compare uncertainty across multiple samples")
-    parser.add_argument("--no-gt",       action="store_true",
-                        help="Skip optional GT fine-mesh FEM panel")
-    parser.add_argument("--epochs",      type=int, default=500,
-                        help="Training epochs for on-the-fly ensemble")
+                        help="Training mesh dirs — pass multiple to combine datasets "
+                             "(e.g. train_fine train01 train02)")
+    parser.add_argument("--output",       type=str, default=None,
+                        help="Output PNG path")
+    parser.add_argument("--n-train",      type=int, default=8,
+                        help="Max training meshes to use")
+    parser.add_argument("--epochs",       type=int, default=80,
+                        help="Ensemble training epochs")
     args = parser.parse_args()
 
-    project_root = Path(__file__).parent.parent
-    samples_dirs = args.samples_dirs or [
-        str(project_root / "train01"),
-        str(project_root / "train02"),
-    ]
-    model_dir  = args.model_dir or str(project_root / "outputs" / "surrogate")
-    output_dir = project_root / "tests" / "test_outputs"
-    output_dir.mkdir(exist_ok=True)
+    # Default: train_fine if available, else fall back to train01 + train02
+    default_dirs = ([str(TRAIN_FINE)] if TRAIN_FINE.exists()
+                    else [str(TRAIN01), str(TRAIN02)])
+    dirs       = args.samples_dirs or default_dirs
+    output_dir = PROJECT_ROOT / "tests" / "test_outputs"
+    out        = args.output or str(output_dir / "sciml_loop.png")
 
-    if args.compare:
-        out = args.output or str(output_dir / "ensemble_comparison.png")
-        results = compare_multiple_uncertainty(samples_dirs, model_dir, out)
-        print("\nComparison Results:")
-        for r in results:
-            print(f"  {r['mesh']}: mean_unc={r['mean_uncertainty']:.4f}  "
-                  f"max_unc={r['max_uncertainty']:.4f}")
-    else:
-        mesh_files = []
-        for d in samples_dirs:
-            mesh_files.extend(sorted(Path(d).glob("sample_*.mesh")))
-        if not mesh_files:
-            print(f"No mesh files found in {samples_dirs}")
-            sys.exit(1)
+    try:
+        import mfem.ser  # noqa: F401
+    except ImportError:
+        print("mfem not available — visualization requires MFEM. "
+              "Run pytest for pure-Python tests.")
+        sys.exit(0)
 
-        idx = min(args.sample, len(mesh_files) - 1)
-        mf  = str(mesh_files[idx])
-        out = args.output or str(output_dir / f"uncertainty_loop_{idx:03d}.png")
-
-        results = visualize_uncertainty_loop(
-            mf, model_dir, out,
-            samples_dirs=samples_dirs,
-            show_gt=not args.no_gt,
-            epochs=args.epochs,
-        )
-        print("\nResults:")
-        for k, v in results.items():
-            if isinstance(v, float):
-                print(f"  {k}: {v:.4f}")
-            else:
-                print(f"  {k}: {v}")
-
-
-# =============================================================================
-# Pytest Integration
-# =============================================================================
-
-class TestTransolver:
-    """Pytest tests for ensemble uncertainty pipeline."""
-
-    def _samples_dir(self):
-        return Path(__file__).parent.parent / "samples"
-
-    def _model_dir(self):
-        return Path(__file__).parent.parent / "outputs" / "surrogate"
-
-    def test_mesh_loading(self):
-        """Mesh files in samples/ are readable."""
-        mesh_files = sorted(self._samples_dir().glob("sample_*.mesh"))
-        if not mesh_files:
-            import pytest; pytest.skip("No sample meshes found")
-
-        verts, elems, bdr = read_mfem_mesh(str(mesh_files[0]))
-        assert len(verts) > 0
-        assert len(elems) > 0
-        assert verts.shape[1] == 2
-
-    def test_ensemble_uncertainty(self):
-        """Ensemble produces non-trivial uncertainty on sample mesh."""
-        import pytest
-        pytest.importorskip("torch", reason="torch not installed")
-
-        mesh_files = sorted(self._samples_dir().glob("sample_*.mesh"))
-        if not mesh_files:
-            pytest.skip("No sample meshes found")
-
-        output_dir = Path(__file__).parent / "test_outputs"
-        output_dir.mkdir(exist_ok=True)
-        model_dir = str(self._model_dir())
-
-        try:
-            model, _ = load_ensemble_model(model_dir)
-        except FileNotFoundError:
-            model = train_fast_ensemble(
-                str(self._samples_dir()),
-                n_train=10, n_ensemble=3, epochs=30,
-                save_dir=model_dir,
-            )
-
-        verts, elems, _ = read_mfem_mesh(str(mesh_files[0]))
-        params = {'E': 200e9, 'nu': 0.3, 'load': 100e6}
-        mean_f, unc_f = predict_ensemble(
-            model, verts, elems, params, ['E', 'nu', 'load']
-        )
-
-        assert mean_f.shape == (len(elems),)
-        assert unc_f.shape  == (len(elems),)
-        # Uncertainty must be non-negative; at least some non-zero values expected
-        assert np.all(unc_f >= 0)
-
-    def test_visualization(self):
-        """5-panel uncertainty loop PNG is created without error."""
-        import pytest
-        pytest.importorskip("torch", reason="torch not installed")
-
-        mesh_files = sorted(self._samples_dir().glob("sample_*.mesh"))
-        if not mesh_files:
-            pytest.skip("No sample meshes found")
-
-        output_dir = Path(__file__).parent / "test_outputs"
-        output_dir.mkdir(exist_ok=True)
-        out = str(output_dir / "uncertainty_loop_test.png")
-
-        results = visualize_uncertainty_loop(
-            str(mesh_files[0]),
-            str(self._model_dir()),
-            out,
-            samples_dir=str(self._samples_dir()),
-            show_gt=True,
-            n_train=10,
-            n_ensemble=3,
-            epochs=30,
-        )
-
-        assert Path(out).exists(), "PNG not created"
-        assert results['mean_uncertainty_coarse'] >= 0
-        assert results['coarse_elements'] > 0
-        print(f"  mean_unc_coarse={results['mean_uncertainty_coarse']:.4f}  "
-              f"r_adapted={results['r_adapted']}  "
-              f"gt_available={results['gt_available']}")
+    run_visualization(
+        samples_dirs=dirs,
+        sample_idx=args.sample,
+        output_file=out,
+        n_train=args.n_train,
+        epochs=args.epochs,
+    )

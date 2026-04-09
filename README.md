@@ -51,6 +51,21 @@ The surrogate improves along two independent axes simultaneously:
 
 ---
 
+## Example Output
+
+![PIANO SciML Loop](tests/test_outputs/sciml_loop.png)
+
+**Top row — plate-with-hole domain** (trained on 20 fine-mesh FEM samples):
+- **① Ensemble Mean** — normalised von Mises prediction over the test mesh (782 triangle elements with local hole refinement)
+- **② Uncertainty** — ensemble std; high values near the hole boundary identify where the model is least confident and adaptation is needed
+- **③ Error Field** — absolute prediction error vs PyMFEM ground truth; blue `+` markers show the 8 spatial hotspots where the surrogate makes the largest errors
+
+**Bottom row — active learning analytics:**
+- **④ Acquisition Scores** — 50 candidate parameter sets sorted by `UncertaintySampling` score; red bars (top-5) are the next FEM simulations the orchestrator would request
+- **⑤ Training Convergence** — MSE loss vs epoch (log scale); the train/test gap reflects the small sample count (20 meshes) — adding more samples from `train_fine/` closes this gap
+
+---
+
 ## Key Features
 
 - **Transolver surrogate** — Physics-Attention (slice-attention) neural operator; reduces O(N²) attention to O(S² + NS) for unstructured meshes
