@@ -113,6 +113,18 @@ class PhysicsAttention(nn.Module):
         return out
 
 
+def get_activation(name: str) -> nn.Module:
+    """Get activation function by name."""
+    activations = {
+        "gelu": nn.GELU(),
+        "relu": nn.ReLU(),
+        "silu": nn.SiLU(),
+    }
+    if name.lower() not in activations:
+        raise ValueError(f"Unknown activation: {name}. Choose from {list(activations.keys())}")
+    return activations[name.lower()]
+
+
 class TransolverBlock(nn.Module):
     """Single Transolver block: PhysicsAttention + FFN with residual connections."""
 
@@ -122,7 +134,8 @@ class TransolverBlock(nn.Module):
         n_heads: int,
         slice_num: int,
         mlp_ratio: float = 4.0,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        activation: str = "gelu"
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
@@ -132,7 +145,7 @@ class TransolverBlock(nn.Module):
         mlp_hidden = int(d_model * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, mlp_hidden),
-            nn.GELU(),
+            get_activation(activation),
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden, d_model),
             nn.Dropout(dropout),
@@ -192,7 +205,8 @@ class TransolverModel(SurrogateModel, nn.Module):
                 cfg.n_heads,
                 cfg.slice_num,
                 cfg.mlp_ratio,
-                cfg.dropout
+                cfg.dropout,
+                cfg.activation
             )
             for _ in range(cfg.n_layers)
         ])

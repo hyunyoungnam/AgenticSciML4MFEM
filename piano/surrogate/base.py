@@ -38,6 +38,9 @@ class TransolverConfig:
         patience: Early stopping patience
         output_dim: Dimension of output field (e.g., 3 for displacement)
         checkpoint_dir: Directory for saving checkpoints
+        optimizer_type: Optimizer type ('adamw', 'adam', 'sgd')
+        scheduler_type: LR scheduler type ('plateau', 'cosine', 'none')
+        activation: Activation function ('gelu', 'relu', 'silu')
     """
     slice_num: int = 32
     n_heads: int = 8
@@ -55,6 +58,9 @@ class TransolverConfig:
     pino_eq_weight: float = 0.1
     pino_E: float = 1.0   # Dimensionless: trainer normalizes outputs, physical E cancels
     pino_nu: float = 0.3
+    optimizer_type: str = "adamw"
+    scheduler_type: str = "plateau"
+    activation: str = "gelu"
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
@@ -75,6 +81,9 @@ class TransolverConfig:
             "pino_eq_weight": self.pino_eq_weight,
             "pino_E": self.pino_E,
             "pino_nu": self.pino_nu,
+            "optimizer_type": self.optimizer_type,
+            "scheduler_type": self.scheduler_type,
+            "activation": self.activation,
         }
 
 

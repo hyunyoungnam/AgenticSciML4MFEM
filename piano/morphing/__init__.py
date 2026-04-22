@@ -1,8 +1,10 @@
 """
 Morphing package — geometry deformation utilities.
 
-R-adaptivity and h-refinement have been removed in favour of the
-PINO (Physics-Informed Neural Operator) loss in the surrogate trainer.
+This package previously contained mesh refinement (AMR/TMOP) capabilities.
+These have been removed. The project now focuses on agentic hyperparameter
+optimization (optimizer, NN architecture, training params) rather than
+mesh refinement strategies.
 """
 
 __all__: list = []

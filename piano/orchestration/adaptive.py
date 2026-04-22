@@ -43,6 +43,11 @@ from ..surrogate.acquisition import (
     AcquisitionType,
     get_acquisition_function,
 )
+from ..surrogate.agentic_trainer import (
+    AgenticSurrogateTrainer,
+    AgenticTrainingConfig,
+    AgenticTrainingResult,
+)
 from .metrics import ActiveLearningMetrics, ConvergenceMonitor
 
 logger = logging.getLogger(__name__)
@@ -77,6 +82,9 @@ class AdaptiveConfig:
         n_ensemble: Number of ensemble models for uncertainty
         physics_config: Optional physics configuration for simulations
         acquisition_strategy: Acquisition function ("uncertainty", "ei", "qbc")
+        use_agentic_hpo: Whether to use LLM-based hyperparameter optimization
+        max_hpo_rounds: Maximum HPO rounds per training session
+        llm_model: LLM model for HPO agents
     """
     base_mesh_path: Path
     output_dir: Path
@@ -91,6 +99,9 @@ class AdaptiveConfig:
     physics_config: Optional[PhysicsConfig] = None
     acquisition_strategy: str = "uncertainty"
     random_seed: int = 42
+    use_agentic_hpo: bool = False
+    max_hpo_rounds: int = 3
+    llm_model: str = "gpt-4-turbo"
 
     # Derived at runtime
     @property
@@ -170,14 +181,16 @@ class AdaptiveOrchestrator:
     resources on regions where the model is weak.
     """
 
-    def __init__(self, config: AdaptiveConfig):
+    def __init__(self, config: AdaptiveConfig, llm_provider: Optional[Any] = None):
         """
         Initialize orchestrator.
 
         Args:
             config: Adaptive learning configuration
+            llm_provider: LLM provider for agentic HPO (optional)
         """
         self.config = config
+        self.llm_provider = llm_provider
         self.dataset: Optional[FEMDataset] = None
         self.surrogate: Optional[SurrogateModel] = None
         self.trainer: Optional[SurrogateTrainer] = None
@@ -676,19 +689,6 @@ class AdaptiveOrchestrator:
 
     def _train_surrogate(self) -> TrainingResult:
         """Train surrogate model on current dataset."""
-        training_config = TrainingConfig(
-            surrogate_config=self.config.surrogate_config,
-            use_ensemble=self.config.n_ensemble > 1,
-            n_ensemble=self.config.n_ensemble,
-            normalize_inputs=True,
-            normalize_outputs=True,
-            train_test_split=0.2,
-            random_seed=self.config.random_seed,
-            save_dir=self.surrogate_dir,
-        )
-
-        self.trainer = SurrogateTrainer(training_config)
-
         try:
             parameters, coordinates_list, outputs_list = self.dataset.prepare_training_data(
                 output_field="displacement",
@@ -702,12 +702,77 @@ class AdaptiveOrchestrator:
         base_manager = MFEMManager(str(self.config.base_mesh_path))
         self._coordinates = base_manager.get_nodes()
 
+        if self.config.use_agentic_hpo:
+            return self._train_with_agentic_hpo(parameters, coordinates_list, outputs_list)
+        else:
+            return self._train_standard(parameters, coordinates_list, outputs_list)
+
+    def _train_standard(
+        self,
+        parameters: np.ndarray,
+        coordinates_list: List[np.ndarray],
+        outputs_list: List[np.ndarray],
+    ) -> TrainingResult:
+        """Standard training without agentic HPO."""
+        training_config = TrainingConfig(
+            surrogate_config=self.config.surrogate_config,
+            use_ensemble=self.config.n_ensemble > 1,
+            n_ensemble=self.config.n_ensemble,
+            normalize_inputs=True,
+            normalize_outputs=True,
+            train_test_split=0.2,
+            random_seed=self.config.random_seed,
+            save_dir=self.surrogate_dir,
+        )
+
+        self.trainer = SurrogateTrainer(training_config)
         result = self.trainer.train(parameters, coordinates_list, outputs_list)
 
         if result.success:
             self.surrogate = self.trainer.model
 
         return result
+
+    def _train_with_agentic_hpo(
+        self,
+        parameters: np.ndarray,
+        coordinates_list: List[np.ndarray],
+        outputs_list: List[np.ndarray],
+    ) -> TrainingResult:
+        """Training with LLM-based hyperparameter optimization."""
+        logger.info("Using agentic HPO for surrogate training")
+
+        agentic_config = AgenticTrainingConfig(
+            base_config=self.config.surrogate_config,
+            max_hpo_rounds=self.config.max_hpo_rounds,
+            trigger_threshold=self.config.convergence_threshold,
+            use_ensemble=self.config.n_ensemble > 1,
+            n_ensemble=self.config.n_ensemble,
+            llm_model=self.config.llm_model,
+            random_seed=self.config.random_seed,
+        )
+
+        agentic_trainer = AgenticSurrogateTrainer(
+            config=agentic_config,
+            llm_provider=self.llm_provider,
+        )
+
+        agentic_result = agentic_trainer.train(
+            parameters, coordinates_list, outputs_list
+        )
+
+        if agentic_result.success and agentic_result.final_result:
+            self.surrogate = agentic_trainer.model
+            logger.info(
+                f"Agentic HPO complete: {agentic_result.n_hpo_rounds} rounds, "
+                f"{agentic_result.improvement_percent:.1f}% improvement"
+            )
+            return agentic_result.final_result
+        else:
+            return TrainingResult(
+                success=False,
+                error_message=agentic_result.error_message or "Agentic training failed",
+            )
 
     def _evaluate_surrogate(self) -> UncertaintyAnalysis:
         """Evaluate surrogate model and identify weak regions using ensemble uncertainty."""

@@ -23,6 +23,8 @@ class AgentRole(Enum):
     RESULT_ANALYST = "result_analyst"
     RETRIEVER = "retriever"
     SELECTOR = "selector"
+    HYPERPARAMETER_CRITIC = "hyperparameter_critic"
+    ARCHITECT = "architect"
 
 
 class MessageType(Enum):

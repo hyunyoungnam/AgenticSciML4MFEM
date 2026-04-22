@@ -17,6 +17,11 @@ from .transolver import TransolverModel, PhysicsAttention
 from .ensemble import EnsembleModel
 from .trainer import SurrogateTrainer, TrainingConfig, TrainingResult
 from .evaluator import SurrogateEvaluator, WeakRegion, UncertaintyAnalysis
+from .agentic_trainer import (
+    AgenticSurrogateTrainer,
+    AgenticTrainingConfig,
+    AgenticTrainingResult,
+)
 
 __all__ = [
     # Base
@@ -34,6 +39,10 @@ __all__ = [
     "SurrogateTrainer",
     "TrainingConfig",
     "TrainingResult",
+    # Agentic Training
+    "AgenticSurrogateTrainer",
+    "AgenticTrainingConfig",
+    "AgenticTrainingResult",
     # Evaluation
     "SurrogateEvaluator",
     "WeakRegion",

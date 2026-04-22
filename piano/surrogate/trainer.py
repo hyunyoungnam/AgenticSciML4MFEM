@@ -19,6 +19,42 @@ from .ensemble import EnsembleModel
 from .pino_loss import PINOElasticityLoss
 
 
+def create_optimizer(model: nn.Module, config: TransolverConfig) -> torch.optim.Optimizer:
+    """Create optimizer based on config."""
+    opt_type = config.optimizer_type.lower()
+    lr = config.learning_rate
+
+    if opt_type == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=lr)
+    elif opt_type == "adam":
+        return torch.optim.Adam(model.parameters(), lr=lr)
+    elif opt_type == "sgd":
+        return torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    else:
+        raise ValueError(f"Unknown optimizer: {opt_type}. Choose from ['adamw', 'adam', 'sgd']")
+
+
+def create_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: TransolverConfig
+) -> Optional[torch.optim.lr_scheduler.LRScheduler]:
+    """Create LR scheduler based on config."""
+    sched_type = config.scheduler_type.lower()
+
+    if sched_type == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=20
+        )
+    elif sched_type == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.epochs, eta_min=1e-6
+        )
+    elif sched_type == "none":
+        return None
+    else:
+        raise ValueError(f"Unknown scheduler: {sched_type}. Choose from ['plateau', 'cosine', 'none']")
+
+
 @dataclass
 class TrainingConfig:
     """
@@ -229,13 +265,8 @@ class SurrogateTrainer:
             model.to(device)
 
             batch_size = self.config.surrogate_config.batch_size
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=self.config.surrogate_config.learning_rate,
-            )
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=20
-            )
+            optimizer = create_optimizer(model, self.config.surrogate_config)
+            scheduler = create_scheduler(optimizer, self.config.surrogate_config)
             criterion = nn.MSELoss()
 
             cfg = self.config.surrogate_config
@@ -323,7 +354,12 @@ class SurrogateTrainer:
                 history['test_loss'].append(test_loss)
                 history['pino_loss'].append(epoch_pino_loss / n_train)
 
-                scheduler.step(test_loss)
+                # Step scheduler (handle different scheduler types)
+                if scheduler is not None:
+                    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        scheduler.step(test_loss)
+                    else:
+                        scheduler.step()
 
                 if test_loss < best_test_loss:
                     best_test_loss = test_loss

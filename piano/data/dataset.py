@@ -218,7 +218,7 @@ class FEMDataset:
         Prepare data for surrogate model training.
 
         Each sample carries its own coordinate array so samples solved on
-        different meshes (e.g. after r-adaptivity) can coexist in the dataset.
+        different meshes (e.g. different geometries) can coexist in the dataset.
 
         Args:
             output_field: Which output field to use as target

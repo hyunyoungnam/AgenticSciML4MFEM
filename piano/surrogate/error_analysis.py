@@ -2,8 +2,8 @@
 Spatial error analysis for surrogate models.
 
 Provides tools to analyze WHERE in the domain the surrogate model
-has high errors, enabling targeted mesh refinement and intelligent
-sampling strategies.
+has high errors, enabling intelligent sampling strategies and
+informing hyperparameter tuning decisions.
 """
 
 from dataclasses import dataclass, field
@@ -59,9 +59,9 @@ class SpatialErrorAnalyzer:
 
     Identifies regions in the physical domain where the surrogate
     has high prediction error, which can inform:
-    1. Mesh refinement strategies
+    1. Active learning sampling strategies
     2. Feature engineering for better spatial representation
-    3. Understanding of model limitations
+    3. Hyperparameter tuning decisions
     """
 
     def __init__(
