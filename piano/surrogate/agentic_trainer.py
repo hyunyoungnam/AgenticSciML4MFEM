@@ -2,8 +2,10 @@
 Agentic Surrogate Trainer.
 
 Wraps SurrogateTrainer with LLM-based hyperparameter optimization.
-Uses HyperparameterCriticAgent and ArchitectAgent to adaptively
-tune model configuration based on training feedback.
+Uses a 3-agent system:
+- HyperparameterCriticAgent: Diagnoses training issues
+- ArchitectAgent: Proposes architecture/optimizer changes
+- PhysicistAgent: Proposes physics loss configuration changes
 """
 
 import logging
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
         TrainingIssue,
     )
     from piano.agents.roles.architect import ArchitectAgent, ArchitectureProposal
+    from piano.agents.roles.physicist import PhysicistAgent, PhysicsProposal
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +44,9 @@ class AgenticTrainingConfig:
         n_ensemble: Number of ensemble members
         llm_model: LLM model for agents
         random_seed: Random seed
+        use_physicist: Whether to use PhysicistAgent for physics loss tuning
+        problem_type: Type of physics problem (crack, plate, thermal, etc.)
+        has_singularity: Whether the problem has stress singularities
     """
     base_config: TransolverConfig = field(default_factory=TransolverConfig)
     max_hpo_rounds: int = 3
@@ -49,6 +55,9 @@ class AgenticTrainingConfig:
     n_ensemble: int = 5
     llm_model: str = "gpt-4-turbo"
     random_seed: int = 42
+    use_physicist: bool = True
+    problem_type: str = "crack"
+    has_singularity: bool = True
 
 
 @dataclass
@@ -77,15 +86,16 @@ class AgenticSurrogateTrainer:
     """
     Agentic wrapper for SurrogateTrainer.
 
-    Implements adaptive hyperparameter optimization using LLM agents:
+    Implements adaptive hyperparameter optimization using a 3-agent system:
     1. Train with initial config
-    2. Analyze training results with CriticAgent
-    3. If issues detected, propose new config with ArchitectAgent
-    4. Retrain and repeat up to max_hpo_rounds
+    2. CriticAgent analyzes training results and diagnoses issues
+    3. If architecture issues: ArchitectAgent proposes model/optimizer changes
+    4. If physics issues: PhysicistAgent proposes physics loss changes
+    5. Merge proposals and retrain, repeat up to max_hpo_rounds
 
     Features:
+    - Separation of concerns: Architecture vs Physics tuning
     - Adaptive trigger: Only invoke agents when needed
-    - Heuristic fallback: Works without LLM if needed
     - History tracking: Learns from previous attempts
     """
 
@@ -107,14 +117,17 @@ class AgenticSurrogateTrainer:
         # Lazy import agents to avoid circular imports
         from piano.agents.roles.hyperparameter_critic import HyperparameterCriticAgent
         from piano.agents.roles.architect import ArchitectAgent
+        from piano.agents.roles.physicist import PhysicistAgent
 
         # Initialize agents
         self.critic = HyperparameterCriticAgent(model=config.llm_model)
         self.architect = ArchitectAgent(model=config.llm_model)
+        self.physicist = PhysicistAgent(model=config.llm_model)
 
         if llm_provider:
             self.critic.set_llm_provider(llm_provider)
             self.architect.set_llm_provider(llm_provider)
+            self.physicist.set_llm_provider(llm_provider)
 
         # State
         self._current_config = config.base_config
@@ -322,7 +335,7 @@ class AgenticSurrogateTrainer:
         # Run async agents synchronously
         loop = asyncio.new_event_loop()
         try:
-            # Get critique
+            # Get critique from CriticAgent
             critique = loop.run_until_complete(
                 self.critic.analyze_training(
                     context=context,
@@ -337,8 +350,8 @@ class AgenticSurrogateTrainer:
 
             logger.info(f"Critic diagnosis: {critique.primary_issue.name} ({critique.severity})")
 
-            # Get architecture proposal
-            proposal = loop.run_until_complete(
+            # Get architecture proposal from ArchitectAgent
+            arch_proposal = loop.run_until_complete(
                 self.architect.propose_config(
                     context=context,
                     current_config=self._current_config,
@@ -348,13 +361,76 @@ class AgenticSurrogateTrainer:
                 )
             )
 
-            logger.info(f"Architect proposal: {proposal.changes}")
-            logger.info(f"Reasoning: {proposal.reasoning[:200]}...")
+            logger.info(f"Architect proposal: {arch_proposal.changes}")
 
-            return proposal.config
+            # Get physics proposal from PhysicistAgent (if enabled)
+            physics_changes = {}
+            if self.config.use_physicist:
+                physics_proposal = loop.run_until_complete(
+                    self.physicist.propose_physics_config(
+                        context=context,
+                        current_config=self._current_config.to_dict(),
+                        critique=critique,
+                        training_history=history,
+                        dataset_size=dataset_size,
+                        problem_type=self.config.problem_type,
+                        has_singularity=self.config.has_singularity,
+                        previous_configs=self._config_history,
+                    )
+                )
+                physics_changes = physics_proposal.changes
+                logger.info(f"Physicist proposal: {physics_changes}")
+                if physics_proposal.physics_diagnosis:
+                    logger.info(f"Physics diagnosis: {physics_proposal.physics_diagnosis[:200]}...")
+
+            # Merge proposals: architecture + physics
+            merged_config = self._merge_proposals(
+                arch_proposal.config,
+                physics_changes,
+            )
+
+            return merged_config
 
         finally:
             loop.close()
+
+    def _merge_proposals(
+        self,
+        arch_config: TransolverConfig,
+        physics_changes: Dict[str, Any],
+    ) -> TransolverConfig:
+        """
+        Merge architecture and physics proposals into a single config.
+
+        Physics changes override architecture config for physics-related params.
+        """
+        config_dict = arch_config.to_dict()
+
+        # Apply physics changes (pino_* params)
+        for key, value in physics_changes.items():
+            if key.startswith("pino"):
+                config_dict[key] = value
+
+        return TransolverConfig(
+            slice_num=config_dict.get('slice_num', 32),
+            n_heads=config_dict.get('n_heads', 8),
+            d_model=config_dict.get('d_model', 256),
+            n_layers=config_dict.get('n_layers', 6),
+            mlp_ratio=config_dict.get('mlp_ratio', 4.0),
+            dropout=config_dict.get('dropout', 0.0),
+            learning_rate=config_dict.get('learning_rate', 1e-3),
+            batch_size=config_dict.get('batch_size', 32),
+            epochs=config_dict.get('epochs', 1000),
+            patience=config_dict.get('patience', 100),
+            output_dim=config_dict.get('output_dim', 3),
+            pino_weight=config_dict.get('pino_weight', 0.1),
+            pino_eq_weight=config_dict.get('pino_eq_weight', 0.1),
+            pino_E=config_dict.get('pino_E', 1.0),
+            pino_nu=config_dict.get('pino_nu', 0.3),
+            optimizer_type=config_dict.get('optimizer_type', 'adamw'),
+            scheduler_type=config_dict.get('scheduler_type', 'plateau'),
+            activation=config_dict.get('activation', 'gelu'),
+        )
 
     def _record_attempt(self, result: TrainingResult, status: str) -> None:
         """Record an HPO attempt."""

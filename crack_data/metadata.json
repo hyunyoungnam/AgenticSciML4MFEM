@@ -1,0 +1,162 @@
+[
+  {
+    "n_vertices": 919,
+    "n_elements": 1678,
+    "crack_length": 0.432186814566789,
+    "crack_type": "edge",
+    "tip_positions": [
+      [
+        0.43196550990708116,
+        0.5578905950060916
+      ]
+    ],
+    "mesh_file": "crack_data\\crack_000.mesh",
+    "sample_id": 0,
+    "crack_angle": -1.8336468074384307,
+    "crack_y": 0.5717195839822765
+  },
+  {
+    "n_vertices": 916,
+    "n_elements": 1676,
+    "crack_length": 0.40921040871780917,
+    "crack_type": "edge",
+    "tip_positions": [
+      [
+        0.4000069345709351,
+        0.5088249286242802
+      ]
+    ],
+    "mesh_file": "crack_data\\crack_001.mesh",
+    "sample_id": 1,
+    "crack_angle": -12.174679563370514,
+    "crack_y": 0.5951244703273512
+  },
+  {
+    "n_vertices": 918,
+    "n_elements": 1679,
+    "crack_length": 0.4283419105971059,
+    "crack_type": "edge",
+    "tip_positions": [
+      [
+        0.423545978112247,
+        0.48954139985456324
+      ]
+    ],
+    "mesh_file": "crack_data\\crack_002.mesh",
+    "sample_id": 2,
+    "crack_angle": 8.581929158308615,
+    "crack_y": 0.4256227265351092
+  },
+  {
+    "n_vertices": 797,
+    "n_elements": 1456,
+    "crack_length": 0.33511578136867015,
+    "crack_type": "edge",
+    "tip_positions": [
+      [
+        0.33434924140289546,
+        0.5626997045070914
+      ]
+    ],
+    "mesh_file": "crack_data\\crack_003.mesh",
+    "sample_id": 3,
+    "crack_angle": -3.8760592730225625,
+    "crack_y": 0.5853529977697204
+  },
+  {
+    "n_vertices": 858,
+    "n_elements": 1566,
+    "crack_length": 0.3931595360241994,
+    "crack_type": "edge",
+    "tip_positions": [
+      [
+        0.38755853123144735,
+        0.554810032632599
+      ]
+    ],
+    "mesh_file": "crack_data\\crack_004.mesh",
+    "sample_id": 4,
+    "crack_angle": 9.6828483981249,
+    "crack_y": 0.4886828397654662
+  },
+  {
+    "n_vertices": 738,
+    "n_elements": 1350,
+    "crack_length": 0.2681716165354331,
+    "crack_type": "edge",
+    "tip_positions": [
+      [
+        0.2680620964595168,
+        0.4204268941126478
+      ]
+    ],
+    "mesh_file": "crack_data\\crack_005.mesh",
+    "sample_id": 5,
+    "crack_angle": 1.6375436104750456,
+    "crack_y": 0.4127634512208351
+  },
+  {
+    "n_vertices": 921,
+    "n_elements": 1680,
+    "crack_length": 0.4482893515977746,
+    "crack_type": "edge",
+    "tip_positions": [
+      [
+        0.44722449681778154,
+        0.5824978362611195
+      ]
+    ],
+    "mesh_file": "crack_data\\crack_006.mesh",
+    "sample_id": 6,
+    "crack_angle": 3.949931973661947,
+    "crack_y": 0.5516175480170747
+  },
+  {
+    "n_vertices": 795,
+    "n_elements": 1455,
+    "crack_length": 0.3063577904389605,
+    "crack_type": "edge",
+    "tip_positions": [
+      [
+        0.2971005504154168,
+        0.6533661716935669
+      ]
+    ],
+    "mesh_file": "crack_data\\crack_007.mesh",
+    "sample_id": 7,
+    "crack_angle": 14.1209407318471,
+    "crack_y": 0.5786242242644395
+  },
+  {
+    "n_vertices": 919,
+    "n_elements": 1678,
+    "crack_length": 0.43351504912212857,
+    "crack_type": "edge",
+    "tip_positions": [
+      [
+        0.4279856999623153,
+        0.42432580868119985
+      ]
+    ],
+    "mesh_file": "crack_data\\crack_008.mesh",
+    "sample_id": 8,
+    "crack_angle": -9.160838764440973,
+    "crack_y": 0.49334420074540686
+  },
+  {
+    "n_vertices": 684,
+    "n_elements": 1252,
+    "crack_length": 0.21314112973616864,
+    "crack_type": "edge",
+    "tip_positions": [
+      [
+        0.20965877098044042,
+        0.49823869558747524
+      ]
+    ],
+    "mesh_file": "crack_data\\crack_009.mesh",
+    "sample_id": 9,
+    "crack_angle": -10.371315237973565,
+    "crack_y": 0.5366097906484909
+  }
+]

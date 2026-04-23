@@ -1,64 +1,46 @@
 """
-Agent role implementations for adaptive surrogate-guided learning.
+Agent role implementations for agentic SciML.
+
+Core agents for the HPO loop:
+- HyperparameterCriticAgent: Diagnoses training issues
+- ArchitectAgent: Proposes architecture/optimizer changes
+- PhysicistAgent: Proposes physics loss configuration changes
+
+Additional agents:
+- AdaptiveProposerAgent: For active learning sample selection
 """
 
-# Hyperparameter optimization agents (import first - no dependencies on broken modules)
+# Hyperparameter Critic Agent
 from piano.agents.roles.hyperparameter_critic import (
     HyperparameterCriticAgent,
     CritiqueResult,
     TrainingHistory,
     TrainingIssue,
 )
+
+# Architect Agent
 from piano.agents.roles.architect import ArchitectAgent, ArchitectureProposal
 
-# Adaptive learning agents
+# Physicist Agent
+from piano.agents.roles.physicist import PhysicistAgent, PhysicsProposal, PhysicsIssue
+
+# Adaptive Proposer Agent (for active learning)
 from piano.agents.roles.adaptive_proposer import AdaptiveProposerAgent, AdaptiveProposal
 
-# Core agents
-from piano.agents.roles.evaluator import EvaluatorAgent
-
-# NOTE: Some agents have import issues (missing proposer module)
-# They are imported lazily to avoid breaking the module
-try:
-    from piano.agents.roles.engineer import EngineerAgent
-except ImportError:
-    EngineerAgent = None  # type: ignore
-
-try:
-    from piano.agents.roles.debugger import DebuggerAgent
-except ImportError:
-    DebuggerAgent = None  # type: ignore
-
-try:
-    from piano.agents.roles.claude_code_engineer import ClaudeCodeEngineer, ClaudeCodeEngineerConfig
-except ImportError:
-    ClaudeCodeEngineer = None  # type: ignore
-    ClaudeCodeEngineerConfig = None  # type: ignore
-
-try:
-    from piano.agents.roles.claude_code_debugger import ClaudeCodeDebugger, ClaudeCodeDebuggerConfig
-except ImportError:
-    ClaudeCodeDebugger = None  # type: ignore
-    ClaudeCodeDebuggerConfig = None  # type: ignore
-
 __all__ = [
-    # Hyperparameter optimization agents
+    # Hyperparameter Critic
     "HyperparameterCriticAgent",
     "CritiqueResult",
     "TrainingHistory",
     "TrainingIssue",
+    # Architect
     "ArchitectAgent",
     "ArchitectureProposal",
-    # Adaptive learning agents
+    # Physicist
+    "PhysicistAgent",
+    "PhysicsProposal",
+    "PhysicsIssue",
+    # Adaptive Proposer
     "AdaptiveProposerAgent",
     "AdaptiveProposal",
-    # Core agents
-    "EvaluatorAgent",
-    "EngineerAgent",
-    "DebuggerAgent",
-    # Claude Code-powered agents
-    "ClaudeCodeEngineer",
-    "ClaudeCodeEngineerConfig",
-    "ClaudeCodeDebugger",
-    "ClaudeCodeDebuggerConfig",
 ]

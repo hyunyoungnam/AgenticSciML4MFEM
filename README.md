@@ -2,361 +2,276 @@
 
 **P**hysics-**I**nformed **A**gentic **N**eural **O**perator
 
-PIANO is a self-improving surrogate framework for computational mechanics. It combines a **Transolver neural operator** with a **PINO (Physics-Informed Neural Operator) loss** and an **autonomous active learning loop** to learn FEM field predictions with minimal ground-truth simulations.
+PIANO is a self-improving surrogate framework for computational mechanics. It combines a **Transolver neural operator** with **physics-informed loss** and an **autonomous 3-agent HPO system** to learn FEM field predictions with minimal ground-truth data.
 
 ---
 
-## Core Idea
+## What Makes PIANO Different?
 
-The surrogate improves along two independent axes simultaneously:
-
-1. **Active learning** — ensemble uncertainty identifies where new FEM simulations are most valuable; acquisition functions select the most informative parameter configurations
-2. **Physics-informed training** — PINO loss enforces 2D plane-stress equilibrium during training, making the surrogate physically consistent even in low-data regions
+Traditional neural operators require manual hyperparameter tuning. PIANO uses **LLM-based agents** that automatically diagnose training issues and propose fixes:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         PIANO WORKFLOW                              │
+│                     3-AGENT HPO SYSTEM                              │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  1. INITIAL SAMPLING (Latin Hypercube)                              │
-│     └─ Diverse initial coverage of parameter space                  │
-│                          ↓                                          │
-│  2. FEM SIMULATIONS (PyMFEM)                                        │
-│     └─ Linear-elasticity PCG solver → displacement, von Mises       │
-│                          ↓                                          │
-│  ┌──────────────── SELF-IMPROVEMENT LOOP ─────────────────────────┐ │
-│  │                                                                │ │
-│  │  3. TRAIN Transolver + PINO LOSS                               │ │
-│  │     ├─ L_data  = MSE(u_pred, u_true)                           │ │
-│  │     ├─ L_eq    = ‖R‖²  (nodal force balance, no labels)        │ │
-│  │     └─ L_pino  = W(u_err)/Vol (energy-norm error, with labels) │ │
-│  │                          ↓                                     │ │
-│  │  4. EVALUATE VIA ENSEMBLE UNCERTAINTY                          │ │
-│  │     └─ uncertainty = std across ensemble members               │ │
-│  │                          ↓                                     │ │
-│  │  5. SELECT INFORMATIVE SAMPLES (acquisition function)          │ │
-│  │     └─ Uncertainty / EI / QBC — with diversity filter          │ │
-│  │                          ↓                                     │ │
-│  │  6. CHECK CONVERGENCE                                          │ │
-│  │     ├─ error < threshold → CONVERGED                           │ │
-│  │     ├─ no improvement for N steps → PATIENCE_EXHAUSTED         │ │
-│  │     └─ budget exhausted → BUDGET_EXHAUSTED                     │ │
-│  │                          ↓                                     │ │
-│  │  7. RUN NEW FEM SIMULATIONS & LOOP                             │ │
-│  └────────────────────────────────────────────────────────────────┘ │
-│                          ↓                                          │
-│  8. SAVE: Dataset, Surrogate, Metrics                               │
+│                         Train Model                                 │
+│                              ↓                                      │
+│                    ┌─────────────────┐                              │
+│                    │  CRITIC AGENT   │                              │
+│                    │  Analyzes loss  │                              │
+│                    │  curves, detects│                              │
+│                    │  issues         │                              │
+│                    └────────┬────────┘                              │
+│                             ↓                                       │
+│              ┌──────────────┴──────────────┐                        │
+│              ↓                              ↓                       │
+│    ┌─────────────────┐            ┌─────────────────┐               │
+│    │ ARCHITECT AGENT │            │ PHYSICIST AGENT │               │
+│    │                 │            │                 │               │
+│    │ • d_model       │            │ • pino_weight   │               │
+│    │ • n_layers      │            │ • pino_eq_weight│               │
+│    │ • learning_rate │            │ • Singularity   │               │
+│    │ • optimizer     │            │   handling      │               │
+│    │ • dropout       │            │ • PDE residual  │               │
+│    └────────┬────────┘            └────────┬────────┘               │
+│             └──────────────┬───────────────┘                        │
+│                            ↓                                        │
+│                     Merge Proposals                                 │
+│                            ↓                                        │
+│                    Retrain & Repeat                                 │
 └─────────────────────────────────────────────────────────────────────┘
+```
+
+**Why 3 agents?** Physics-informed learning has two distinct concerns:
+- **Architecture tuning** (capacity, optimization) — handled by Architect
+- **Physics enforcement** (PDE constraints, singularities) — handled by Physicist
+
+Separating these allows each agent to be an expert in its domain.
+
+---
+
+## Example: Crack Tip Singularity
+
+PIANO focuses on **fracture mechanics** — specifically edge cracks with 1/√r stress singularities. This is challenging for neural operators and showcases the value of agentic HPO.
+
+### Demo Visualization
+
+![Crack Demo](tests/test_outputs/agentic_crack_demo.png)
+
+**Row 1:** Displacement field prediction on crack mesh
+- Predicted |u|, Ground truth (Williams expansion), Error field
+- Red star marks crack tip where singularity causes highest error
+
+**Row 2:** Agentic HPO analysis
+- Training loss curves (before/after optimization)
+- Hyperparameter changes from Architect and Physicist
+- Summary with improvement metrics
+
+### Run the Demo
+
+```bash
+# Generate the visualization above
+python tests/test_agentic_sciml.py --n-samples 8 --epochs 30
+
+# Run all tests
+pytest tests/test_agentic_sciml.py -v
 ```
 
 ---
 
-## Example Outputs
+## The Agents
 
-PIANO trains on three geometry families, each solved with randomised material properties (E, ν) and biaxial loads (Fx, Fy). All panels show displacement magnitude |u| predicted by the 3-member ensemble, trained on 20 FEM samples with PINO loss active.
+### 1. HyperparameterCriticAgent
+**Role:** Training diagnostician
 
-### Single hole (`train_fine/`)
+Analyzes loss curves to detect:
+- `OVERFITTING` — test loss increasing while train decreases
+- `UNDERFITTING` — both losses high, model not learning
+- `SLOW_CONVERGENCE` — learning rate too low
+- `LOSS_PLATEAU` — no improvement for many epochs
+- `GRADIENT_EXPLOSION` — NaN values detected
 
-![Single hole](tests/test_outputs/sciml_single_hole.png)
+### 2. ArchitectAgent
+**Role:** Neural network architect
 
-Plate [0,1]² with one blob-shaped void (local hole refinement, ~800 elements). Stress concentration forms a smooth gradient around the hole. Uncertainty peaks near the hole boundary where the field gradient is steepest.
+Proposes changes to:
+| Category | Parameters |
+|----------|------------|
+| Architecture | d_model, n_layers, n_heads, slice_num |
+| Optimization | learning_rate, optimizer_type, scheduler_type |
+| Regularization | dropout, weight_decay |
+| Activation | gelu, silu, relu |
 
----
+### 3. PhysicistAgent
+**Role:** Physics loss specialist
 
-### Double hole (`train02/`)
+Proposes changes to:
+| Category | Parameters |
+|----------|------------|
+| Energy loss | pino_weight (strain energy consistency) |
+| Equilibrium | pino_eq_weight (force balance residual) |
+| Material | pino_E, pino_nu (constitutive law) |
 
-![Double hole](tests/test_outputs/sciml_double_hole.png)
-
-Two non-overlapping blob holes. The ligament (material bridge between holes) concentrates stress and drives higher uncertainty in the inter-hole region — exactly the region the acquisition function prioritises for the next FEM simulation.
-
----
-
-### Hole cluster (`train03/`)
-
-![Hole cluster](tests/test_outputs/sciml_cluster.png)
-
-3–5 randomly placed blob holes (~1300 elements). Complex multi-hole interaction fields test the surrogate's ability to generalise across topologically varied geometries. Near-boundary holes (30% of samples) add edge-interaction stress patterns to the training distribution.
-
----
-
-**Panel legend (all figures):**
-- **① Ensemble Mean |u|** — normalised displacement magnitude; captures load path and stress concentration geometry
-- **② Ensemble Uncertainty** — norm of ensemble std across displacement components; high values identify where more FEM data is needed
-- **③ Error Field** — `||u|_pred − |u|_GT|`; blue `+` markers are the top spatial hotspots at the 85th percentile
-- **④ Acquisition Scores** — 50 candidate parameter sets sorted by `UncertaintySampling`; red bars (top-5) are the next simulations the orchestrator would request
-- **⑤ Training Convergence** — displacement MSE loss vs epoch (log scale); PINO physics loss is active alongside data loss
-
----
-
-## Key Features
-
-- **Transolver surrogate** — Physics-Attention (slice-attention) neural operator; reduces O(N²) attention to O(S² + NS) for unstructured meshes
-- **PINO loss** — two physics terms computed from Delaunay triangulation + vectorized B-matrices:
-  - Equilibrium residual `‖R‖²` at mesh nodes (label-free, true PINO)
-  - Energy-norm error `W(u_pred − u_true)/Vol` (physics-weighted H1 seminorm)
-- **Ensemble active learning** — 5-member ensemble for uncertainty quantification; acquisition functions (Uncertainty, EI, QBC, UCB) drive intelligent sampling
-- **PyMFEM FEM ground truth** — real linear-elasticity solver (PCG + Gauss-Seidel), no analytical approximations
-- **Agentic orchestration** — LLM-based agents (Claude / GPT-4) for proposal, engineering, evaluation, and debugging roles
+Understands:
+- Crack tip singularities (1/√r behavior)
+- When physics constraints help vs. hurt learning
+- Balance between data-driven and physics-informed loss
 
 ---
 
 ## Quick Start
 
-### Programmatic API
-
-```python
-from piano import AdaptiveOrchestrator, AdaptiveConfig
-
-config = AdaptiveConfig(
-    base_mesh_path="meshes/plate_with_hole.mesh",
-    output_dir="./output",
-    parameter_bounds={
-        "delta_R": (-0.5, 0.5),   # hole radius variation
-        "E":       (150e9, 250e9), # Young's modulus
-        "load":    (80e6, 120e6),  # applied traction (Pa)
-    },
-    initial_samples=20,
-    max_samples=200,
-    acquisition_strategy="uncertainty",
-    convergence_threshold=0.05,
-    n_ensemble=5,
-)
-
-orchestrator = AdaptiveOrchestrator(config)
-result = orchestrator.run()
-
-print(f"Stopped: {result.stopping_criterion.name}")
-print(f"Samples used: {result.total_samples}")
-print(f"Error reduction: {result.error_reduction_percent:.1f}%")
-```
-
-### Training the Surrogate (CLI)
+### Installation
 
 ```bash
-# Generate mesh samples
-python samples/generate_samples.py --n 200 --output train01
-
-# Train ensemble surrogate
-python tests/test_transolver.py \
-    --samples-dirs train01 \
-    --model-dir outputs/surrogate \
-    --epochs 500
-```
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/AgenticSciML/PIANO.git
+git clone https://github.com/your-username/PIANO.git
 cd PIANO
 pip install -e ".[all]"
 ```
 
-### Dependency groups
+### Generate Crack Meshes
 
-| Group | Command | Includes |
-|-------|---------|---------|
-| Core | `pip install -e .` | numpy, scipy, PyYAML |
-| Surrogate | `pip install -e ".[surrogate]"` | + torch, einops |
-| FEM solver | `pip install -e ".[mfem]"` | + mfem |
-| Full | `pip install -e ".[all]"` | everything + pyvista |
-
-**Prerequisites:** Python 3.9+, PyTorch ≥ 2.0, PyMFEM ≥ 4.6 (for FEM ground truth)
-
----
-
-## PINO Loss
-
-The physics loss is computed for each training sample using the mesh coordinates and predicted displacement field — no additional FEM solve required.
-
-```python
-from piano.surrogate.pino_loss import PINOElasticityLoss
-
-# Instantiated automatically by SurrogateTrainer when pino_weight > 0
-loss_fn = PINOElasticityLoss(
-    E=1.0,              # dimensionless (trainer normalizes outputs)
-    nu=0.3,             # Poisson's ratio — drives constitutive anisotropy
-    eq_weight=0.1,      # weight for equilibrium residual (label-free)
-    energy_weight=0.1,  # weight for energy-norm error (with labels)
-)
-
-# Total training loss per sample:
-# L = L_MSE + eq_weight * L_eq + energy_weight * L_energy
+```bash
+python scripts/generate_crack_meshes.py --n-samples 10 --output-dir crack_data
 ```
 
-**How it works:**
+This creates meshes with:
+- Varying crack length (a/W = 0.2 to 0.5)
+- Varying crack angle (-15° to +15°)
+- Refined mesh near crack tip
 
-1. Delaunay triangulation of mesh nodes (scipy, once per sample, ~1ms)
-2. Vectorized B-matrix assembly over all triangles: `B: (M, 3, 6)`, `areas: (M,)`
-3. **Equilibrium term** — assemble nodal force residual via `scatter_add_`:
-   ```
-   R_i = Σ_e (B_e^T C B_e u_pred_e A_e)   →  ‖R‖² / N
-   ```
-4. **Energy-norm term** — strain energy of prediction error:
-   ```
-   L_energy = Σ_e (ε_err_e^T C ε_err_e A_e) / Σ_e A_e
-   ```
-
-Fully differentiable — gradients flow back through `scatter_add_` and `einsum` to the Transolver weights.
-
----
-
-## FEM Solver
+### Train with Agentic HPO
 
 ```python
-from piano.mesh.mfem_manager import MFEMManager
-from piano.solvers.mfem_solver import MFEMSolver
-from piano.solvers.base import (
-    PhysicsConfig, PhysicsType, MaterialProperties,
-    BoundaryCondition, BoundaryConditionType,
+from piano.surrogate.agentic_trainer import (
+    AgenticSurrogateTrainer,
+    AgenticTrainingConfig,
 )
-import numpy as np, tempfile
+from piano.surrogate.base import TransolverConfig
 
-manager = MFEMManager("train01/sample_000.mesh")
-
-physics = PhysicsConfig(
-    physics_type=PhysicsType.LINEAR_ELASTICITY,
-    material=MaterialProperties(E=200e9, nu=0.3),
-    boundary_conditions=[
-        BoundaryCondition(BoundaryConditionType.SYMMETRY, boundary_id=4, direction=0),
-        BoundaryCondition(BoundaryConditionType.SYMMETRY, boundary_id=1, direction=1),
-        BoundaryCondition(BoundaryConditionType.TRACTION,  boundary_id=2,
-                          value=np.array([100e6, 0.])),
-    ],
+# Configure agentic training
+config = AgenticTrainingConfig(
+    base_config=TransolverConfig(
+        d_model=64,        # Initial (small)
+        n_layers=2,        # Initial (shallow)
+        epochs=100,
+    ),
+    max_hpo_rounds=3,      # Max optimization rounds
+    trigger_threshold=0.1, # Trigger HPO if loss > this
+    use_physicist=True,    # Enable PhysicistAgent
+    problem_type="crack",  # Physics problem type
+    has_singularity=True,  # Has stress singularity
 )
 
-solver = MFEMSolver(order=1)
-solver.setup(manager, physics)
+# Create trainer with LLM provider
+trainer = AgenticSurrogateTrainer(config, llm_provider=your_provider)
 
-with tempfile.TemporaryDirectory() as tmp:
-    result = solver.solve(tmp)
+# Train — agents automatically optimize if needed
+result = trainer.train(parameters, coordinates, outputs)
 
-vm = result.solution_data['von_mises']
-print(f"von Mises: {vm.min()*1e-6:.1f} .. {vm.max()*1e-6:.1f} MPa")
+print(f"HPO rounds: {result.n_hpo_rounds}")
+print(f"Improvement: {result.improvement_percent:.1f}%")
 ```
-
-**Solver:** Galerkin FEM with `ElasticityIntegrator`, H1 order-1 elements, PCG (500 iters, 1e-12 tol), Gauss-Seidel preconditioner.
 
 ---
 
-## Architecture
+## Project Structure
 
 ```
 piano/
-├── __init__.py                  # Public API
-├── cli.py                       # Command-line interface
+├── surrogate/                   # Neural operator training
+│   ├── transolver.py           # Transolver (Physics-Attention)
+│   ├── trainer.py              # Standard training loop
+│   ├── agentic_trainer.py      # 3-agent HPO wrapper
+│   ├── pino_loss.py            # Physics-informed loss
+│   ├── ensemble.py             # Ensemble for uncertainty
+│   └── base.py                 # TransolverConfig
 │
-├── surrogate/                   # Neural operator + active learning
-│   ├── transolver.py           # Transolver (Physics-Attention neural operator)
-│   ├── ensemble.py             # Ensemble wrapper for uncertainty quantification
-│   ├── pino_loss.py            # PINO loss (equilibrium residual + energy-norm)
-│   ├── trainer.py              # Training workflow (MSE + PINO)
-│   ├── evaluator.py            # Uncertainty analysis + acquisition sampling
-│   ├── acquisition.py          # Acquisition functions (Uncertainty, EI, QBC, UCB)
-│   ├── error_analysis.py       # Spatial error decomposition
-│   └── base.py                 # TransolverConfig, SurrogateModel interface
+├── agents/                      # LLM-based agents
+│   ├── base.py                 # BaseAgent, AgentContext
+│   ├── roles/
+│   │   ├── hyperparameter_critic.py  # Diagnoses training issues
+│   │   ├── architect.py              # Architecture/optimizer tuning
+│   │   ├── physicist.py              # Physics loss tuning
+│   │   └── adaptive_proposer.py      # Active learning (future)
+│   └── llm/                    # LLM providers (OpenAI, Anthropic)
 │
-├── orchestration/               # Workflow control
-│   ├── adaptive.py             # AdaptiveOrchestrator (active learning loop)
-│   └── metrics.py              # Learning efficiency tracking
-│
-├── data/                        # Dataset management
-│   ├── dataset.py              # FEMSample, FEMDataset
-│   └── loader.py               # Data loaders
+├── geometry/                    # Mesh generation
+│   └── crack.py                # Crack geometry (edge, center)
 │
 ├── mesh/                        # Mesh handling
-│   ├── base.py                 # MeshManager interface
 │   └── mfem_manager.py         # MFEM mesh wrapper
 │
 ├── solvers/                     # FEM solvers
-│   ├── base.py                 # SolverInterface, PhysicsConfig, BoundaryCondition
-│   └── mfem_solver.py          # PyMFEM linear-elasticity + heat-transfer
+│   └── mfem_solver.py          # PyMFEM linear-elasticity
 │
-├── evaluation/                  # Mesh quality metrics
-└── agents/                      # LLM-based agentic roles (optional)
-    ├── roles/                   # Engineer, Evaluator, Debugger, Proposer
-    ├── prompts/                 # System prompts
-    └── llm/                    # Claude / GPT-4 providers
+└── orchestration/               # Workflow control
+    └── adaptive.py             # Active learning loop
 ```
 
 ---
 
-## Configuration Reference
+## Physics-Informed Loss (PINO)
 
-### `TransolverConfig` (physics-informed training)
+The loss combines data-driven and physics-informed terms:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `pino_weight` | `0.1` | Weight for energy-norm error term |
-| `pino_eq_weight` | `0.1` | Weight for equilibrium residual term |
-| `pino_E` | `1.0` | Young's modulus for PINO (dimensionless with normalized outputs) |
-| `pino_nu` | `0.3` | Poisson's ratio for PINO constitutive law |
-| `epochs` | `1000` | Max training epochs |
-| `patience` | `100` | Early stopping patience |
-| `batch_size` | `32` | Gradient accumulation batch size |
-| `d_model` | `256` | Hidden dimension |
-| `n_layers` | `6` | Transolver layers |
-| `slice_num` | `32` | Physics-attention slices S |
-| `learning_rate` | `1e-3` | AdamW learning rate |
-
-### `AdaptiveConfig` (active learning loop)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `base_mesh_path` | required | Path to MFEM mesh |
-| `output_dir` | required | Output directory |
-| `parameter_bounds` | `{"delta_R": (-0.5, 0.5)}` | Bounds per parameter |
-| `initial_samples` | `20` | Initial LHS samples |
-| `max_samples` | `200` | Hard budget limit |
-| `convergence_threshold` | `0.05` | Error threshold to stop |
-| `patience` | `3` | Iterations without improvement |
-| `n_ensemble` | `5` | Ensemble size for UQ |
-| `acquisition_strategy` | `"uncertainty"` | Acquisition function |
-
----
-
-## API Reference
-
-```python
-# Core
-from piano import AdaptiveOrchestrator, AdaptiveConfig, AdaptiveResult
-from piano import MFEMManager, MFEMSolver, PhysicsConfig, PhysicsType, MaterialProperties
-from piano import FEMDataset, FEMSample, DatasetConfig
-
-# Surrogate
-from piano.surrogate.pino_loss import PINOElasticityLoss
-from piano.surrogate.trainer import SurrogateTrainer
-from piano.surrogate.evaluator import SurrogateEvaluator
-from piano.surrogate.acquisition import get_acquisition_function
-from piano.surrogate.base import TransolverConfig
-
-# Metrics
-from piano.orchestration.metrics import ActiveLearningMetrics
+```
+L_total = L_MSE + pino_weight × L_energy + pino_eq_weight × L_equilibrium
 ```
 
+### Equilibrium Residual (Label-Free)
+Enforces force balance: div(σ) = 0
+```
+L_eq = ‖R‖² / N,  where R_i = Σ_e (B_e^T C B_e u_pred A_e)
+```
+
+### Energy-Norm Error (With Labels)
+Physics-weighted H1 seminorm:
+```
+L_energy = Σ_e (ε_err^T C ε_err A_e) / Σ_e A_e
+```
+
+Both terms use Delaunay triangulation + vectorized B-matrix assembly. Fully differentiable via PyTorch `scatter_add_`.
+
 ---
 
-## Stopping Criteria
+## Configuration
 
-| Criterion | Condition |
-|-----------|-----------|
-| `CONVERGED` | Test error < `convergence_threshold` |
-| `PATIENCE_EXHAUSTED` | No improvement for `patience` iterations |
-| `BUDGET_EXHAUSTED` | Total samples ≥ `max_samples` |
-| `MAX_ITERATIONS` | Loop iterations ≥ limit |
-| `LOW_UNCERTAINTY` | Mean ensemble uncertainty < threshold |
-| `DIMINISHING_RETURNS` | Sample efficiency dropping consistently |
+### TransolverConfig
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `d_model` | 256 | Hidden dimension |
+| `n_layers` | 6 | Transformer layers |
+| `n_heads` | 8 | Attention heads |
+| `slice_num` | 32 | Physics-attention slices |
+| `dropout` | 0.0 | Dropout rate |
+| `learning_rate` | 1e-3 | Learning rate |
+| `optimizer_type` | "adamw" | Optimizer (adamw, adam, sgd) |
+| `scheduler_type` | "plateau" | Scheduler (plateau, cosine, none) |
+| `activation` | "gelu" | Activation (gelu, silu, relu) |
+| `pino_weight` | 0.1 | Energy-norm loss weight |
+| `pino_eq_weight` | 0.1 | Equilibrium loss weight |
+
+### AgenticTrainingConfig
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_hpo_rounds` | 3 | Maximum HPO iterations |
+| `trigger_threshold` | 0.1 | Loss threshold to trigger HPO |
+| `use_physicist` | True | Enable PhysicistAgent |
+| `problem_type` | "crack" | Physics problem type |
+| `has_singularity` | True | Problem has stress singularity |
 
 ---
 
 ## References
 
 - Wu et al. (2024): *Transolver: A Fast Transformer Solver for PDEs on General Geometries*, ICML 2024
-- Li et al. (2024): *Physics-Informed Neural Operator for Learning Partial Differential Equations*, ICLR 2024
-- Settles (2009): *Active Learning Literature Survey*
+- Li et al. (2024): *Physics-Informed Neural Operator for Learning Partial Differential Equations*
+- Williams (1957): *On the Stress Distribution at the Base of a Stationary Crack*
 - [MFEM](https://mfem.org/) — Modular Finite Element Methods library
-- [PyMFEM](https://github.com/mfem/PyMFEM) — Python wrapper for MFEM
 
 ---
 

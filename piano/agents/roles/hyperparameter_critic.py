@@ -421,18 +421,29 @@ class HyperparameterCriticAgent(BaseAgent[CritiqueResult]):
 
         Args:
             history: Training history
-            threshold: Error threshold for triggering
+            threshold: Error threshold for triggering. If set very high (>10),
+                       only critical issues (NaN) will trigger HPO.
 
         Returns:
             True if HPO should be triggered
         """
-        # Always trigger if NaN detected
+        # Always trigger if NaN detected (critical issue)
         if history.has_nan:
             return True
+
+        # If threshold is very high, user doesn't want HPO
+        # Only trigger for critical issues (NaN above)
+        if threshold > 10.0:
+            return False
 
         # Trigger if test loss is above threshold
         if history.final_test_loss > threshold:
             return True
+
+        # Only check overfitting/plateau if we have reasonable loss values
+        # (avoid triggering on noise when losses are already very low)
+        if history.final_test_loss < 0.001:
+            return False
 
         # Trigger if significant overfitting
         if len(history.train_losses) >= 10 and len(history.test_losses) >= 10:

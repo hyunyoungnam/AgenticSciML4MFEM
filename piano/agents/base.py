@@ -15,16 +15,12 @@ import uuid
 
 class AgentRole(Enum):
     """Enumeration of agent roles in the system."""
-    EVALUATOR = "evaluator"
-    PROPOSER = "proposer"
-    CRITIC = "critic"
-    ENGINEER = "engineer"
-    DEBUGGER = "debugger"
-    RESULT_ANALYST = "result_analyst"
-    RETRIEVER = "retriever"
-    SELECTOR = "selector"
+    # Core HPO agents
     HYPERPARAMETER_CRITIC = "hyperparameter_critic"
     ARCHITECT = "architect"
+    PHYSICIST = "physicist"
+    # Active learning agents
+    ADAPTIVE_PROPOSER = "adaptive_proposer"
 
 
 class MessageType(Enum):
@@ -55,7 +51,7 @@ class AgentMessage:
         timestamp: When the message was created
     """
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    sender: AgentRole = AgentRole.EVALUATOR
+    sender: AgentRole = AgentRole.HYPERPARAMETER_CRITIC
     receiver: Optional[AgentRole] = None
     type: MessageType = MessageType.QUERY
     content: Any = ""

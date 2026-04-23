@@ -186,7 +186,7 @@ class AdaptiveProposerAgent(BaseAgent[AdaptiveProposal]):
         **kwargs,
     ):
         super().__init__(
-            role=AgentRole.PROPOSER,
+            role=AgentRole.ADAPTIVE_PROPOSER,
             model=model,
             temperature=temperature,
             **kwargs,
