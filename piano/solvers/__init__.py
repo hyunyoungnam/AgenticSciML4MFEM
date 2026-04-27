@@ -9,6 +9,7 @@ from .base import (
     BoundaryCondition,
     BoundaryConditionType,
     MaterialProperties,
+    PhaseFieldConfig,
     PhysicsConfig,
     PhysicsType,
     SolverInterface,
@@ -20,9 +21,17 @@ __all__ = [
     "BoundaryCondition",
     "BoundaryConditionType",
     "MaterialProperties",
+    "PhaseFieldConfig",
     "PhysicsConfig",
     "PhysicsType",
     "SolverInterface",
     "SolverResult",
     "MFEMSolver",
 ]
+
+# Conditionally import FEniCS components
+try:
+    from .fenics_phase_field import FEniCSPhaseFieldSolver, PhaseFieldState
+    __all__.extend(["FEniCSPhaseFieldSolver", "PhaseFieldState"])
+except ImportError:
+    pass

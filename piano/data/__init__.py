@@ -21,3 +21,22 @@ __all__ = [
     "DatasetLoader",
     "MFEMDataLoader",
 ]
+
+# Conditionally import phase field generator (requires gmsh and dolfinx)
+try:
+    from .phase_field_generator import (
+        PhaseFieldFEMConfig,
+        ParameterBounds,
+        generate_phase_field_sample,
+        generate_phase_field_dataset,
+        create_phase_field_dataset,
+    )
+    __all__.extend([
+        "PhaseFieldFEMConfig",
+        "ParameterBounds",
+        "generate_phase_field_sample",
+        "generate_phase_field_dataset",
+        "create_phase_field_dataset",
+    ])
+except (ImportError, OSError):
+    pass

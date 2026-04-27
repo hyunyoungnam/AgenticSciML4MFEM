@@ -30,6 +30,8 @@ class FEMSample:
         stress: Stress field (N_elements, n_components) - optional
         temperature: Temperature field (N_nodes,) - optional
         von_mises: Von Mises stress (N_elements,) - optional
+        damage: Damage/phase field (N_nodes,) for fracture - optional
+        crack_path: Crack path coordinates (N_points, dim) - optional
         mesh_file: Path to the mesh file
         metadata: Additional metadata
         created_at: Creation timestamp
@@ -42,6 +44,8 @@ class FEMSample:
     stress: Optional[np.ndarray] = None
     temperature: Optional[np.ndarray] = None
     von_mises: Optional[np.ndarray] = None
+    damage: Optional[np.ndarray] = None
+    crack_path: Optional[np.ndarray] = None
     mesh_file: Optional[Path] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -54,6 +58,8 @@ class FEMSample:
             "stress": self.stress,
             "temperature": self.temperature,
             "von_mises": self.von_mises,
+            "damage": self.damage,
+            "crack_path": self.crack_path,
         }
         return field_map.get(field_name)
 
@@ -70,6 +76,8 @@ class FEMSample:
             "has_displacement": self.displacement is not None,
             "has_stress": self.stress is not None,
             "has_temperature": self.temperature is not None,
+            "has_damage": self.damage is not None,
+            "has_crack_path": self.crack_path is not None,
             "mesh_file": str(self.mesh_file) if self.mesh_file else None,
             "metadata": self.metadata,
             "created_at": self.created_at,
@@ -357,6 +365,10 @@ class FEMDataset:
                 np.save(sample_dir / "temperature.npy", sample.temperature)
             if sample.von_mises is not None:
                 np.save(sample_dir / "von_mises.npy", sample.von_mises)
+            if sample.damage is not None:
+                np.save(sample_dir / "damage.npy", sample.damage)
+            if sample.crack_path is not None:
+                np.save(sample_dir / "crack_path.npy", sample.crack_path)
 
         return path
 
@@ -408,6 +420,8 @@ class FEMDataset:
             stress = None
             temperature = None
             von_mises = None
+            damage = None
+            crack_path = None
 
             if (sample_dir / "displacement.npy").exists():
                 displacement = np.load(sample_dir / "displacement.npy")
@@ -417,6 +431,10 @@ class FEMDataset:
                 temperature = np.load(sample_dir / "temperature.npy")
             if (sample_dir / "von_mises.npy").exists():
                 von_mises = np.load(sample_dir / "von_mises.npy")
+            if (sample_dir / "damage.npy").exists():
+                damage = np.load(sample_dir / "damage.npy")
+            if (sample_dir / "crack_path.npy").exists():
+                crack_path = np.load(sample_dir / "crack_path.npy")
 
             sample = FEMSample(
                 sample_id=sample_id,
@@ -426,6 +444,8 @@ class FEMDataset:
                 stress=stress,
                 temperature=temperature,
                 von_mises=von_mises,
+                damage=damage,
+                crack_path=crack_path,
                 mesh_file=Path(sample_meta["mesh_file"]) if sample_meta.get("mesh_file") else None,
                 metadata=sample_meta.get("metadata", {}),
                 created_at=sample_meta.get("created_at", ""),

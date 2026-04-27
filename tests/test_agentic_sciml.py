@@ -88,6 +88,8 @@ class MockLLMProvider:
             return MockLLMResponse(self._architect_response())
         elif "physicist" in system_prompt.lower():
             return MockLLMResponse(self._physicist_response())
+        elif "scientific machine learning" in system_prompt.lower():
+            return MockLLMResponse(self._proposer_response())
         else:
             return MockLLMResponse("Unknown agent type")
 
@@ -154,32 +156,74 @@ SHOULD_RETRAIN: false
 
     def _architect_response(self) -> str:
         """Generate mock architect response."""
-        responses = {
-            "underfitting": """
-REASONING: The crack tip singularity (1/sqrt(r)) requires high model capacity. Current architecture is too shallow to capture sharp stress gradients. Increasing depth and width, plus using SiLU activation which handles sharp transitions better than GELU.
+        # Rotate through progressively stronger configs for underfitting
+        call_count = getattr(self, "_arch_call_count", 0)
+        self._arch_call_count = call_count + 1
+
+        underfitting_configs = [
+            # Round 1 → 2: add physics, keep lr high
+            """
+REASONING: Add PINO physics constraint to regularize underfitting on small dataset.
 
 CHANGES:
-- d_model: 256 (increased from 64 for more capacity)
-- n_layers: 6 (deeper to capture complex patterns)
-- n_heads: 8 (more attention heads)
-- slice_num: 32 (finer spatial resolution)
-- activation: silu (better for sharp gradients)
-- learning_rate: 1e-3 (faster initial learning)
-- dropout: 0.05 (light regularization)
-- pino_weight: 0.05 (reduced to allow singularity learning)
+- d_model: 32
+- n_layers: 2
+- n_heads: 2
+- slice_num: 8
+- learning_rate: 8e-4
+- dropout: 0.0
+- pino_weight: 0.05
 
-EXPECTED_IMPACT: Model should better capture crack tip stress concentration. Expect significant error reduction near tip.
-
-CONFIDENCE: high
+EXPECTED_IMPACT: Physics regularization helps generalization.
+CONFIDENCE: medium
 """,
+            # Round 2 → 3: moderate capacity increase
+            """
+REASONING: Still underfitting — increase model capacity moderately.
+
+CHANGES:
+- d_model: 48
+- n_layers: 3
+- n_heads: 4
+- slice_num: 16
+- activation: silu
+- learning_rate: 5e-4
+- dropout: 0.0
+- epochs: 150
+- pino_weight: 0.05
+
+EXPECTED_IMPACT: Larger model with physics captures stress concentration.
+CONFIDENCE: medium
+""",
+            # Round 3 → 4: more epochs, lower lr
+            """
+REASONING: Need longer training to escape plateau.
+
+CHANGES:
+- d_model: 48
+- n_layers: 3
+- n_heads: 4
+- slice_num: 16
+- learning_rate: 2e-4
+- dropout: 0.0
+- epochs: 200
+- scheduler_type: cosine
+- pino_weight: 0.1
+
+EXPECTED_IMPACT: Lower lr with more epochs finds better minimum.
+CONFIDENCE: medium
+""",
+        ]
+        responses = {
+            "underfitting": underfitting_configs[min(call_count, len(underfitting_configs) - 1)],
             "overfitting": """
 REASONING: Need to regularize and reduce capacity to prevent memorization.
 
 CHANGES:
-- d_model: 128 (reduced)
-- dropout: 0.2 (added regularization)
-- pino_weight: 0.2 (physics constraints)
-- learning_rate: 5e-4 (reduced)
+- d_model: 48 (reduced)
+- dropout: 0.15 (added regularization)
+- pino_weight: 0.15 (physics constraints)
+- learning_rate: 1e-4 (reduced)
 
 CONFIDENCE: high
 """,
@@ -187,7 +231,7 @@ CONFIDENCE: high
 REASONING: Need faster learning dynamics.
 
 CHANGES:
-- learning_rate: 1e-3 (increased)
+- learning_rate: 3e-4 (moderate increase)
 - scheduler_type: cosine
 - optimizer_type: adamw
 
@@ -197,7 +241,7 @@ CONFIDENCE: medium
 REASONING: Minor tuning only.
 
 CHANGES:
-- epochs: 100
+- epochs: 50
 
 CONFIDENCE: medium
 """,
@@ -208,17 +252,17 @@ CONFIDENCE: medium
         """Generate mock physicist response for physics loss configuration."""
         responses = {
             "underfitting": """
-PHYSICS_DIAGNOSIS: The physics loss is not effectively enforcing equilibrium near the crack tip. The 1/sqrt(r) singularity causes high residuals that dominate the loss, but current weights are too low to guide learning. Need to increase physics enforcement gradually.
+PHYSICS_DIAGNOSIS: For small datasets, physics loss provides crucial regularization. Moderate physics weights help the model generalize by enforcing physical constraints. Don't increase too aggressively to avoid conflicting gradients.
 
 CHANGES:
-- pino_weight: 0.15 (increased to enforce energy consistency)
-- pino_eq_weight: 0.2 (higher to enforce equilibrium near singularity)
+- pino_weight: 0.1 (moderate increase for regularization)
+- pino_eq_weight: 0.1 (balanced with data loss)
 
-REASONING: For crack tip singularities, equilibrium enforcement is critical. The stress field must satisfy div(sigma)=0 everywhere including the singular region. Higher eq_weight helps the model learn the correct asymptotic behavior.
+REASONING: Physics constraints act as regularizers on small datasets. Moderate weights help without overwhelming the data-driven learning.
 
-EXPECTED_IMPACT: Better capture of crack tip stress field. Equilibrium residual should decrease near tip.
+EXPECTED_IMPACT: Better generalization through physics-based regularization.
 
-CONFIDENCE: high
+CONFIDENCE: medium
 """,
             "overfitting": """
 PHYSICS_DIAGNOSIS: Physics constraints may be too weak, allowing model to memorize training data without learning underlying physics. Increasing physics loss will regularize the model.
@@ -260,6 +304,46 @@ CONFIDENCE: low
 """,
         }
         return responses.get(self.scenario, responses["underfitting"])
+
+    def _proposer_response(self) -> str:
+        """Generate mock adaptive proposer response."""
+        # Generate proposals based on crack problem parameters
+        return """
+**Proposal 1**
+Parameters: E=200e9, nu=0.30, K_I=6e6, crack_length=0.35
+Target Region: High uncertainty near crack tip with long crack
+Reasoning: The model shows highest uncertainty in the region with crack_length > 0.3 and high K_I values. This sample targets the singularity-dominated regime where the 1/sqrt(r) behavior is most pronounced.
+Expected Improvement: Should reduce error in high-stress intensity region by ~15%
+Priority: High
+
+**Proposal 2**
+Parameters: E=180e9, nu=0.28, K_I=4e6, crack_length=0.25
+Target Region: Moderate crack length with lower stiffness
+Reasoning: Current dataset lacks samples with lower Young's modulus combined with moderate crack lengths. This configuration will help the model generalize across material stiffness variations.
+Expected Improvement: Better generalization for softer materials
+Priority: Medium
+
+**Proposal 3**
+Parameters: E=220e9, nu=0.32, K_I=8e6, crack_length=0.45
+Target Region: Long crack with high stress intensity
+Reasoning: Extreme case near parameter bounds. The model needs exposure to near-critical crack configurations to accurately predict failure-prone scenarios.
+Expected Improvement: Improved accuracy at parameter space boundaries
+Priority: High
+
+**Proposal 4**
+Parameters: E=190e9, nu=0.30, K_I=3e6, crack_length=0.30
+Target Region: Central parameter space with low K_I
+Reasoning: Filling coverage gap in the low stress intensity region with moderate crack length.
+Expected Improvement: More uniform error distribution across parameter space
+Priority: Medium
+
+**Proposal 5**
+Parameters: E=210e9, nu=0.33, K_I=7e6, crack_length=0.40
+Target Region: High Poisson's ratio with long crack
+Reasoning: Higher Poisson's ratio affects stress distribution near crack tip. This sample explores material incompressibility effects on fracture behavior.
+Expected Improvement: Better capture of Poisson's ratio sensitivity
+Priority: Medium
+"""
 
 
 # =============================================================================
@@ -905,22 +989,296 @@ async def test_critic_scenarios(scenario, expected_issue):
 
 
 # =============================================================================
-# 7. Visualization Demo with Crack Contour Plots
+# 7. AdaptiveProposer Integration Tests
 # =============================================================================
 
+@pytest.mark.asyncio
+async def test_adaptive_proposer_propose_targeted():
+    """Test AdaptiveProposerAgent produces targeted proposals."""
+    from piano.agents.roles.adaptive_proposer import AdaptiveProposerAgent
+    from piano.agents.base import AgentContext
+    from piano.surrogate.evaluator import UncertaintyAnalysis, WeakRegion
+
+    proposer = AdaptiveProposerAgent()
+    provider = MockLLMProvider(scenario="underfitting")
+    proposer.set_llm_provider(provider)
+
+    context = AgentContext()
+
+    # Create mock uncertainty analysis with correct fields
+    uncertainty = UncertaintyAnalysis(
+        overall_uncertainty=0.15,
+        max_uncertainty=0.35,
+        weak_regions=[
+            WeakRegion(
+                parameter_ranges={"E": (180e9, 220e9), "nu": (0.28, 0.32), "K_I": (4e6, 6e6)},
+                metric="uncertainty",
+                metric_value=0.35,
+                priority=1.0,
+                sample_count=2,
+                suggested_samples=3,
+            ),
+        ],
+    )
+
+    parameter_bounds = {
+        "E": (150e9, 250e9),
+        "nu": (0.25, 0.35),
+        "K_I": (1e6, 10e6),
+        "crack_length": (0.2, 0.5),
+    }
+
+    proposals = await proposer.propose_targeted(
+        context=context,
+        uncertainty_analysis=uncertainty,
+        parameter_bounds=parameter_bounds,
+        n_samples=10,
+        n_valid=10,
+        n_proposals=3,
+    )
+
+    # Should return proposals with parameters
+    assert len(proposals) >= 1
+    for proposal in proposals:
+        assert proposal.parameters is not None
+        assert "E" in proposal.parameters
+        assert proposal.reasoning is not None
+
+
+def test_adaptive_proposer_parse_response():
+    """Test parsing of LLM response into proposals."""
+    from piano.agents.roles.adaptive_proposer import AdaptiveProposerAgent
+
+    proposer = AdaptiveProposerAgent()
+
+    # Test parsing the mock response format
+    response = """
+    **Proposal 1**
+    Parameters: E=200e9, nu=0.30, K_I=6e6, crack_length=0.35
+    Target Region: High uncertainty near crack tip
+    Reasoning: Testing the singularity region
+    Priority: High
+
+    **Proposal 2**
+    Parameters: E=180e9, nu=0.28, K_I=4e6, crack_length=0.25
+    Target Region: Low stiffness region
+    Reasoning: Exploring softer materials
+    Priority: Medium
+    """
+
+    proposals = proposer._parse_multiple_proposals(response, expected_count=2)
+
+    assert len(proposals) >= 2
+    assert proposals[0].parameters["E"] == 200e9
+    assert proposals[0].parameters["crack_length"] == 0.35
+    assert proposals[1].parameters["nu"] == 0.28
+
+
+def test_orchestrator_select_informative_samples():
+    """Test orchestrator sample selection with AdaptiveProposer."""
+    from piano.orchestration.adaptive import AdaptiveOrchestrator, AdaptiveConfig
+    from pathlib import Path
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = AdaptiveConfig(
+            base_mesh_path=Path(tmpdir) / "mesh.mesh",
+            output_dir=Path(tmpdir) / "output",
+            parameter_bounds={
+                "E": (150e9, 250e9),
+                "nu": (0.25, 0.35),
+                "K_I": (1e6, 10e6),
+                "crack_length": (0.2, 0.5),
+            },
+            use_agentic_proposer=True,
+        )
+
+        provider = MockLLMProvider(scenario="underfitting")
+        orchestrator = AdaptiveOrchestrator(config, llm_provider=provider)
+
+        # Verify proposer is initialized
+        assert orchestrator.proposer is not None
+
+        # Test that calling _select_informative_samples without evaluator raises
+        # (this is expected since we haven't set up the full training pipeline)
+        with pytest.raises(RuntimeError, match="Evaluator not initialized"):
+            orchestrator._select_informative_samples(3)
+
+
+def test_orchestrator_proposer_initialization():
+    """Test that proposer is correctly initialized based on config."""
+    from piano.orchestration.adaptive import AdaptiveOrchestrator, AdaptiveConfig
+    from pathlib import Path
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # When use_agentic_proposer=False, proposer should be None
+        config_disabled = AdaptiveConfig(
+            base_mesh_path=Path(tmpdir) / "mesh.mesh",
+            output_dir=Path(tmpdir) / "output",
+            use_agentic_proposer=False,
+        )
+        orchestrator_disabled = AdaptiveOrchestrator(config_disabled)
+        assert orchestrator_disabled.proposer is None
+
+        # When use_agentic_proposer=True, proposer should be initialized
+        config_enabled = AdaptiveConfig(
+            base_mesh_path=Path(tmpdir) / "mesh2.mesh",
+            output_dir=Path(tmpdir) / "output2",
+            use_agentic_proposer=True,
+        )
+        provider = MockLLMProvider()
+        orchestrator_enabled = AdaptiveOrchestrator(config_enabled, llm_provider=provider)
+        assert orchestrator_enabled.proposer is not None
+
+
+# =============================================================================
+# 8. Visualization Demo: Agentic Loop Progress with V-Notch FEM
+# =============================================================================
+
+def _generate_vnotch_fem_data(
+    n_samples: int,
+    notch_depth: float = 0.3,
+    notch_angle: float = 60.0,
+    resolution: int = 20,
+    seed: int = 42,
+    output_field: str = "von_mises",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray]]:
+    """
+    Generate V-notch FEM dataset (or synthetic if MFEM unavailable).
+
+    Returns:
+        params: (n_samples, 3) - [E, nu, traction]
+        coords: (n_nodes, 2) - mesh coordinates
+        triangles: (n_elements, 3) - element connectivity
+        outputs: List of output arrays (von_mises or displacement)
+    """
+    from piano.data.fem_generator import generate_vnotch_fem_sample, VNotchFEMConfig, compute_ki
+
+    rng = np.random.default_rng(seed)
+
+    config = VNotchFEMConfig(
+        notch_depth=notch_depth,
+        notch_angle=notch_angle,
+        resolution=resolution,
+    )
+
+    params_list = []
+    outputs = []
+    coords = None
+    triangles = None
+
+    for i in range(n_samples):
+        E = float(rng.uniform(150e9, 250e9))
+        nu = float(rng.uniform(0.25, 0.35))
+        traction = float(rng.uniform(50e6, 150e6))
+
+        sample = generate_vnotch_fem_sample(E, nu, traction, config)
+
+        if sample is not None:
+            # Use coordinates from the FEM sample (MFEM-compacted node list)
+            if coords is None:
+                coords = sample.coordinates
+                # Build Delaunay triangulation on MFEM coords for visualization
+                from scipy.spatial import Delaunay
+                triangles = Delaunay(coords).simplices
+
+            K_I_val = compute_ki(traction, notch_depth=config.notch_depth,
+                                 width=config.width, angle=config.notch_angle)
+            params_list.append([E, nu, traction, K_I_val])
+            if output_field == "von_mises" and sample.von_mises is not None:
+                # Von Mises stress (scalar field) -> shape (N, 1)
+                outputs.append(sample.von_mises[:, np.newaxis])
+            else:
+                # Displacement field -> shape (N, 2)
+                outputs.append(sample.displacement)
+
+    params = np.array(params_list, dtype=np.float32)
+    if coords is None:
+        raise RuntimeError("No valid FEM samples generated")
+
+    return params, coords.astype(np.float32), triangles, outputs
+
+
+def _compute_von_mises_nodal(
+    disp: np.ndarray,
+    coords: np.ndarray,
+    triangles: np.ndarray,
+    E: float,
+    nu: float,
+) -> np.ndarray:
+    """
+    Compute nodal von Mises stress from nodal displacement using CST B-matrices.
+
+    Each element contributes a constant stress; values are averaged at shared nodes.
+
+    Args:
+        disp:      (N, 2) nodal displacement [u_x, u_y]
+        coords:    (N, 2) node coordinates
+        triangles: (M, 3) element connectivity
+        E, nu:     material properties (plane stress)
+
+    Returns:
+        (N,) nodal von Mises stress
+    """
+    E_fac = E / (1.0 - nu**2)      # plane-stress modulus factor
+    mu = E / (2.0 * (1.0 + nu))
+
+    n_nodes = len(coords)
+    vm_sum = np.zeros(n_nodes)
+    count = np.zeros(n_nodes)
+
+    for tri in triangles:
+        n0, n1, n2 = int(tri[0]), int(tri[1]), int(tri[2])
+        x0, y0 = coords[n0]
+        x1, y1 = coords[n1]
+        x2, y2 = coords[n2]
+
+        A2 = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+        if abs(A2) < 1e-14:
+            continue
+
+        b0 = y1 - y2;  b1 = y2 - y0;  b2 = y0 - y1
+        c0 = x2 - x1;  c1 = x0 - x2;  c2 = x1 - x0
+
+        # CST B-matrix: B @ u_e = [eps_xx, eps_yy, gamma_xy]
+        u_e = np.array([disp[n0, 0], disp[n0, 1],
+                        disp[n1, 0], disp[n1, 1],
+                        disp[n2, 0], disp[n2, 1]])
+        eps_xx = (b0 * u_e[0] + b1 * u_e[2] + b2 * u_e[4]) / A2
+        eps_yy = (c0 * u_e[1] + c1 * u_e[3] + c2 * u_e[5]) / A2
+        gam_xy = (c0 * u_e[0] + b0 * u_e[1] + c1 * u_e[2] +
+                  b1 * u_e[3] + c2 * u_e[4] + b2 * u_e[5]) / A2
+
+        # Plane-stress constitutive
+        sig_xx = E_fac * (eps_xx + nu * eps_yy)
+        sig_yy = E_fac * (eps_yy + nu * eps_xx)
+        sig_xy = mu * gam_xy
+
+        vm = np.sqrt(sig_xx**2 - sig_xx * sig_yy + sig_yy**2 + 3.0 * sig_xy**2)
+
+        for nid in (n0, n1, n2):
+            vm_sum[nid] += vm
+            count[nid] += 1
+
+    count = np.maximum(count, 1)
+    return vm_sum / count
+
+
 def run_agentic_loop_demo(
-    n_samples: int = 8,
-    epochs: int = 30,
-    output_file: str = "tests/test_outputs/agentic_crack_demo.png",
+    n_samples: int = 30,
+    epochs_per_round: int = 80,
+    max_hpo_rounds: int = 8,
+    output_file: str = "tests/test_outputs/agentic_vnotch_demo.png",
 ):
     """
-    Demonstration of agentic SciML loop for crack problems.
+    Demonstration of agentic SciML loop for V-notch problem.
 
-    Generates visualization with:
-    - Displacement contour on crack mesh
-    - Error concentration at crack tip
-    - Training convergence before/after HPO
-    - Hyperparameter changes
+    Shows the iterative HPO process:
+    - Multiple HPO rounds with agent interventions
+    - Loss progression across rounds
+    - Error reduction over iterations
+    - Final prediction vs FEM ground truth (von Mises stress)
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -929,87 +1287,39 @@ def run_agentic_loop_demo(
     import matplotlib.tri as mtri
 
     print("=" * 70)
-    print("Agentic SciML Loop: Static Crack Problem")
+    print("PIANO: Agentic SciML Loop - V-Notch Stress Prediction")
     print("=" * 70)
 
-    rng = np.random.default_rng(42)
+    # Configuration
+    notch_depth = 0.3
+    notch_angle = 60.0
+    output_field = "displacement"  # Vector field — PINO-compatible (output_dim=2)
 
-    # Generate crack mesh
-    print("\n1. Generating crack mesh...")
-    crack_length = 0.35
-    coords, triangles = _generate_crack_mesh(
-        n_points=500, crack_length=crack_length, rng=rng
+    # Generate analytical GT data
+    print(f"\n1. Generating {n_samples} V-notch analytical samples (displacement)...")
+    params, coords, triangles, outputs = _generate_vnotch_fem_data(
+        n_samples=n_samples,
+        notch_depth=notch_depth,
+        notch_angle=notch_angle,
+        resolution=20,
+        output_field=output_field,
     )
-    tip_x, tip_y = crack_length, 0.5
-    print(f"   Mesh: {len(coords)} nodes, {len(triangles)} triangles")
-    print(f"   Crack length: {crack_length}, tip at ({tip_x:.2f}, {tip_y:.2f})")
-
-    # Generate training samples
-    print(f"\n2. Generating {n_samples} training samples (Williams expansion)...")
-    params_list = []
-    outputs = []
-    for i in range(n_samples):
-        p = {
-            "E": float(rng.uniform(150e9, 250e9)),
-            "nu": float(rng.uniform(0.25, 0.35)),
-            "K_I": float(rng.uniform(2e6, 8e6)),
-            "crack_length": crack_length,
-        }
-        params_list.append(p)
-        disp = _williams_displacement(coords, p, tip_x=tip_x, tip_y=tip_y)
-        outputs.append(disp)
-
-    params = np.array([[p["E"], p["nu"], p["K_I"], p["crack_length"]]
-                       for p in params_list], dtype=np.float32)
+    print(f"   Mesh: {len(coords)} nodes, {len(triangles)} elements")
+    print(f"   Notch: depth={notch_depth}, angle={notch_angle}°")
+    print(f"   Output: {output_field} (vector field, PINO-enabled)")
 
     # Import training components
-    from piano.surrogate.base import TransolverConfig
+    from piano.surrogate.base import TransolverConfig, CrackConfig
     from piano.surrogate.trainer import SurrogateTrainer, TrainingConfig
     from piano.agents.roles.hyperparameter_critic import (
         HyperparameterCriticAgent, TrainingHistory,
     )
     from piano.agents.roles.architect import ArchitectAgent
+    from piano.agents.roles.physicist import PhysicistAgent
     from piano.agents.base import AgentContext
     import asyncio
 
-    # Initial config (intentionally weak for crack singularity)
-    print("\n3. Training with INITIAL config (weak for singularity)...")
-    initial_config = TransolverConfig(
-        d_model=64,       # Too small
-        n_layers=2,       # Too shallow
-        n_heads=4,
-        slice_num=8,      # Too coarse
-        dropout=0.0,
-        learning_rate=1e-4,  # Too slow
-        optimizer_type="adam",
-        scheduler_type="plateau",
-        epochs=epochs,
-        patience=20,
-        batch_size=4,
-        output_dim=2,
-    )
-
-    trainer1 = SurrogateTrainer(TrainingConfig(
-        surrogate_config=initial_config,
-        use_ensemble=True,
-        n_ensemble=3,
-        train_test_split=0.2,
-    ))
-    result1 = trainer1.train(params, [coords] * n_samples, outputs)
-    print(f"   Initial: train={result1.train_loss:.6f}, test={result1.test_loss:.6f}")
-
-    # Critic analysis
-    print("\n4. Critic analyzing training...")
-    history = TrainingHistory(
-        train_losses=result1.history.get("train_loss", []),
-        test_losses=result1.history.get("test_loss", []),
-        epochs_completed=len(result1.history.get("train_loss", [])),
-        final_train_loss=result1.train_loss,
-        final_test_loss=result1.test_loss,
-    )
-
-    from piano.agents.roles.physicist import PhysicistAgent
-
+    # Initialize agents
     critic = HyperparameterCriticAgent()
     architect = ArchitectAgent()
     physicist = PhysicistAgent()
@@ -1018,225 +1328,410 @@ def run_agentic_loop_demo(
     architect.set_llm_provider(provider)
     physicist.set_llm_provider(provider)
 
+    # Track progress across HPO rounds
+    round_results = []
+    all_train_losses = []
+    all_test_losses = []
+    agent_actions = []
+
+    # Notch tip position and fixed tip_weight (geometry info, not agent-tunable)
+    tip = np.array([notch_depth, 0.5], dtype=np.float32)
+    tip_weight_fixed = 5.0
+
+    # Crack fracture PINO config: K_I is 4th param (index 3), E=0, nu=1
+    crack_cfg = CrackConfig(
+        tip_x=notch_depth,
+        tip_y=0.5,
+        e_param_idx=0,
+        nu_param_idx=1,
+        ki_param_idx=3,
+    )
+
+    # Initial config — small model that generalises with O(30) samples.
+    # Crack physics losses left at 0.0: their scale (O(1e12) Pa²) dwarfs
+    # the data loss (O(1)) until the surrogate produces physical displacements.
+    current_config = TransolverConfig(
+        d_model=32,
+        n_layers=2,
+        n_heads=2,
+        slice_num=8,
+        dropout=0.0,
+        learning_rate=1e-3,
+        optimizer_type="adamw",
+        scheduler_type="cosine",
+        epochs=epochs_per_round,
+        patience=epochs_per_round,
+        batch_size=4,
+        output_dim=2,
+        pino_weight=0.0,    # start data-only; architect enables physics
+        tip_weight=2.0,
+        ki_weight=0.0,
+        bc_weight=0.0,
+        williams_weight=0.0,
+        j_weight=0.0,
+    )
+
     context = AgentContext()
     loop = asyncio.new_event_loop()
 
-    critique = loop.run_until_complete(
-        critic.analyze_training(context, history, initial_config.to_dict())
-    )
-    print(f"   Diagnosis: {critique.primary_issue.name} ({critique.severity})")
+    # Convergence criteria
+    min_improvement_pct = 2.0   # stop when round-over-round improvement < 2 %
+    min_rounds = 2              # always run at least this many rounds
 
-    # Architect proposal (architecture + optimizer)
-    print("\n5. Architect proposing architecture changes...")
-    arch_proposal = loop.run_until_complete(
-        architect.propose_config(context, initial_config, critique, n_samples)
-    )
-    print(f"   Architecture: {arch_proposal.changes}")
+    print(f"\n2. Agentic loop — runs until convergence "
+          f"(max {max_hpo_rounds} rounds, stop when <{min_improvement_pct}% improvement)...")
 
-    # Physicist proposal (physics loss config)
-    print("\n6. Physicist proposing physics loss changes...")
-    phys_proposal = loop.run_until_complete(
-        physicist.propose_physics_config(
-            context, initial_config.to_dict(), critique, history,
-            n_samples, problem_type="crack", has_singularity=True
+    round_idx = 0
+    converged = False
+    best_test_loss = float('inf')
+    best_trainer = None
+    no_improve_streak = 0
+    max_no_improve = 2          # stop after this many consecutive non-improving rounds
+
+    while round_idx < max_hpo_rounds and not converged:
+        print(f"\n   --- Round {round_idx + 1} ---")
+
+        # Train with current config; patience = epochs so we never early-stop within a round
+        current_config.patience = current_config.epochs
+        trainer = SurrogateTrainer(TrainingConfig(
+            surrogate_config=current_config,
+            use_ensemble=True,
+            n_ensemble=3,
+            train_test_split=0.2,
+            tip_coords=tip,
+            crack_config=crack_cfg,
+        ))
+        result = trainer.train(params, [coords] * len(params), outputs)
+        if not result.success:
+            print(f"   [ERROR] Training failed: {result.error_message}")
+
+        # Store results
+        round_results.append({
+            "round": round_idx + 1,
+            "train_loss": result.train_loss,
+            "test_loss": result.test_loss,
+            "config": current_config.to_dict().copy(),
+            "trainer": trainer,
+            "history": result.history,
+        })
+
+        # Accumulate loss history
+        round_train = result.history.get("train_loss", [])
+        round_test  = result.history.get("test_loss", [])
+        all_train_losses.extend(round_train)
+        all_test_losses.extend(round_test)
+
+        curr_loss = result.test_loss
+        print(f"   Train: {result.train_loss:.6f}, Test: {curr_loss:.6f}")
+
+        # Track best model across all rounds
+        if curr_loss < best_test_loss:
+            improvement_vs_best = (best_test_loss - curr_loss) / best_test_loss * 100.0 if best_test_loss < float('inf') else 100.0
+            best_test_loss = curr_loss
+            best_trainer = trainer
+            no_improve_streak = 0
+            if round_idx > 0:
+                print(f"   New best! Improvement: {improvement_vs_best:.1f}%")
+        else:
+            no_improve_streak += 1
+            regress_pct = (curr_loss - best_test_loss) / best_test_loss * 100.0
+            print(f"   No improvement ({regress_pct:+.1f}% vs best). Streak: {no_improve_streak}/{max_no_improve}")
+
+        # Convergence check (after minimum rounds)
+        if round_idx >= min_rounds - 1:
+            if no_improve_streak >= max_no_improve:
+                print(f"   Converged — no improvement for {max_no_improve} consecutive rounds.")
+                converged = True
+            elif round_idx >= 1:
+                # Also stop if marginal gain vs best
+                if best_test_loss < float('inf'):
+                    prev_best = round_results[-2]["test_loss"] if len(round_results) >= 2 else float('inf')
+                    if prev_best > 0 and prev_best < float('inf'):
+                        round_improvement = (prev_best - curr_loss) / prev_best * 100.0
+                        if 0 < round_improvement < min_improvement_pct:
+                            print(f"   Converged — improvement {round_improvement:.1f}% < {min_improvement_pct}% threshold.")
+                            converged = True
+
+        # Critic analysis
+        history = TrainingHistory(
+            train_losses=round_train,
+            test_losses=round_test,
+            epochs_completed=len(round_train),
+            final_train_loss=result.train_loss,
+            final_test_loss=result.test_loss,
         )
-    )
-    print(f"   Physics: {phys_proposal.changes}")
 
-    # Merge proposals
-    proposal = arch_proposal  # Use architect's config as base
-    for k, v in phys_proposal.changes.items():
-        if k.startswith("pino"):
-            proposal.changes[k] = v
+        critique = loop.run_until_complete(
+            critic.analyze_training(context, history, current_config.to_dict())
+        )
+
+        action = {
+            "round": round_idx + 1,
+            "issue": critique.primary_issue.name,
+            "severity": critique.severity,
+            "arch_changes": {},
+            "phys_changes": {},
+        }
+
+        if not converged and critique.should_retrain:
+            # Get proposals from both agents
+            arch_proposal = loop.run_until_complete(
+                architect.propose_config(context, current_config, critique, len(params))
+            )
+            phys_proposal = loop.run_until_complete(
+                physicist.propose_physics_config(
+                    context, current_config.to_dict(), critique, history,
+                    len(params), problem_type="notch", has_singularity=True
+                )
+            )
+
+            action["arch_changes"] = arch_proposal.changes
+            action["phys_changes"] = phys_proposal.changes
+
+            # Apply changes; preserve geometry-fixed params
+            current_config = arch_proposal.config
+            current_config.tip_weight = tip_weight_fixed
+            current_config.output_dim = 2
+            for k, v in phys_proposal.changes.items():
+                if hasattr(current_config, k):
+                    setattr(current_config, k, v)
+
+            print(f"   Critic: {critique.primary_issue.name}")
+            print(f"   Architect: {list(arch_proposal.changes.keys())}")
+            print(f"   Physicist: {list(phys_proposal.changes.keys())}")
+
+        agent_actions.append(action)
+        round_idx += 1
 
     loop.close()
+    n_rounds_run = round_idx
 
-    # Retrain with optimized config
-    print("\n7. Retraining with OPTIMIZED config...")
-    new_config = proposal.config
+    # Generate test prediction with final model
+    print("\n3. Generating test prediction...")
+    test_E, test_nu, test_traction = 200e9, 0.3, 100e6
+    from piano.data.fem_generator import compute_ki as _compute_ki
+    test_K_I = _compute_ki(test_traction, notch_depth=notch_depth, angle=notch_angle)
+    test_arr = np.array([[test_E, test_nu, test_traction, test_K_I]], dtype=np.float32)
 
-    trainer2 = SurrogateTrainer(TrainingConfig(
-        surrogate_config=new_config,
-        use_ensemble=True,
-        n_ensemble=3,
-        train_test_split=0.2,
-    ))
-    result2 = trainer2.train(params, [coords] * n_samples, outputs)
-    print(f"   After HPO: train={result2.train_loss:.6f}, test={result2.test_loss:.6f}")
+    # Get ground truth displacement from FEM
+    from piano.data.fem_generator import generate_vnotch_fem_sample, VNotchFEMConfig
+    gt_config = VNotchFEMConfig(notch_depth=notch_depth, notch_angle=notch_angle, resolution=20)
+    gt_sample = generate_vnotch_fem_sample(test_E, test_nu, test_traction, gt_config)
 
-    # Store physics changes for visualization
-    physics_changes = phys_proposal.changes
+    if gt_sample is not None and gt_sample.displacement is not None:
+        disp_gt = gt_sample.displacement  # (N, 2) on same MFEM mesh
+        vm_gt = _compute_von_mises_nodal(disp_gt, coords, triangles, test_E, test_nu)
+    else:
+        disp_gt = outputs[0]
+        vm_gt = _compute_von_mises_nodal(disp_gt, coords, triangles, test_E, test_nu)
 
-    # Test prediction
-    print("\n9. Generating test prediction...")
-    test_params = {"E": 200e9, "nu": 0.3, "K_I": 5e6, "crack_length": crack_length}
-    test_arr = np.array([[test_params["E"], test_params["nu"],
-                          test_params["K_I"], test_params["crack_length"]]],
-                        dtype=np.float32)
+    # Use the best model across all rounds for the final prediction
+    pred_raw, _ = best_trainer.predict_with_uncertainty(test_arr, coords)
+    if pred_raw.ndim == 3:
+        pred_raw = pred_raw[0]
+    vm_pred = _compute_von_mises_nodal(pred_raw, coords, triangles, test_E, test_nu)
+    error = np.abs(vm_pred - vm_gt)
 
-    disp_gt = _williams_displacement(coords, test_params, tip_x=tip_x, tip_y=tip_y)
-    disp_mag_gt = np.linalg.norm(disp_gt, axis=1)
-
-    pred, unc = trainer2.predict_with_uncertainty(test_arr, coords)
-    if pred.ndim == 3:
-        pred = pred[0]
-    disp_mag_pred = np.linalg.norm(pred, axis=-1)
-
-    error = np.abs(disp_mag_pred - disp_mag_gt)
-
-    # Visualization
-    print("\n10. Creating 6-panel visualization...")
-
-    fig = plt.figure(figsize=(18, 12))
-    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.25)
-
-    triang = mtri.Triangulation(coords[:, 0], coords[:, 1], triangles)
-
-    def _contour(ax, values, title, cmap, vmin=None, vmax=None):
-        v0 = values.min() if vmin is None else vmin
-        v1 = values.max() if vmax is None else vmax
-        levels = np.linspace(v0, v1, 20)
-        cf = ax.tricontourf(triang, values, levels=levels, cmap=cmap, extend='both')
-        ax.triplot(triang, 'k-', lw=0.1, alpha=0.2)
-        # Mark crack
-        ax.plot([0, tip_x], [0.5, tip_y], 'r-', lw=2, label='Crack')
-        ax.plot(tip_x, tip_y, 'r*', markersize=12)
-        ax.set_xlim(-0.05, 1.05)
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_aspect('equal')
-        ax.set_title(title, fontsize=11, fontweight='bold')
-        return cf
-
-    # Row 1: Contour plots
-    ax1 = fig.add_subplot(gs[0, 0])
-    cf1 = _contour(ax1, disp_mag_pred, "Predicted |u| (Displacement)", "jet")
-    fig.colorbar(cf1, ax=ax1, shrink=0.7, label="|u| [m]")
-
-    ax2 = fig.add_subplot(gs[0, 1])
-    cf2 = _contour(ax2, disp_mag_gt, "Ground Truth |u| (Williams)", "jet",
-                   vmin=disp_mag_pred.min(), vmax=disp_mag_pred.max())
-    fig.colorbar(cf2, ax=ax2, shrink=0.7, label="|u| [m]")
-
-    ax3 = fig.add_subplot(gs[0, 2])
-    cf3 = _contour(ax3, error, "Prediction Error (near tip = hard)", "Reds")
-    fig.colorbar(cf3, ax=ax3, shrink=0.7, label="Error [m]")
-    ax3.text(0.02, 0.98, f"Mean: {error.mean():.2e}\nMax: {error.max():.2e}",
-             transform=ax3.transAxes, fontsize=8, va='top',
-             bbox=dict(facecolor='white', alpha=0.8))
-
-    # Row 2: Analysis
-    ax4 = fig.add_subplot(gs[1, 0])
-    if result1.history and result2.history:
-        ep1 = np.arange(1, len(result1.history["test_loss"]) + 1)
-        ep2 = np.arange(1, len(result2.history["test_loss"]) + 1)
-        ax4.semilogy(ep1, result1.history["test_loss"], 'r--', lw=1.5,
-                     alpha=0.6, label="Initial (test)")
-        ax4.semilogy(ep2, result2.history["test_loss"], 'b-', lw=2,
-                     label="After HPO (test)")
-        ax4.semilogy(ep2, result2.history["train_loss"], 'g--', lw=1.5,
-                     alpha=0.6, label="After HPO (train)")
-    ax4.set_xlabel("Epoch")
-    ax4.set_ylabel("Loss (log)")
-    ax4.set_title("Training Convergence", fontsize=11, fontweight='bold')
-    ax4.legend(fontsize=8)
-    ax4.grid(True, alpha=0.3)
-
-    # Config changes
-    ax5 = fig.add_subplot(gs[1, 1])
-    cfg_params = ["d_model", "n_layers", "slice_num", "learning_rate", "dropout"]
-    x = np.arange(len(cfg_params))
-    init_v = [initial_config.to_dict().get(p, 0) for p in cfg_params]
-    new_v = [new_config.to_dict().get(p, 0) for p in cfg_params]
-    max_v = [max(abs(i), abs(n), 1e-10) for i, n in zip(init_v, new_v)]
-    init_n = [i / m for i, m in zip(init_v, max_v)]
-    new_n = [n / m for n, m in zip(new_v, max_v)]
-
-    w = 0.35
-    ax5.bar(x - w/2, init_n, w, label="Initial", color="steelblue")
-    ax5.bar(x + w/2, new_n, w, label="After HPO", color="coral")
-    ax5.set_xticks(x)
-    ax5.set_xticklabels(cfg_params, rotation=20, ha="right")
-    ax5.set_title("Hyperparameter Changes", fontsize=11, fontweight='bold')
-    ax5.legend()
-    ax5.grid(True, axis="y", alpha=0.3)
-
-    # Summary
-    ax6 = fig.add_subplot(gs[1, 2])
-    ax6.axis("off")
-
-    improvement = (result1.test_loss - result2.test_loss) / result1.test_loss * 100
-
-    # Separate architecture and physics changes for display
-    arch_changes_str = chr(10).join(
-        f'  {k}: {v}' for k, v in list(arch_proposal.changes.items())[:3]
-        if not k.startswith('pino')
+    # -------------------------------------------------------------------------
+    # Build notch-aware triangulation: remove triangles inside the V-notch
+    # -------------------------------------------------------------------------
+    from piano.geometry.notch import VNotchGeometry
+    geometry = VNotchGeometry(notch_depth=notch_depth, notch_angle=notch_angle)
+    centroids = coords[triangles].mean(axis=1)  # (M, 2)
+    valid_mask = np.array(
+        [not geometry.is_inside_notch(c, tolerance=0.005) for c in centroids]
     )
-    phys_changes_str = chr(10).join(
-        f'  {k}: {v}' for k, v in physics_changes.items()
-    ) or "  (no changes)"
+    valid_triangles = triangles[valid_mask]
 
-    summary = f"""
-AGENTIC SCIML: 3-AGENT HPO
-{'='*44}
+    # =========================================================================
+    # VISUALIZATION: 2x3 Grid showing agentic loop progress
+    # =========================================================================
+    print("\n4. Creating visualization...")
 
-Problem: Edge crack with 1/sqrt(r) singularity
-Crack: a={crack_length:.2f}, Tip: ({tip_x:.2f}, {tip_y:.2f})
+    fig = plt.figure(figsize=(16, 10))
+    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.3)
 
-Critic: {critique.primary_issue.name} ({critique.severity})
+    # Get notch tip position for marking
+    tip_x, tip_y = notch_depth, 0.5
 
-Architect (architecture):
-{arch_changes_str}
+    # --- Panel 1: Loss Evolution Across All Rounds ---
+    ax1 = fig.add_subplot(gs[0, 0])
 
-Physicist (physics loss):
-{phys_changes_str}
+    epochs_total = len(all_test_losses)
+    epochs_arr = np.arange(1, epochs_total + 1)
 
-Performance:
-  Initial loss: {result1.test_loss:.6f}
-  Final loss:   {result2.test_loss:.6f}
-  Change:       {improvement:+.1f}%
+    ax1.semilogy(epochs_arr, all_train_losses, 'b-', lw=1.5, alpha=0.7, label='Train')
+    ax1.semilogy(epochs_arr, all_test_losses, 'r-', lw=2, label='Test')
 
-Error: mean={error.mean():.2e}, max={error.max():.2e}
-"""
-    ax6.text(0.02, 0.98, summary, transform=ax6.transAxes,
-             fontsize=9, va="top", fontfamily="monospace",
-             bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.9))
+    # Mark round boundaries
+    epoch_offset = 0
+    colors = ['green', 'orange', 'purple', 'brown']
+    for i, rr in enumerate(round_results):
+        n_epochs = len(rr["history"].get("train_loss", []))
+        if i > 0:
+            ax1.axvline(epoch_offset, color=colors[i % len(colors)], ls='--', lw=1.5, alpha=0.7)
+            ax1.text(epoch_offset + 1, ax1.get_ylim()[1] * 0.8, f'R{i+1}',
+                     fontsize=9, color=colors[i % len(colors)], fontweight='bold')
+        epoch_offset += n_epochs
 
-    fig.suptitle("Agentic SciML: 3-Agent HPO (Critic + Architect + Physicist)",
-                 fontsize=14, fontweight="bold")
+    ax1.set_xlabel('Epoch (cumulative)')
+    ax1.set_ylabel('Loss (log scale)')
+    ax1.set_title('Loss Evolution Across HPO Rounds', fontweight='bold')
+    ax1.legend(loc='upper right', fontsize=9)
+    ax1.grid(True, alpha=0.3)
 
+    # --- Panel 2: Test Error vs HPO Round ---
+    ax2 = fig.add_subplot(gs[0, 1])
+
+    rounds = [rr["round"] for rr in round_results]
+    test_losses = [rr["test_loss"] for rr in round_results]
+
+    ax2.plot(rounds, test_losses, 'ro-', lw=2, markersize=10, markerfacecolor='white', markeredgewidth=2)
+    ax2.fill_between(rounds, test_losses, alpha=0.3, color='red')
+
+    for i, (r, loss) in enumerate(zip(rounds, test_losses)):
+        ax2.annotate(f'{loss:.4f}', (r, loss), textcoords="offset points",
+                     xytext=(0, 10), ha='center', fontsize=9)
+
+    # Improvement = first round loss → best-across-all-rounds loss
+    improvement = (test_losses[0] - best_test_loss) / test_losses[0] * 100
+    # Highlight best round
+    best_round_idx = min(range(len(test_losses)), key=lambda i: test_losses[i])
+    ax2.plot(rounds[best_round_idx], test_losses[best_round_idx], 'g*', ms=14,
+             zorder=5, label=f'Best (R{rounds[best_round_idx]})')
+    ax2.legend(fontsize=8, loc='upper right')
+    ax2.set_xlabel('HPO Round')
+    ax2.set_ylabel('Test Loss')
+    ax2.set_title(f'Convergence: {improvement:.1f}% improvement (best vs R1)', fontweight='bold')
+    ax2.set_xticks(rounds)
+    ax2.grid(True, alpha=0.3)
+
+    # --- Panel 3: Agent Activity Timeline ---
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.axis('off')
+
+    timeline_text = "AGENT ACTIVITY LOG\n" + "=" * 40 + "\n\n"
+    for action in agent_actions:
+        timeline_text += f"Round {action['round']}:\n"
+        timeline_text += f"  Critic: {action['issue']} ({action['severity']})\n"
+        if action['arch_changes']:
+            changes = ', '.join(f"{k}" for k in list(action['arch_changes'].keys())[:3])
+            timeline_text += f"  Architect: {changes}\n"
+        if action['phys_changes']:
+            changes = ', '.join(f"{k}" for k in list(action['phys_changes'].keys())[:2])
+            timeline_text += f"  Physicist: {changes}\n"
+        timeline_text += "\n"
+
+    ax3.text(0.05, 0.95, timeline_text, transform=ax3.transAxes,
+             fontsize=9, va='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
+
+    # Notch-masked triangulation (removes triangles inside V-notch cavity)
+    triang = mtri.Triangulation(coords[:, 0], coords[:, 1], valid_triangles)
+
+    # Notch outline for overlay (V shape: upper edge → tip → lower edge)
+    notch_verts = geometry.get_notch_vertices()  # [upper_edge, tip, lower_edge]
+    notch_xs = [0.0, notch_verts[0, 0], notch_verts[1, 0], notch_verts[2, 0], 0.0]
+    notch_ys = [notch_verts[0, 1], notch_verts[0, 1],
+                notch_verts[1, 1], notch_verts[2, 1], notch_verts[2, 1]]
+
+    def _add_notch_overlay(ax):
+        """Fill V-notch cavity with white (clean cutout, no outlines)."""
+        ax.fill(notch_xs, notch_ys, color='white', zorder=3)
+
+    # Von Mises stress common colour scale (clip high singularity spike at 95th pct)
+    vm_all = np.concatenate([vm_pred, vm_gt])
+    vmin = 0.0
+    vmax = np.percentile(vm_all, 95)
+    levels = np.linspace(vmin, vmax, 25)
+
+    # --- Panel 4: Surrogate Von Mises ---
+    ax4 = fig.add_subplot(gs[1, 0])
+
+    cf4 = ax4.tricontourf(triang, np.clip(vm_pred, vmin, vmax),
+                          levels=levels, cmap='hot_r', extend='max')
+    ax4.triplot(triang, 'k-', lw=0.08, alpha=0.12)
+    _add_notch_overlay(ax4)
+    ax4.set_xlim(-0.05, 1.05)
+    ax4.set_ylim(-0.05, 1.05)
+    ax4.set_aspect('equal')
+    ax4.set_title('Surrogate: Von Mises Stress', fontweight='bold')
+    fig.colorbar(cf4, ax=ax4, shrink=0.7, label=r'$\sigma_{VM}$ [Pa]', format='%.1e')
+
+    # --- Panel 5: Ground Truth Von Mises ---
+    ax5 = fig.add_subplot(gs[1, 1])
+
+    cf5 = ax5.tricontourf(triang, np.clip(vm_gt, vmin, vmax),
+                          levels=levels, cmap='hot_r', extend='max')
+    ax5.triplot(triang, 'k-', lw=0.08, alpha=0.12)
+    _add_notch_overlay(ax5)
+    ax5.set_xlim(-0.05, 1.05)
+    ax5.set_ylim(-0.05, 1.05)
+    ax5.set_aspect('equal')
+    ax5.set_title('Ground Truth: Von Mises Stress', fontweight='bold')
+    fig.colorbar(cf5, ax=ax5, shrink=0.7, label=r'$\sigma_{VM}$ [Pa]', format='%.1e')
+
+    # --- Panel 6: Von Mises Error ---
+    ax6 = fig.add_subplot(gs[1, 2])
+
+    err_max = np.percentile(error, 95)
+    error_levels = np.linspace(0, err_max, 25)
+    cf6 = ax6.tricontourf(triang, np.clip(error, 0, err_max),
+                          levels=error_levels, cmap='Reds', extend='max')
+    ax6.triplot(triang, 'k-', lw=0.08, alpha=0.12)
+    _add_notch_overlay(ax6)
+    ax6.set_xlim(-0.05, 1.05)
+    ax6.set_ylim(-0.05, 1.05)
+    ax6.set_aspect('equal')
+    ax6.set_title(f'Von Mises Error (mean={error.mean():.2e} Pa)', fontweight='bold')
+    fig.colorbar(cf6, ax=ax6, shrink=0.7, label=r'$|\Delta\sigma_{VM}|$ [Pa]', format='%.1e')
+
+    stop_reason = "converged" if converged else "max rounds reached"
+    # Main title
+    fig.suptitle(
+        f'PIANO: V-Notch Von Mises Stress ({n_rounds_run} rounds, {improvement:.1f}% improvement, {stop_reason})',
+        fontsize=13, fontweight='bold'
+    )
+
+    # Save
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     print(f"\nSaved visualization to: {output_path}")
     print("\n" + "=" * 70)
     print("Summary:")
-    print(f"  Crack length:      {crack_length}")
-    print(f"  Training samples:  {n_samples}")
-    print(f"  Initial test loss: {result1.test_loss:.6f}")
-    print(f"  Final test loss:   {result2.test_loss:.6f}")
-    print(f"  Improvement:       {improvement:.1f}%")
-    print(f"  Mean error:        {error.mean():.2e} m")
+    print(f"  V-Notch: depth={notch_depth}, angle={notch_angle}°")
+    print(f"  Output: Displacement (vector, PINO) → Von Mises for visualization")
+    print(f"  Training samples: {n_samples}")
+    print(f"  HPO rounds run: {n_rounds_run} ({stop_reason})")
+    print(f"  Initial test loss: {round_results[0]['test_loss']:.6f}")
+    print(f"  Final test loss: {round_results[-1]['test_loss']:.6f}")
+    print(f"  Improvement: {improvement:.1f}%")
+    print(f"  Mean von Mises error: {error.mean():.2e} Pa")
     print("=" * 70)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Agentic SciML: Crack Problem")
-    parser.add_argument("--n-samples", type=int, default=8,
-                        help="Number of samples (default: 8)")
-    parser.add_argument("--epochs", type=int, default=30,
-                        help="Training epochs (default: 30)")
+    parser = argparse.ArgumentParser(description="PIANO: Agentic SciML V-Notch Demo")
+    parser.add_argument("--n-samples", type=int, default=30,
+                        help="Number of FEM samples (default: 30)")
+    parser.add_argument("--epochs", type=int, default=80,
+                        help="Epochs per first HPO round (default: 80; architect may increase)")
+    parser.add_argument("--rounds", type=int, default=8,
+                        help="Max HPO rounds before forced stop (default: 8)")
     parser.add_argument("--output", type=str, default=None,
                         help="Output PNG path")
     args = parser.parse_args()
 
-    output = args.output or str(PROJECT_ROOT / "tests" / "test_outputs" / "agentic_crack_demo.png")
+    output = args.output or str(PROJECT_ROOT / "tests" / "test_outputs" / "agentic_vnotch_demo.png")
 
     run_agentic_loop_demo(
         n_samples=args.n_samples,
-        epochs=args.epochs,
+        epochs_per_round=args.epochs,
+        max_hpo_rounds=args.rounds,
         output_file=output,
     )

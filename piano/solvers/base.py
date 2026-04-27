@@ -20,6 +20,7 @@ class PhysicsType(Enum):
     """Enumeration of supported physics types."""
     LINEAR_ELASTICITY = auto()
     HEAT_TRANSFER = auto()
+    PHASE_FIELD_FRACTURE = auto()
     # Future
     INCOMPRESSIBLE_NAVIER_STOKES = auto()
     STOKES = auto()
@@ -185,6 +186,42 @@ class NonlinearConfig:
 
 
 @dataclass
+class PhaseFieldConfig:
+    """
+    Configuration for phase field fracture model (AT2).
+
+    Implements the Ambrosio-Tortorelli (AT2) regularization of brittle fracture.
+
+    Attributes:
+        G_c: Fracture toughness / critical energy release rate (J/m²)
+        l_0: Regularization length scale (m) - controls crack width
+        k_res: Residual stiffness to prevent numerical singularity
+        stagger_tol: Convergence tolerance for staggered scheme
+        stagger_max_iter: Maximum staggered iterations per load step
+        n_load_steps: Number of quasi-static load steps
+        damage_threshold: Threshold for crack path extraction (d > threshold)
+    """
+    G_c: float = 2.7e3       # Fracture toughness (J/m²) - typical for steel
+    l_0: float = 0.015       # Regularization length (m)
+    k_res: float = 1e-7      # Residual stiffness for numerical stability
+    stagger_tol: float = 1e-4
+    stagger_max_iter: int = 100
+    n_load_steps: int = 50
+    damage_threshold: float = 0.9  # d > 0.9 considered as crack
+
+    def __post_init__(self):
+        """Validate phase field parameters."""
+        if self.G_c <= 0:
+            raise ValueError("Fracture toughness G_c must be positive")
+        if self.l_0 <= 0:
+            raise ValueError("Regularization length l_0 must be positive")
+        if not 0 < self.k_res < 1:
+            raise ValueError("Residual stiffness k_res must be in (0, 1)")
+        if not 0 < self.damage_threshold < 1:
+            raise ValueError("Damage threshold must be in (0, 1)")
+
+
+@dataclass
 class PhysicsConfig:
     """
     Physics configuration for FEM analysis.
@@ -197,6 +234,7 @@ class PhysicsConfig:
         heat_source: Volumetric heat source (W/m^3)
         transient: Time integration settings (None = steady-state)
         nonlinear: Newton iteration settings (None = linear problem)
+        phase_field: Phase field fracture settings (None = no fracture)
     """
     physics_type: PhysicsType
     material: MaterialProperties = field(default_factory=MaterialProperties)
@@ -205,6 +243,7 @@ class PhysicsConfig:
     heat_source: float = 0.0
     transient: Optional[TransientConfig] = None
     nonlinear: Optional[NonlinearConfig] = None
+    phase_field: Optional[PhaseFieldConfig] = None
 
 
 @dataclass

@@ -48,6 +48,8 @@ from ..surrogate.agentic_trainer import (
     AgenticTrainingConfig,
     AgenticTrainingResult,
 )
+from ..agents.roles.adaptive_proposer import AdaptiveProposerAgent, AdaptiveProposal
+from ..agents.base import AgentContext
 from .metrics import ActiveLearningMetrics, ConvergenceMonitor
 
 logger = logging.getLogger(__name__)
@@ -81,10 +83,10 @@ class AdaptiveConfig:
         patience: Iterations without improvement before stopping
         n_ensemble: Number of ensemble models for uncertainty
         physics_config: Optional physics configuration for simulations
-        acquisition_strategy: Acquisition function ("uncertainty", "ei", "qbc")
         use_agentic_hpo: Whether to use LLM-based hyperparameter optimization
+        use_agentic_proposer: Whether to use LLM-based sample proposal
         max_hpo_rounds: Maximum HPO rounds per training session
-        llm_model: LLM model for HPO agents
+        llm_model: LLM model for agents
     """
     base_mesh_path: Path
     output_dir: Path
@@ -97,9 +99,9 @@ class AdaptiveConfig:
     patience: int = 3
     n_ensemble: int = 5
     physics_config: Optional[PhysicsConfig] = None
-    acquisition_strategy: str = "uncertainty"
     random_seed: int = 42
     use_agentic_hpo: bool = False
+    use_agentic_proposer: bool = False
     max_hpo_rounds: int = 3
     llm_model: str = "gpt-4-turbo"
 
@@ -231,14 +233,21 @@ class AdaptiveOrchestrator:
         )
         self.dataset = FEMDataset(dataset_config)
 
-        # Initialize acquisition function
-        self._acquisition_fn = get_acquisition_function(config.acquisition_strategy)
+        # Initialize acquisition function (for non-agentic mode)
+        self._acquisition_fn = get_acquisition_function("uncertainty")
+
+        # Initialize agentic proposer if enabled
+        self.proposer: Optional[AdaptiveProposerAgent] = None
+        if config.use_agentic_proposer:
+            self.proposer = AdaptiveProposerAgent(model=config.llm_model)
+            if llm_provider:
+                self.proposer.set_llm_provider(llm_provider)
 
         # Setup RNG
         np.random.seed(config.random_seed)
 
         logger.info(f"Initialized AdaptiveOrchestrator")
-        logger.info(f"  Acquisition: {config.acquisition_strategy}")
+        logger.info(f"  Agentic Proposer: {config.use_agentic_proposer}")
         logger.info(f"  Convergence: {config.convergence_threshold}")
         logger.info(f"  Patience: {config.patience}")
         logger.info(f"  Max samples: {config.max_samples}")
@@ -499,34 +508,63 @@ class AdaptiveOrchestrator:
         n_samples: int
     ) -> List[Dict[str, float]]:
         """
-        Select new samples using acquisition-based active learning.
+        Select new samples using LLM-based adaptive proposer.
 
-        This is the core active learning step - using the acquisition
-        function to identify the most informative parameter configurations.
+        The AdaptiveProposerAgent analyzes uncertainty and weak regions,
+        then proposes new simulation parameters with reasoning.
         """
+        import asyncio
+
         if self.evaluator is None or self._coordinates is None:
-            return self._generate_random_parameters(n_samples)
+            raise RuntimeError("Evaluator not initialized")
 
-        # Get existing samples to avoid
-        existing_samples = None
-        try:
-            params, _, _ = self.dataset.prepare_training_data(
-                output_field="displacement",
-                valid_only=True
-            )
-            existing_samples = params
-        except ValueError:
-            pass
+        if self.proposer is None:
+            raise RuntimeError("AdaptiveProposer not initialized. Set use_agentic_proposer=True")
 
-        # Use acquisition-based selection (hardcoded sensible defaults)
-        new_params = self.evaluator.suggest_samples_active(
-            budget=n_samples,
-            coordinates=self._coordinates,
-            acquisition_type=self.config.acquisition_strategy,
-            n_candidates=1000,
-            diversity_weight=0.1,
-            existing_samples=existing_samples,
+        # Get uncertainty analysis from evaluator
+        analysis = self.evaluator.analyze_uncertainty(
+            self.surrogate,
+            self._coordinates
         )
+
+        # Get current sample count
+        n_current = len(self.dataset) if self.dataset else 0
+
+        # Create agent context
+        context = AgentContext()
+
+        # Run async proposer synchronously
+        loop = asyncio.new_event_loop()
+        try:
+            proposals = loop.run_until_complete(
+                self.proposer.propose_targeted(
+                    context=context,
+                    uncertainty_analysis=analysis,
+                    parameter_bounds=self.config.parameter_bounds,
+                    n_samples=n_current,
+                    n_valid=n_current,
+                    n_proposals=n_samples,
+                )
+            )
+        finally:
+            loop.close()
+
+        # Convert proposals to parameter dicts
+        new_params = []
+        for proposal in proposals:
+            if proposal.parameters:
+                # Ensure all required parameters are present
+                param_dict = {}
+                for name in self.config.parameter_names:
+                    if name in proposal.parameters:
+                        param_dict[name] = proposal.parameters[name]
+                    else:
+                        # Use midpoint of bounds if not specified
+                        bounds = self.config.parameter_bounds[name]
+                        param_dict[name] = (bounds[0] + bounds[1]) / 2
+                new_params.append(param_dict)
+                logger.info(f"  Proposal: {param_dict}")
+                logger.info(f"    Reasoning: {proposal.reasoning[:100]}...")
 
         return new_params
 

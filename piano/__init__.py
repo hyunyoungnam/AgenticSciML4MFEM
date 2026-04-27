@@ -1,28 +1,28 @@
 """
-piano: Automated MFEM mesh generation for AI/ML training datasets.
+PIANO: Physics-Informed Agentic Neural Operator
 
-This library provides multi-agent AI systems to automatically generate diverse,
-validated MFEM mesh files through intelligent mesh morphing. It eliminates
-the tedious manual work of creating FEA datasets for machine learning research.
+A self-improving surrogate framework for computational mechanics that combines:
+- Transolver neural operator for learning FEM field predictions
+- PINO loss for physics-informed training (equilibrium + energy norm)
+- 3-agent HPO system for autonomous hyperparameter optimization:
+  - CriticAgent: Diagnoses training issues
+  - ArchitectAgent: Proposes architecture/optimizer changes
+  - PhysicistAgent: Proposes physics loss configuration
 
-Key Features:
-- Adaptive learning: Surrogate-guided active learning with Transolver
-- PINO loss: Physics-informed training via 2D plane-stress equilibrium residual
-- MFEM integration: Native support for MFEM mesh format
-- FEM simulation: Built-in solvers for elasticity and heat transfer
-
-Example (Adaptive Learning):
-    >>> from piano import AdaptiveOrchestrator, AdaptiveConfig
-    >>> config = AdaptiveConfig(
-    ...     base_mesh_path="model.mesh",
-    ...     output_dir="./output",
-    ...     parameter_bounds={"delta_R": (-0.5, 0.5)},
+Example (Agentic Training):
+    >>> from piano.surrogate.agentic_trainer import (
+    ...     AgenticSurrogateTrainer, AgenticTrainingConfig
     ... )
-    >>> orchestrator = AdaptiveOrchestrator(config)
-    >>> result = orchestrator.run()
+    >>> config = AgenticTrainingConfig(
+    ...     max_hpo_rounds=3,
+    ...     use_physicist=True,
+    ...     problem_type="crack",
+    ... )
+    >>> trainer = AgenticSurrogateTrainer(config, llm_provider)
+    >>> result = trainer.train(params, coords, outputs)
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __author__ = "H.-Y. Nam, Q. Jiang"
 
 # Core API - MFEM mesh management
@@ -49,12 +49,26 @@ from piano.orchestration.adaptive import (
     AdaptiveResult,
 )
 
-# Backwards-compatible aliases
-AdaptiveOrchestratorConfig = AdaptiveConfig
-AdaptiveOrchestratorResult = AdaptiveResult
+# Surrogate API
+from piano.surrogate.base import TransolverConfig
+from piano.surrogate.trainer import SurrogateTrainer, TrainingConfig
+from piano.surrogate.agentic_trainer import (
+    AgenticSurrogateTrainer,
+    AgenticTrainingConfig,
+    AgenticTrainingResult,
+)
 
 # Dataset API
 from piano.data.dataset import FEMDataset, FEMSample, DatasetConfig
+
+# Geometry API
+from piano.geometry import (
+    CrackGeometry,
+    EdgeCrack,
+    CenterCrack,
+    CrackMeshGenerator,
+    generate_crack_mesh,
+)
 
 __all__ = [
     # Version info
@@ -77,10 +91,21 @@ __all__ = [
     "AdaptiveOrchestrator",
     "AdaptiveConfig",
     "AdaptiveResult",
-    "AdaptiveOrchestratorConfig",  # Backwards compat
-    "AdaptiveOrchestratorResult",  # Backwards compat
+    # Surrogate
+    "TransolverConfig",
+    "SurrogateTrainer",
+    "TrainingConfig",
+    "AgenticSurrogateTrainer",
+    "AgenticTrainingConfig",
+    "AgenticTrainingResult",
     # Dataset
     "FEMDataset",
     "FEMSample",
     "DatasetConfig",
+    # Geometry
+    "CrackGeometry",
+    "EdgeCrack",
+    "CenterCrack",
+    "CrackMeshGenerator",
+    "generate_crack_mesh",
 ]

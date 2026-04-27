@@ -13,10 +13,32 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .base import TransolverConfig, EnsembleConfig, SurrogateModel
+from .base import TransolverConfig, EnsembleConfig, SurrogateModel, CrackConfig
 from .transolver import TransolverModel
 from .ensemble import EnsembleModel
 from .pino_loss import PINOElasticityLoss
+from .crack_pino_loss import CrackFractureLoss
+
+
+def _weighted_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """MSE loss with optional per-node weighting for singularity-aware training.
+
+    Args:
+        pred:    (1, N, D) predicted field
+        target:  (1, N, D) ground-truth field
+        weights: (N,) per-node weights, or None for plain MSE
+
+    Returns:
+        Scalar loss
+    """
+    err = (pred - target) ** 2  # (1, N, D)
+    if weights is not None:
+        err = err * weights.unsqueeze(0).unsqueeze(-1)
+    return err.mean()
 
 
 def create_optimizer(model: nn.Module, config: TransolverConfig) -> torch.optim.Optimizer:
@@ -80,6 +102,8 @@ class TrainingConfig:
     random_seed: int = 42
     save_dir: Optional[Path] = None
     log_dir: Optional[Path] = None
+    tip_coords: Optional[np.ndarray] = None    # (2,) crack/notch tip for singularity-weighted MSE
+    crack_config: Optional[CrackConfig] = None  # crack geometry + param indices for fracture PINO
 
 
 @dataclass
@@ -135,7 +159,7 @@ class SurrogateTrainer:
         parameters: np.ndarray,
         coordinates: List[np.ndarray],
         outputs: List[np.ndarray],
-    ) -> Tuple[np.ndarray, List[np.ndarray], np.ndarray, List[np.ndarray], List[np.ndarray], Dict]:
+    ) -> Tuple[np.ndarray, List[np.ndarray], np.ndarray, List[np.ndarray], List[np.ndarray], Dict, np.ndarray]:
         """
         Prepare data for training.
 
@@ -165,6 +189,9 @@ class SurrogateTrainer:
         train_outputs = [outputs[i] for i in train_idx]
         test_outputs  = [outputs[i] for i in test_idx]
 
+        # Keep raw (un-normalized) train params for physics losses that need physical units
+        raw_train_params = train_params.copy()
+
         if self.config.normalize_inputs:
             self._input_normalizer = Normalizer()
             train_params = self._input_normalizer.fit_transform(train_params)
@@ -192,6 +219,7 @@ class SurrogateTrainer:
             train_outputs,
             test_outputs,
             self._get_normalization_params(),
+            raw_train_params,
         )
 
     def _get_normalization_params(self) -> Dict[str, Any]:
@@ -237,6 +265,7 @@ class SurrogateTrainer:
                 train_outputs,
                 test_outputs,
                 norm_params,
+                raw_train_params,
             ) = self.prepare_data(parameters, coordinates, outputs)
 
             n_train = len(train_params)
@@ -264,12 +293,53 @@ class SurrogateTrainer:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             model.to(device)
 
-            batch_size = self.config.surrogate_config.batch_size
-            optimizer = create_optimizer(model, self.config.surrogate_config)
-            scheduler = create_scheduler(optimizer, self.config.surrogate_config)
-            criterion = nn.MSELoss()
-
             cfg = self.config.surrogate_config
+
+            # Per-node weights for singularity-aware training
+            node_weights = None
+            if self.config.tip_coords is not None and cfg.tip_weight > 0:
+                tip = self.config.tip_coords  # (2,)
+                ref_coords = train_coords[0]  # (N, 2) — fixed mesh assumption
+                r = np.linalg.norm(ref_coords - tip, axis=1) + 1e-8
+                w = 1.0 + cfg.tip_weight / r
+                w = w / w.mean()  # normalize: mean weight = 1 so loss scale is unchanged
+                node_weights = torch.tensor(w, dtype=torch.float32, device=device)
+
+            # Crack fracture PINO loss (optional)
+            crack_loss_fn = None
+            out_mean_t = out_std_t = None
+            cc = self.config.crack_config
+            sc = self.config.surrogate_config
+            if (
+                cc is not None
+                and any(w > 0 for w in [sc.ki_weight, sc.bc_weight, sc.williams_weight, sc.j_weight])
+            ):
+                crack_loss_fn = CrackFractureLoss(
+                    tip_x=cc.tip_x,
+                    tip_y=cc.tip_y,
+                    r_ki_min=cc.r_ki_min,
+                    r_ki_max=cc.r_ki_max,
+                    r_williams=cc.r_williams,
+                    r_j=cc.r_j,
+                    crack_face_tol=cc.crack_face_tol,
+                    ki_weight=sc.ki_weight,
+                    bc_weight=sc.bc_weight,
+                    williams_weight=sc.williams_weight,
+                    j_weight=sc.j_weight,
+                ).to(device)
+                # Output normalizer stats as tensors for denormalization
+                if self._output_normalizer is not None:
+                    out_mean_t = torch.tensor(
+                        self._output_normalizer.mean, dtype=torch.float32, device=device
+                    )
+                    out_std_t = torch.tensor(
+                        self._output_normalizer.std, dtype=torch.float32, device=device
+                    )
+
+            batch_size = cfg.batch_size
+            optimizer = create_optimizer(model, cfg)
+            scheduler = create_scheduler(optimizer, cfg)
+
             use_pino = (
                 output_dim >= 2
                 and coord_dim == 2
@@ -312,11 +382,27 @@ class SurrogateTrainer:
                     ).unsqueeze(0)  # (1, N_i, output_dim)
 
                     pred = model.forward(params_t, coords_t)
-                    data_loss = criterion(pred, output_t) / batch_size
+                    data_loss = _weighted_mse(pred, output_t, node_weights) / batch_size
                     if pino_fn is not None:
                         physics_loss = pino_fn(pred[0], output_t[0], coords_t[0]) / batch_size
                     else:
                         physics_loss = torch.tensor(0.0, device=device)
+
+                    if crack_loss_fn is not None:
+                        # Denormalize prediction to physical units before crack loss
+                        u_phys = pred[0]
+                        if out_std_t is not None:
+                            u_phys = u_phys * out_std_t + out_mean_t
+                        raw_p = raw_train_params[idx]
+                        crack_phys_loss = crack_loss_fn(
+                            u_phys,
+                            coords_t[0],
+                            K_I=float(raw_p[cc.ki_param_idx]),
+                            E=float(raw_p[cc.e_param_idx]),
+                            nu=float(raw_p[cc.nu_param_idx]),
+                        ) / batch_size
+                        physics_loss = physics_loss + crack_phys_loss
+
                     loss = data_loss + physics_loss
                     loss.backward()
                     epoch_loss += data_loss.item() * batch_size
@@ -350,7 +436,7 @@ class SurrogateTrainer:
                             test_outputs[idx], dtype=torch.float32, device=device
                         ).unsqueeze(0)
                         pred = model.forward(params_t, coords_t)
-                        test_loss += criterion(pred, output_t).item() / n_test
+                        test_loss += _weighted_mse(pred, output_t).item() / n_test
                 history['test_loss'].append(test_loss)
                 history['pino_loss'].append(epoch_pino_loss / n_train)
 
@@ -417,6 +503,9 @@ class SurrogateTrainer:
             )
 
         except Exception as e:
+            import traceback
+            msg = traceback.format_exc()
+            print(f"[SurrogateTrainer] Training failed:\n{msg}")
             return TrainingResult(
                 success=False,
                 error_message=str(e),

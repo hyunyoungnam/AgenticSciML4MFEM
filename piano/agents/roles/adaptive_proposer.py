@@ -300,8 +300,8 @@ class AdaptiveProposerAgent(BaseAgent[AdaptiveProposal]):
         )
         if params_match:
             params_str = params_match.group(1)
-            # Parse param=value pairs
-            param_pairs = re.findall(r'(\w+)\s*=\s*([+-]?[0-9.]+)', params_str)
+            # Parse param=value pairs (support scientific notation like 200e9, 1e-3)
+            param_pairs = re.findall(r'(\w+)\s*=\s*([+-]?[0-9.]+(?:[eE][+-]?[0-9]+)?)', params_str)
             for name, value in param_pairs:
                 try:
                     proposal.parameters[name] = float(value)
@@ -351,7 +351,8 @@ class AdaptiveProposerAgent(BaseAgent[AdaptiveProposal]):
         # Split by proposal markers
         proposal_blocks = re.split(
             r'\*\*Proposal\s+\d+\*\*',
-            response, re.IGNORECASE
+            response,
+            flags=re.IGNORECASE
         )
 
         for block in proposal_blocks[1:]:  # Skip first empty split

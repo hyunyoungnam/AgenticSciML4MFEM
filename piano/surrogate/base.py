@@ -11,6 +11,38 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+
+@dataclass
+class CrackConfig:
+    """
+    Crack geometry and parameter-index configuration for CrackFractureLoss.
+
+    Tells the trainer which parameter indices hold K_I, E, nu so it can
+    pass physical values to the physics loss after output denormalization.
+
+    Attributes:
+        tip_x:           Crack tip x-coordinate
+        tip_y:           Crack tip y-coordinate
+        e_param_idx:     Index of Young's modulus in the raw parameter vector
+        nu_param_idx:    Index of Poisson's ratio in the raw parameter vector
+        ki_param_idx:    Index of K_I in the raw parameter vector
+        r_ki_min:        Inner radius of K_I extraction annulus
+        r_ki_max:        Outer radius of K_I extraction annulus
+        r_williams:      Radius of Williams matching zone
+        r_j:             Outer radius of J-integral domain
+        crack_face_tol:  Half-width tolerance for crack-face element detection
+    """
+    tip_x: float
+    tip_y: float
+    e_param_idx: int = 0
+    nu_param_idx: int = 1
+    ki_param_idx: int = 3
+    r_ki_min: float = 0.02
+    r_ki_max: float = 0.10
+    r_williams: float = 0.05
+    r_j: float = 0.15
+    crack_face_tol: float = 0.02
+
 import numpy as np
 
 
@@ -58,6 +90,11 @@ class TransolverConfig:
     pino_eq_weight: float = 0.1
     pino_E: float = 1.0   # Dimensionless: trainer normalizes outputs, physical E cancels
     pino_nu: float = 0.3
+    tip_weight: float = 0.0      # >0 upweights nodes near singularity tip by (1 + tip_weight/r)
+    ki_weight: float = 0.0       # K_I consistency loss weight
+    bc_weight: float = 0.0       # Crack face traction-free BC loss weight
+    williams_weight: float = 0.0 # Williams asymptotic residual loss weight
+    j_weight: float = 0.0        # J-integral conservation loss weight
     optimizer_type: str = "adamw"
     scheduler_type: str = "plateau"
     activation: str = "gelu"
@@ -81,6 +118,11 @@ class TransolverConfig:
             "pino_eq_weight": self.pino_eq_weight,
             "pino_E": self.pino_E,
             "pino_nu": self.pino_nu,
+            "tip_weight": self.tip_weight,
+            "ki_weight": self.ki_weight,
+            "bc_weight": self.bc_weight,
+            "williams_weight": self.williams_weight,
+            "j_weight": self.j_weight,
             "optimizer_type": self.optimizer_type,
             "scheduler_type": self.scheduler_type,
             "activation": self.activation,
