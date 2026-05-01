@@ -46,6 +46,7 @@ class FEMSample:
     von_mises: Optional[np.ndarray] = None
     damage: Optional[np.ndarray] = None
     crack_path: Optional[np.ndarray] = None
+    elements: Optional[np.ndarray] = None
     mesh_file: Optional[Path] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -369,6 +370,8 @@ class FEMDataset:
                 np.save(sample_dir / "damage.npy", sample.damage)
             if sample.crack_path is not None:
                 np.save(sample_dir / "crack_path.npy", sample.crack_path)
+            if sample.elements is not None:
+                np.save(sample_dir / "elements.npy", sample.elements)
 
         return path
 
@@ -436,6 +439,10 @@ class FEMDataset:
             if (sample_dir / "crack_path.npy").exists():
                 crack_path = np.load(sample_dir / "crack_path.npy")
 
+            elements = None
+            if (sample_dir / "elements.npy").exists():
+                elements = np.load(sample_dir / "elements.npy")
+
             sample = FEMSample(
                 sample_id=sample_id,
                 parameters=sample_meta["parameters"],
@@ -446,6 +453,7 @@ class FEMDataset:
                 von_mises=von_mises,
                 damage=damage,
                 crack_path=crack_path,
+                elements=elements,
                 mesh_file=Path(sample_meta["mesh_file"]) if sample_meta.get("mesh_file") else None,
                 metadata=sample_meta.get("metadata", {}),
                 created_at=sample_meta.get("created_at", ""),

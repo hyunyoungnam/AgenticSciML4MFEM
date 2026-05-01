@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from piano.agents.base import BaseAgent, AgentContext, AgentRole
 from piano.agents.roles.hyperparameter_critic import CritiqueResult
 from piano.surrogate.base import TransolverConfig
+from piano.surrogate.deeponet import DeepONetConfig
 
 
 @dataclass
@@ -45,14 +46,30 @@ Your role is to propose concrete model configurations based on training diagnost
 
 The Transolver is a transformer-based neural operator that learns mappings from parameters to physical fields. Key hyperparameters:
 
-### Architecture
-- `d_model`: Hidden dimension (64, 128, 256, 512). Higher = more capacity, more compute.
-- `n_layers`: Number of transformer layers (2, 4, 6, 8). More layers = deeper features, risk of overfitting.
-- `n_heads`: Attention heads (4, 8, 16). Should divide d_model evenly.
-- `slice_num`: Physics slices for attention (16, 32, 64). More = finer resolution.
-- `mlp_ratio`: FFN expansion (2.0, 4.0). Higher = more parameters.
-- `dropout`: Regularization (0.0, 0.1, 0.2). Higher = less overfitting.
+### Architecture Selection
+- `arch_type`: Neural architecture to use — **choose first, then set its hyperparameters**.
+  - `transolver`: Physics-Attention neural operator. Best for varied geometry or large datasets (>200 samples).
+  - `deeponet`: Branch-trunk operator. Best for **fixed geometry + small datasets (<100 samples)**.
+    Branch(params) x Trunk(x,y) separates parameter dependence from spatial basis learning.
+    Far fewer parameters than Transolver — generalises well with 20-50 samples.
+
+### Transolver Hyperparameters (when arch_type=transolver)
+- `d_model`: Hidden dimension (32, 64, 128, 256). Higher = more capacity.
+- `n_layers`: Transformer layers (2, 4, 6). More = deeper features, risk of overfitting.
+- `n_heads`: Attention heads (2, 4, 8). Must divide d_model evenly.
+- `slice_num`: Physics slices (4, 8, 16, 32). More = finer spatial resolution.
+- `mlp_ratio`: FFN expansion (2.0, 4.0).
+- `dropout`: Regularization (0.0, 0.1, 0.2, 0.3).
 - `activation`: Activation function (gelu, relu, silu).
+
+### DeepONet Hyperparameters (when arch_type=deeponet)
+- `hidden_dim`: MLP width for branch and trunk (32, 64, 128).
+- `n_basis`: Number of shared basis functions (16, 32, 64). More = richer spatial representation.
+- `n_layers`: MLP depth for branch and trunk (2, 3, 4).
+- `dropout`: Branch MLP regularization (0.0, 0.1, 0.2). Branch encodes parameter→coefficient mapping; keep low.
+- `trunk_dropout`: Trunk MLP regularization (0.0, 0.05, 0.1, 0.2). Trunk learns spatial basis functions.
+  Higher values prevent oscillatory/swirling basis artifacts; lower values allow sharper spatial features.
+  Tune independently from branch dropout — overfitting trunk vs. branch requires different responses.
 
 ### Optimizer
 - `optimizer_type`: adamw (default, good regularization), adam, sgd (needs tuning).
@@ -124,6 +141,19 @@ Format your response as:
 REASONING: [Why you're making these changes]
 
 CHANGES:
+- arch_type: [transolver|deeponet] (reason — required if switching architecture)
+For deeponet:
+- hidden_dim: [value] (reason)
+- n_basis: [value] (reason)
+- n_layers: [value] (reason)
+- dropout: [value] (reason, branch MLP)
+- trunk_dropout: [value] (reason, trunk MLP)
+- learning_rate: [value] (reason)
+- optimizer_type: [adamw|adam|sgd] (reason)
+- scheduler_type: [plateau|cosine|none] (reason)
+- activation: [gelu|relu|silu] (reason)
+- batch_size: [value] (reason)
+For transolver:
 - d_model: [value] (reason)
 - n_layers: [value] (reason)
 - n_heads: [value] (reason)
@@ -142,7 +172,7 @@ TRADE_OFFS: [What trade-offs this configuration makes]
 CONFIDENCE: [low|medium|high]
 ```
 
-Only include parameters you want to change from the current config.
+Only include parameters relevant to the chosen arch_type.
 """
 
 
@@ -262,9 +292,10 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
 
         # Patterns for different parameter types
         patterns = {
-            'int': ['d_model', 'n_layers', 'n_heads', 'slice_num', 'batch_size', 'epochs', 'patience'],
-            'float': ['dropout', 'learning_rate', 'pino_weight', 'pino_eq_weight', 'mlp_ratio'],
-            'str': ['optimizer_type', 'scheduler_type', 'activation'],
+            'int': ['d_model', 'n_layers', 'n_heads', 'slice_num', 'batch_size', 'epochs',
+                    'patience', 'hidden_dim', 'n_basis'],
+            'float': ['dropout', 'trunk_dropout', 'learning_rate', 'pino_weight', 'pino_eq_weight', 'mlp_ratio'],
+            'str': ['optimizer_type', 'scheduler_type', 'activation', 'arch_type'],
         }
 
         for param in patterns['int']:
@@ -289,47 +320,59 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
 
     def apply_changes(
         self,
-        base_config: TransolverConfig,
-        changes: Dict[str, Any]
-    ) -> TransolverConfig:
+        base_config: Any,
+        changes: Dict[str, Any],
+    ) -> Any:
         """
         Apply proposed changes to create a new config.
 
-        Args:
-            base_config: The current configuration
-            changes: Dictionary of changes to apply
-
-        Returns:
-            New TransolverConfig with changes applied
+        When changes contain arch_type='deeponet', returns a DeepONetConfig.
+        When changes contain arch_type='transolver' or base is TransolverConfig, returns TransolverConfig.
         """
-        # Create a dict from base config
-        config_dict = base_config.to_dict()
+        arch_type = changes.get("arch_type", getattr(base_config, "arch_type", "transolver"))
 
-        # Apply changes
+        if arch_type == "deeponet":
+            base = base_config.to_dict() if isinstance(base_config, DeepONetConfig) else {}
+            return DeepONetConfig(
+                hidden_dim=changes.get("hidden_dim", base.get("hidden_dim", 64)),
+                n_basis=changes.get("n_basis", base.get("n_basis", 32)),
+                n_layers=changes.get("n_layers", base.get("n_layers", 3)),
+                dropout=changes.get("dropout", base.get("dropout", 0.0)),
+                trunk_dropout=changes.get("trunk_dropout", base.get("trunk_dropout", 0.1)),
+                learning_rate=changes.get("learning_rate", base.get("learning_rate", 1e-3)),
+                batch_size=changes.get("batch_size", base.get("batch_size", 4)),
+                epochs=changes.get("epochs", base.get("epochs", 200)),
+                patience=changes.get("patience", base.get("patience", 50)),
+                optimizer_type=changes.get("optimizer_type", base.get("optimizer_type", "adamw")),
+                scheduler_type=changes.get("scheduler_type", base.get("scheduler_type", "cosine")),
+                activation=changes.get("activation", base.get("activation", "gelu")),
+                output_dim=base_config.output_dim if hasattr(base_config, "output_dim") else 1,
+            )
+
+        # TransolverConfig path
+        config_dict = base_config.to_dict() if hasattr(base_config, "to_dict") else {}
         for key, value in changes.items():
             if key in config_dict:
                 config_dict[key] = value
-
-        # Create new config
         return TransolverConfig(
-            slice_num=config_dict.get('slice_num', 32),
-            n_heads=config_dict.get('n_heads', 8),
-            d_model=config_dict.get('d_model', 256),
-            n_layers=config_dict.get('n_layers', 6),
-            mlp_ratio=config_dict.get('mlp_ratio', 4.0),
-            dropout=config_dict.get('dropout', 0.0),
-            learning_rate=config_dict.get('learning_rate', 1e-3),
-            batch_size=config_dict.get('batch_size', 32),
-            epochs=config_dict.get('epochs', 1000),
-            patience=config_dict.get('patience', 100),
-            output_dim=config_dict.get('output_dim', 3),
-            pino_weight=config_dict.get('pino_weight', 0.1),
-            pino_eq_weight=config_dict.get('pino_eq_weight', 0.1),
-            pino_E=config_dict.get('pino_E', 1.0),
-            pino_nu=config_dict.get('pino_nu', 0.3),
-            optimizer_type=config_dict.get('optimizer_type', 'adamw'),
-            scheduler_type=config_dict.get('scheduler_type', 'plateau'),
-            activation=config_dict.get('activation', 'gelu'),
+            slice_num=config_dict.get("slice_num", 32),
+            n_heads=config_dict.get("n_heads", 8),
+            d_model=config_dict.get("d_model", 256),
+            n_layers=config_dict.get("n_layers", 6),
+            mlp_ratio=config_dict.get("mlp_ratio", 4.0),
+            dropout=config_dict.get("dropout", 0.0),
+            learning_rate=config_dict.get("learning_rate", 1e-3),
+            batch_size=config_dict.get("batch_size", 32),
+            epochs=config_dict.get("epochs", 1000),
+            patience=config_dict.get("patience", 100),
+            output_dim=config_dict.get("output_dim", 1),
+            pino_weight=config_dict.get("pino_weight", 0.0),
+            pino_eq_weight=config_dict.get("pino_eq_weight", 0.0),
+            pino_E=config_dict.get("pino_E", 1.0),
+            pino_nu=config_dict.get("pino_nu", 0.3),
+            optimizer_type=config_dict.get("optimizer_type", "adamw"),
+            scheduler_type=config_dict.get("scheduler_type", "plateau"),
+            activation=config_dict.get("activation", "gelu"),
         )
 
     async def propose_config(

@@ -381,7 +381,10 @@ class CrackFractureLoss(nn.Module):
         Compute combined fracture mechanics physics loss.
 
         Args:
-            u_pred:  Predicted displacement field in physical units (N, 2)
+            u_pred:  Predicted displacement field in physical units (N, 2).
+                     **Incompatible with von Mises scalar output (N, 1).**
+                     Only enable this loss when the surrogate predicts
+                     displacement (output_dim=2), not stress scalars.
             coords:  Mesh node coordinates (N, 2)
             K_I:     Mode I stress intensity factor [Pa√m]
             E:       Young's modulus [Pa]

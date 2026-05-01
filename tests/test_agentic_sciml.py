@@ -85,9 +85,9 @@ class MockLLMProvider:
         if "training analyst" in system_prompt.lower():
             return MockLLMResponse(self._critic_response())
         elif "architect" in system_prompt.lower():
-            return MockLLMResponse(self._architect_response())
+            return MockLLMResponse(self._architect_response(user_prompt))
         elif "physicist" in system_prompt.lower():
-            return MockLLMResponse(self._physicist_response())
+            return MockLLMResponse(self._physicist_response(user_prompt))
         elif "scientific machine learning" in system_prompt.lower():
             return MockLLMResponse(self._proposer_response())
         else:
@@ -154,19 +154,86 @@ SHOULD_RETRAIN: false
         }
         return responses.get(self.scenario, responses["underfitting"])
 
-    def _architect_response(self) -> str:
-        """Generate mock architect response."""
-        # Rotate through progressively stronger configs for underfitting
+    def _parse_issue(self, user_prompt: str) -> str:
+        """Extract the primary issue from the architect/physicist user prompt."""
+        import re
+        match = re.search(r'\*\*Primary Issue\*\*:\s*(\w+)', user_prompt)
+        if match:
+            return match.group(1).lower()
+        for issue in ("overfitting", "underfitting", "slow_convergence",
+                      "unstable_training", "loss_plateau", "stable"):
+            if issue in user_prompt.lower():
+                return issue
+        return self.scenario
+
+    def _architect_response(self, user_prompt: str = "") -> str:
+        """Generate mock architect response based on the actual diagnosed issue."""
+        issue = self._parse_issue(user_prompt)
         call_count = getattr(self, "_arch_call_count", 0)
         self._arch_call_count = call_count + 1
 
+        overfitting_configs = [
+            # Round 1: switch to DeepONet — correct architecture for fixed-geometry small data
+            """
+REASONING: Overfitting with fixed geometry and small dataset (<100 samples). Transolver has too many parameters for this regime. Switch to DeepONet whose branch-trunk structure generalises much better with 20-50 samples.
+
+CHANGES:
+- arch_type: deeponet
+- hidden_dim: 64
+- n_basis: 32
+- n_layers: 3
+- dropout: 0.1
+- learning_rate: 5e-4
+- optimizer_type: adamw
+- scheduler_type: cosine
+
+EXPECTED_IMPACT: DeepONet separates parameter dependence (branch) from spatial basis (trunk), reducing effective output dimensionality and closing the train/test gap.
+TRADE_OFFS: No PINO physics loss support; trunk learns spatial patterns from data only.
+CONFIDENCE: high
+""",
+            # Round 2: tune DeepONet — increase n_basis, add more dropout
+            """
+REASONING: DeepONet still overfitting — increase n_basis for richer spatial basis and add stronger dropout.
+
+CHANGES:
+- arch_type: deeponet
+- hidden_dim: 64
+- n_basis: 48
+- n_layers: 3
+- dropout: 0.2
+- learning_rate: 2e-4
+- optimizer_type: adamw
+- scheduler_type: cosine
+
+EXPECTED_IMPACT: More basis functions improve spatial expressiveness; stronger dropout regularises the branch network.
+TRADE_OFFS: Slightly more parameters but still far fewer than Transolver.
+CONFIDENCE: high
+""",
+            # Round 3: reduce hidden_dim to cut capacity further
+            """
+REASONING: Persistent overfitting — reduce hidden_dim to limit branch and trunk capacity.
+
+CHANGES:
+- arch_type: deeponet
+- hidden_dim: 32
+- n_basis: 32
+- n_layers: 3
+- dropout: 0.25
+- learning_rate: 1e-4
+- optimizer_type: adamw
+- scheduler_type: cosine
+
+EXPECTED_IMPACT: Smaller MLPs generalise better under severe data scarcity.
+TRADE_OFFS: Risk of underfitting if reduced too far.
+CONFIDENCE: medium
+""",
+        ]
         underfitting_configs = [
-            # Round 1 → 2: add physics, keep lr high
             """
 REASONING: Add PINO physics constraint to regularize underfitting on small dataset.
 
 CHANGES:
-- d_model: 32
+- d_model: 64
 - n_layers: 2
 - n_heads: 2
 - slice_num: 8
@@ -177,7 +244,6 @@ CHANGES:
 EXPECTED_IMPACT: Physics regularization helps generalization.
 CONFIDENCE: medium
 """,
-            # Round 2 → 3: moderate capacity increase
             """
 REASONING: Still underfitting — increase model capacity moderately.
 
@@ -195,7 +261,6 @@ CHANGES:
 EXPECTED_IMPACT: Larger model with physics captures stress concentration.
 CONFIDENCE: medium
 """,
-            # Round 3 → 4: more epochs, lower lr
             """
 REASONING: Need longer training to escape plateau.
 
@@ -215,30 +280,30 @@ CONFIDENCE: medium
 """,
         ]
         responses = {
+            "overfitting": overfitting_configs[min(call_count, len(overfitting_configs) - 1)],
             "underfitting": underfitting_configs[min(call_count, len(underfitting_configs) - 1)],
-            "overfitting": """
-REASONING: Need to regularize and reduce capacity to prevent memorization.
-
-CHANGES:
-- d_model: 48 (reduced)
-- dropout: 0.15 (added regularization)
-- pino_weight: 0.15 (physics constraints)
-- learning_rate: 1e-4 (reduced)
-
-CONFIDENCE: high
-""",
             "slow_convergence": """
 REASONING: Need faster learning dynamics.
 
 CHANGES:
-- learning_rate: 3e-4 (moderate increase)
+- learning_rate: 3e-4
 - scheduler_type: cosine
 - optimizer_type: adamw
 
 CONFIDENCE: medium
 """,
+            "unstable_training": """
+REASONING: Reduce learning rate and increase batch size to stabilize training.
+
+CHANGES:
+- learning_rate: 1e-4
+- batch_size: 8
+- scheduler_type: plateau
+
+CONFIDENCE: medium
+""",
             "stable": """
-REASONING: Minor tuning only.
+REASONING: Training is stable — minor tuning only.
 
 CHANGES:
 - epochs: 50
@@ -246,10 +311,11 @@ CHANGES:
 CONFIDENCE: medium
 """,
         }
-        return responses.get(self.scenario, responses["underfitting"])
+        return responses.get(issue, underfitting_configs[min(call_count, len(underfitting_configs) - 1)])
 
-    def _physicist_response(self) -> str:
-        """Generate mock physicist response for physics loss configuration."""
+    def _physicist_response(self, user_prompt: str = "") -> str:
+        """Generate mock physicist response based on the actual diagnosed issue."""
+        issue = self._parse_issue(user_prompt)
         responses = {
             "underfitting": """
 PHYSICS_DIAGNOSIS: For small datasets, physics loss provides crucial regularization. Moderate physics weights help the model generalize by enforcing physical constraints. Don't increase too aggressively to avoid conflicting gradients.
@@ -265,17 +331,17 @@ EXPECTED_IMPACT: Better generalization through physics-based regularization.
 CONFIDENCE: medium
 """,
             "overfitting": """
-PHYSICS_DIAGNOSIS: Physics constraints may be too weak, allowing model to memorize training data without learning underlying physics. Increasing physics loss will regularize the model.
+PHYSICS_DIAGNOSIS: Physics loss scale may be mismatched with data loss. Keep weights at zero until the surrogate produces physically consistent predictions; premature physics enforcement destabilizes training.
 
 CHANGES:
-- pino_weight: 0.3 (significantly increased)
-- pino_eq_weight: 0.25 (increased for physics regularization)
+- pino_weight: 0.0
+- pino_eq_weight: 0.0
 
-REASONING: Physics-informed loss acts as a regularizer by enforcing physical constraints that generalize across samples.
+REASONING: With small datasets and a model that is still overfitting, physics loss adds conflicting gradients. Regularize via architecture first (dropout, weight decay), then enable physics once train/test gap closes.
 
-EXPECTED_IMPACT: Reduced overfitting through physics-based regularization.
+EXPECTED_IMPACT: Stable training without physics loss interference.
 
-CONFIDENCE: medium
+CONFIDENCE: high
 """,
             "slow_convergence": """
 PHYSICS_DIAGNOSIS: Physics loss may be conflicting with data loss early in training. Reduce physics weights initially.
@@ -303,7 +369,7 @@ EXPECTED_IMPACT: Marginal improvement in physics consistency.
 CONFIDENCE: low
 """,
         }
-        return responses.get(self.scenario, responses["underfitting"])
+        return responses.get(issue, responses["underfitting"])
 
     def _proposer_response(self) -> str:
         """Generate mock adaptive proposer response."""
@@ -1179,16 +1245,22 @@ def _generate_vnotch_fem_data(
             # Use coordinates from the FEM sample (MFEM-compacted node list)
             if coords is None:
                 coords = sample.coordinates
-                # Build Delaunay triangulation on MFEM coords for visualization
-                from scipy.spatial import Delaunay
-                triangles = Delaunay(coords).simplices
+                # Use mesh element connectivity directly — already excludes notch interior
+                triangles = sample.elements
 
             K_I_val = compute_ki(traction, notch_depth=config.notch_depth,
                                  width=config.width, angle=config.notch_angle)
             params_list.append([E, nu, traction, K_I_val])
-            if output_field == "von_mises" and sample.von_mises is not None:
-                # Von Mises stress (scalar field) -> shape (N, 1)
-                outputs.append(sample.von_mises[:, np.newaxis])
+            if output_field == "von_mises":
+                # Compute nodal von Mises from displacement (element-centered
+                # sample.von_mises has 714 values vs 409 nodes — misaligned)
+                vm_nodal = _compute_von_mises_nodal(
+                    sample.displacement, coords, triangles, E, nu
+                )
+                # Log-transform: σ ∝ 1/√r near tip → log(σ) ≈ log(K_I) - 0.5·log(r)
+                # This converts the power-law singularity to a smooth log-linear function
+                # that a small MLP trunk can represent. Inverse: np.expm1(pred).
+                outputs.append(np.log1p(vm_nodal)[:, np.newaxis])
             else:
                 # Displacement field -> shape (N, 2)
                 outputs.append(sample.displacement)
@@ -1270,6 +1342,7 @@ def run_agentic_loop_demo(
     epochs_per_round: int = 80,
     max_hpo_rounds: int = 8,
     output_file: str = "tests/test_outputs/agentic_vnotch_demo.png",
+    use_real_llm: bool = False,
 ):
     """
     Demonstration of agentic SciML loop for V-notch problem.
@@ -1293,7 +1366,7 @@ def run_agentic_loop_demo(
     # Configuration
     notch_depth = 0.3
     notch_angle = 60.0
-    output_field = "displacement"  # Vector field — PINO-compatible (output_dim=2)
+    output_field = "displacement"  # (N, 2) — enables PINO equilibrium loss
 
     # Generate analytical GT data
     print(f"\n1. Generating {n_samples} V-notch analytical samples (displacement)...")
@@ -1306,7 +1379,23 @@ def run_agentic_loop_demo(
     )
     print(f"   Mesh: {len(coords)} nodes, {len(triangles)} elements")
     print(f"   Notch: depth={notch_depth}, angle={notch_angle}°")
-    print(f"   Output: {output_field} (vector field, PINO-enabled)")
+    print(f"   Output: {output_field} (vector field, output_dim=2)")
+
+    # Enrich trunk coordinates with polar features relative to notch tip.
+    # log(σ) ≈ log(K_I) - 0.5·log(r) near tip; giving the trunk explicit (r, log_r, θ)
+    # means it can learn the singularity without discovering geometry from raw (x,y).
+    tip_xy = np.array([notch_depth, 0.5], dtype=np.float32)
+    dxy = coords - tip_xy                                        # (N, 2)
+    r_feat = np.linalg.norm(dxy, axis=1, keepdims=True).clip(1e-6)  # (N, 1)
+    log_r_feat = np.log(r_feat)                                  # (N, 1)
+    theta = np.arctan2(dxy[:, 1:2], dxy[:, 0:1])                # (N, 1)
+    # Use (sin θ, cos θ) instead of raw θ — removes the ±π branch-cut discontinuity
+    # that causes atan2 to produce a spatial jump the trunk MLP maps to swirling artifacts
+    sin_theta = np.sin(theta)                                    # (N, 1)
+    cos_theta = np.cos(theta)                                    # (N, 1)
+    coords_enriched = np.concatenate(
+        [coords, r_feat, log_r_feat, sin_theta, cos_theta], axis=1
+    ).astype(np.float32)                                         # (N, 6)
 
     # Import training components
     from piano.surrogate.base import TransolverConfig, CrackConfig
@@ -1319,11 +1408,15 @@ def run_agentic_loop_demo(
     from piano.agents.base import AgentContext
     import asyncio
 
-    # Initialize agents
     critic = HyperparameterCriticAgent()
     architect = ArchitectAgent()
     physicist = PhysicistAgent()
-    provider = MockLLMProvider(scenario="underfitting")
+    if use_real_llm:
+        from piano.agents.llm.anthropic_provider import AnthropicProvider
+        provider = AnthropicProvider()
+        print("   Using real LLM (AnthropicProvider) for all agents")
+    else:
+        provider = MockLLMProvider(scenario="underfitting")
     critic.set_llm_provider(provider)
     architect.set_llm_provider(provider)
     physicist.set_llm_provider(provider)
@@ -1363,7 +1456,7 @@ def run_agentic_loop_demo(
         patience=epochs_per_round,
         batch_size=4,
         output_dim=2,
-        pino_weight=0.0,    # start data-only; architect enables physics
+        pino_weight=0.0,    # energy-norm term off; physicist enables when appropriate
         tip_weight=2.0,
         ki_weight=0.0,
         bc_weight=0.0,
@@ -1401,7 +1494,7 @@ def run_agentic_loop_demo(
             tip_coords=tip,
             crack_config=crack_cfg,
         ))
-        result = trainer.train(params, [coords] * len(params), outputs)
+        result = trainer.train(params, [coords_enriched] * len(params), outputs)
         if not result.success:
             print(f"   [ERROR] Training failed: {result.error_message}")
 
@@ -1434,7 +1527,7 @@ def run_agentic_loop_demo(
                 print(f"   New best! Improvement: {improvement_vs_best:.1f}%")
         else:
             no_improve_streak += 1
-            regress_pct = (curr_loss - best_test_loss) / best_test_loss * 100.0
+            regress_pct = (curr_loss - best_test_loss) / max(best_test_loss, 1e-12) * 100.0
             print(f"   No improvement ({regress_pct:+.1f}% vs best). Streak: {no_improve_streak}/{max_no_improve}")
 
         # Convergence check (after minimum rounds)
@@ -1488,10 +1581,11 @@ def run_agentic_loop_demo(
             action["arch_changes"] = arch_proposal.changes
             action["phys_changes"] = phys_proposal.changes
 
-            # Apply changes; preserve geometry-fixed params
+            # Apply changes; always preserve output_dim=2 (displacement)
             current_config = arch_proposal.config
-            current_config.tip_weight = tip_weight_fixed
             current_config.output_dim = 2
+            if hasattr(current_config, "tip_weight"):
+                current_config.tip_weight = tip_weight_fixed
             for k, v in phys_proposal.changes.items():
                 if hasattr(current_config, k):
                     setattr(current_config, k, v)
@@ -1519,16 +1613,15 @@ def run_agentic_loop_demo(
     gt_sample = generate_vnotch_fem_sample(test_E, test_nu, test_traction, gt_config)
 
     if gt_sample is not None and gt_sample.displacement is not None:
-        disp_gt = gt_sample.displacement  # (N, 2) on same MFEM mesh
-        vm_gt = _compute_von_mises_nodal(disp_gt, coords, triangles, test_E, test_nu)
+        vm_gt = _compute_von_mises_nodal(gt_sample.displacement, coords, triangles, test_E, test_nu)
     else:
-        disp_gt = outputs[0]
-        vm_gt = _compute_von_mises_nodal(disp_gt, coords, triangles, test_E, test_nu)
+        vm_gt = _compute_von_mises_nodal(outputs[0], coords, triangles, float(params[0, 0]), float(params[0, 1]))
 
     # Use the best model across all rounds for the final prediction
-    pred_raw, _ = best_trainer.predict_with_uncertainty(test_arr, coords)
+    pred_raw, _ = best_trainer.predict_with_uncertainty(test_arr, coords_enriched)
     if pred_raw.ndim == 3:
         pred_raw = pred_raw[0]
+    # Derive von Mises from predicted displacement (N, 2) using plane-stress constitutive law
     vm_pred = _compute_von_mises_nodal(pred_raw, coords, triangles, test_E, test_nu)
     error = np.abs(vm_pred - vm_gt)
 
@@ -1703,7 +1796,7 @@ def run_agentic_loop_demo(
     print("\n" + "=" * 70)
     print("Summary:")
     print(f"  V-Notch: depth={notch_depth}, angle={notch_angle}°")
-    print(f"  Output: Displacement (vector, PINO) → Von Mises for visualization")
+    print(f"  Output: Displacement field (output_dim=2), von Mises derived for evaluation")
     print(f"  Training samples: {n_samples}")
     print(f"  HPO rounds run: {n_rounds_run} ({stop_reason})")
     print(f"  Initial test loss: {round_results[0]['test_loss']:.6f}")
@@ -1725,6 +1818,8 @@ if __name__ == "__main__":
                         help="Max HPO rounds before forced stop (default: 8)")
     parser.add_argument("--output", type=str, default=None,
                         help="Output PNG path")
+    parser.add_argument("--use-real-llm", action="store_true",
+                        help="Use AnthropicProvider (ANTHROPIC_API_KEY required) instead of MockLLMProvider")
     args = parser.parse_args()
 
     output = args.output or str(PROJECT_ROOT / "tests" / "test_outputs" / "agentic_vnotch_demo.png")
@@ -1734,4 +1829,5 @@ if __name__ == "__main__":
         epochs_per_round=args.epochs,
         max_hpo_rounds=args.rounds,
         output_file=output,
+        use_real_llm=args.use_real_llm,
     )

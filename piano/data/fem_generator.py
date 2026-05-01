@@ -52,12 +52,14 @@ class FEMSample:
         coordinates: Node coordinates (N, 2)
         displacement: Displacement field (N, 2)
         von_mises: Von Mises stress at elements (optional)
+        elements: Triangle connectivity (M, 3) — already excludes notch interior
         metadata: Additional simulation info
     """
     parameters: Dict[str, float]
     coordinates: np.ndarray
     displacement: np.ndarray
     von_mises: Optional[np.ndarray] = None
+    elements: Optional[np.ndarray] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -172,16 +174,20 @@ def generate_vnotch_fem_sample(
     # because MFEM compacts unreferenced vertices when loading the mesh file)
     mfem_coords = mesh_manager.get_nodes()  # (n_mfem_nodes, 2) — matches displacement size
 
+    # Use MFEM's own element connectivity — consistent with get_nodes() ordering
+    mfem_elements = mesh_manager.get_elements()
+
     return FEMSample(
         parameters={"E": E, "nu": nu, "traction": traction},
         coordinates=mfem_coords.astype(np.float32),
         displacement=displacement.astype(np.float32),
         von_mises=von_mises.astype(np.float32) if von_mises is not None else None,
+        elements=mfem_elements,
         metadata={
             "notch_depth": config.notch_depth,
             "notch_angle": config.notch_angle,
             "n_nodes": mfem_coords.shape[0],
-            "n_elements": len(elements),
+            "n_elements": mfem_elements.shape[0],
             "max_displacement": float(np.max(np.linalg.norm(displacement, axis=1))),
         },
     )
@@ -304,6 +310,7 @@ def _generate_synthetic_sample(
         coordinates=vertices.astype(np.float32),
         displacement=displacement.astype(np.float32),
         von_mises=von_mises,
+        elements=elements.astype(np.int32),
         metadata={
             "notch_depth": config.notch_depth,
             "notch_angle": config.notch_angle,

@@ -347,6 +347,11 @@ class HyperparameterCriticAgent(BaseAgent[CritiqueResult]):
         Returns:
             CritiqueResult with diagnosis and recommendations
         """
+        if self._llm_provider is None:
+            raise RuntimeError(
+                "HyperparameterCriticAgent requires an LLM provider. "
+                "Call set_llm_provider() before analyze_training()."
+            )
         return await self.execute(
             context,
             training_history=training_history,
@@ -370,11 +375,13 @@ class HyperparameterCriticAgent(BaseAgent[CritiqueResult]):
         if len(history.train_losses) < 5 or len(history.test_losses) < 5:
             return issues  # Not enough data
 
-        # Check overfitting
+        # Check overfitting: ratio check catches it even when epoch-by-epoch
+        # trends are noisy (common with small datasets and short training runs)
         train_trend = self._compute_trend(history.train_losses[-20:])
         test_trend = self._compute_trend(history.test_losses[-20:])
 
-        if train_trend < -0.01 and test_trend > 0.01:
+        ratio = history.final_test_loss / (history.final_train_loss + 1e-12)
+        if ratio > 5.0 or (train_trend < -0.01 and test_trend > 0.01):
             issues.append(TrainingIssue.OVERFITTING)
 
         # Check underfitting (both losses high and not improving)

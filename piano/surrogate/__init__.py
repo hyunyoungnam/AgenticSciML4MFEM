@@ -15,6 +15,7 @@ from .base import (
 )
 from .transolver import TransolverModel, PhysicsAttention
 from .ensemble import EnsembleModel
+from .deeponet import DeepONetConfig, DeepONetModel
 from .trainer import SurrogateTrainer, TrainingConfig, TrainingResult
 from .evaluator import SurrogateEvaluator, WeakRegion, UncertaintyAnalysis
 from .agentic_trainer import (
@@ -35,6 +36,8 @@ __all__ = [
     "TransolverModel",
     "PhysicsAttention",
     "EnsembleModel",
+    "DeepONetConfig",
+    "DeepONetModel",
     # Training
     "SurrogateTrainer",
     "TrainingConfig",

@@ -14,6 +14,7 @@ import torch.nn as nn
 
 from .base import SurrogateModel, EnsembleConfig, PredictionResult, TransolverConfig
 from .transolver import TransolverModel
+from .deeponet import DeepONetConfig, DeepONetModel
 
 
 class EnsembleModel(SurrogateModel, nn.Module):
@@ -50,25 +51,30 @@ class EnsembleModel(SurrogateModel, nn.Module):
             num_points: Number of mesh points
         """
         self._models = []
+        member_cfg = self.ensemble_config.member_config
 
         for i in range(self.ensemble_config.n_members):
-            # Create member with slightly different initialization
-            member_config = TransolverConfig(
-                slice_num=self.ensemble_config.member_config.slice_num,
-                n_heads=self.ensemble_config.member_config.n_heads,
-                d_model=self.ensemble_config.member_config.d_model,
-                n_layers=self.ensemble_config.member_config.n_layers,
-                mlp_ratio=self.ensemble_config.member_config.mlp_ratio,
-                dropout=self.ensemble_config.member_config.dropout,
-                learning_rate=self.ensemble_config.member_config.learning_rate,
-                batch_size=self.ensemble_config.member_config.batch_size,
-                epochs=self.ensemble_config.member_config.epochs,
-                patience=self.ensemble_config.member_config.patience,
-                output_dim=self.ensemble_config.member_config.output_dim,
-                checkpoint_dir=self.ensemble_config.member_config.checkpoint_dir,
-            )
-
-            model = TransolverModel(member_config)
+            if isinstance(member_cfg, DeepONetConfig):
+                # Different seed per member so weights are uncorrelated
+                torch.manual_seed(42 + i)
+                model = DeepONetModel(member_cfg)
+            else:
+                # Copy TransolverConfig so each member has independent state
+                member_config = TransolverConfig(
+                    slice_num=member_cfg.slice_num,
+                    n_heads=member_cfg.n_heads,
+                    d_model=member_cfg.d_model,
+                    n_layers=member_cfg.n_layers,
+                    mlp_ratio=member_cfg.mlp_ratio,
+                    dropout=member_cfg.dropout,
+                    learning_rate=member_cfg.learning_rate,
+                    batch_size=member_cfg.batch_size,
+                    epochs=member_cfg.epochs,
+                    patience=member_cfg.patience,
+                    output_dim=member_cfg.output_dim,
+                    checkpoint_dir=member_cfg.checkpoint_dir,
+                )
+                model = TransolverModel(member_config)
             model.build(input_dim, coord_dim, num_points)
             self._models.append(model)
 

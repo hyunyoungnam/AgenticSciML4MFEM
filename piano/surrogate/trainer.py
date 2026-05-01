@@ -16,6 +16,7 @@ import torch.nn as nn
 from .base import TransolverConfig, EnsembleConfig, SurrogateModel, CrackConfig
 from .transolver import TransolverModel
 from .ensemble import EnsembleModel
+from .deeponet import DeepONetConfig, DeepONetModel
 from .pino_loss import PINOElasticityLoss
 from .crack_pino_loss import CrackFractureLoss
 
@@ -286,7 +287,10 @@ class SurrogateTrainer:
                 )
                 model = EnsembleModel(ensemble_config)
             else:
-                model = TransolverModel(self.config.surrogate_config)
+                if isinstance(self.config.surrogate_config, DeepONetConfig):
+                    model = DeepONetModel(self.config.surrogate_config)
+                else:
+                    model = TransolverModel(self.config.surrogate_config)
 
             model.build(n_params, coord_dim, num_points)
 
@@ -299,8 +303,9 @@ class SurrogateTrainer:
             node_weights = None
             if self.config.tip_coords is not None and cfg.tip_weight > 0:
                 tip = self.config.tip_coords  # (2,)
-                ref_coords = train_coords[0]  # (N, 2) — fixed mesh assumption
-                r = np.linalg.norm(ref_coords - tip, axis=1) + 1e-8
+                ref_coords = train_coords[0]  # (N, coord_dim) — fixed mesh assumption
+                # Use only first 2 columns (x, y) when coords are enriched with extra features
+                r = np.linalg.norm(ref_coords[:, :2] - tip, axis=1) + 1e-8
                 w = 1.0 + cfg.tip_weight / r
                 w = w / w.mean()  # normalize: mean weight = 1 so loss scale is unchanged
                 node_weights = torch.tensor(w, dtype=torch.float32, device=device)
@@ -312,7 +317,8 @@ class SurrogateTrainer:
             sc = self.config.surrogate_config
             if (
                 cc is not None
-                and any(w > 0 for w in [sc.ki_weight, sc.bc_weight, sc.williams_weight, sc.j_weight])
+                and any(getattr(sc, k, 0.0) > 0
+                        for k in ["ki_weight", "bc_weight", "williams_weight", "j_weight"])
             ):
                 crack_loss_fn = CrackFractureLoss(
                     tip_x=cc.tip_x,
@@ -342,7 +348,6 @@ class SurrogateTrainer:
 
             use_pino = (
                 output_dim >= 2
-                and coord_dim == 2
                 and (cfg.pino_weight > 0 or cfg.pino_eq_weight > 0)
             )
             pino_fn = (
@@ -383,8 +388,11 @@ class SurrogateTrainer:
 
                     pred = model.forward(params_t, coords_t)
                     data_loss = _weighted_mse(pred, output_t, node_weights) / batch_size
+                    # Slice to (x, y) only — coords may be enriched with extra features
+                    coords_xy = coords_t[0, :, :2]
+
                     if pino_fn is not None:
-                        physics_loss = pino_fn(pred[0], output_t[0], coords_t[0]) / batch_size
+                        physics_loss = pino_fn(pred[0], output_t[0], coords_xy) / batch_size
                     else:
                         physics_loss = torch.tensor(0.0, device=device)
 
@@ -396,7 +404,7 @@ class SurrogateTrainer:
                         raw_p = raw_train_params[idx]
                         crack_phys_loss = crack_loss_fn(
                             u_phys,
-                            coords_t[0],
+                            coords_xy,
                             K_I=float(raw_p[cc.ki_param_idx]),
                             E=float(raw_p[cc.e_param_idx]),
                             nu=float(raw_p[cc.nu_param_idx]),

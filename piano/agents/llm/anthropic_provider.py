@@ -14,22 +14,30 @@ class AnthropicProvider(LLMProvider):
     """
     Anthropic API provider.
 
-    Supports Claude 3 models (Opus, Sonnet, Haiku).
+    Supports Claude 4 models (Opus 4.7, Sonnet 4.6, Haiku 4.5).
     """
 
     SUPPORTED_MODELS = [
+        # Claude 4 (current)
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5-20251001",
+        # Claude 3.5 (legacy)
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-sonnet-20240620",
+        # Claude 3 (legacy)
         "claude-3-opus-20240229",
         "claude-3-sonnet-20240229",
         "claude-3-haiku-20240307",
-        "claude-3-5-sonnet-20240620",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-opus",
-        "claude-3-sonnet",
-        "claude-3-haiku",
     ]
 
     # Model aliases for convenience
     MODEL_ALIASES = {
+        # Claude 4 aliases
+        "claude-opus": "claude-opus-4-7",
+        "claude-sonnet": "claude-sonnet-4-6",
+        "claude-haiku": "claude-haiku-4-5-20251001",
+        # Legacy Claude 3 aliases
         "claude-3-opus": "claude-3-opus-20240229",
         "claude-3-sonnet": "claude-3-sonnet-20240229",
         "claude-3-haiku": "claude-3-haiku-20240307",
@@ -60,7 +68,7 @@ class AnthropicProvider(LLMProvider):
 
     @property
     def default_model(self) -> str:
-        return "claude-3-opus-20240229"
+        return "claude-haiku-4-5-20251001"
 
     def _resolve_model(self, model: str) -> str:
         """Resolve model alias to full model name."""
@@ -249,7 +257,7 @@ class AnthropicProvider(LLMProvider):
         try:
             client = self._get_client()
             response = await client.messages.create(
-                model="claude-3-haiku-20240307",
+                model="claude-haiku-4-5-20251001",
                 messages=[{"role": "user", "content": "Hello"}],
                 max_tokens=5,
             )
