@@ -350,10 +350,11 @@ class SurrogateTrainer:
                 output_dim >= 2
                 and (cfg.pino_weight > 0 or cfg.pino_eq_weight > 0)
             )
+            # nu_param_idx: which column of raw_train_params holds Poisson's ratio
+            _nu_col = cc.nu_param_idx if cc is not None else None
             pino_fn = (
                 PINOElasticityLoss(
-                    E=cfg.pino_E,
-                    nu=cfg.pino_nu,
+                    nominal_nu=0.3,
                     eq_weight=cfg.pino_eq_weight,
                     energy_weight=cfg.pino_weight,
                 ).to(device)
@@ -392,7 +393,8 @@ class SurrogateTrainer:
                     coords_xy = coords_t[0, :, :2]
 
                     if pino_fn is not None:
-                        physics_loss = pino_fn(pred[0], output_t[0], coords_xy) / batch_size
+                        sample_nu = float(raw_train_params[idx][_nu_col]) if _nu_col is not None else None
+                        physics_loss = pino_fn(pred[0], output_t[0], coords_xy, nu=sample_nu) / batch_size
                     else:
                         physics_loss = torch.tensor(0.0, device=device)
 

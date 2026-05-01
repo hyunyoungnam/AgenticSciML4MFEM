@@ -68,10 +68,6 @@ The PINO (Physics-Informed Neural Operator) loss has two main terms:
 - Computed: W(u_pred - u_true) / Volume
 - Effect: Physics-weighted H1 seminorm, penalizes strain errors
 
-### Material Parameters
-- `pino_E`: Young's modulus for constitutive law (dimensionless, typically 1.0)
-- `pino_nu`: Poisson's ratio (typically 0.3 for metals)
-
 ## Physics Considerations for Fracture Mechanics
 
 ### Crack Tip Singularity (1/sqrt(r))
@@ -110,8 +106,6 @@ Output your proposals in structured format."""
 PHYSICIST_PROMPT = """## Current Physics Configuration
 - pino_weight: {pino_weight}
 - pino_eq_weight: {pino_eq_weight}
-- pino_E: {pino_E}
-- pino_nu: {pino_nu}
 
 ## Training Diagnostics
 **Primary Issue**: {primary_issue}
@@ -148,8 +142,6 @@ PHYSICS_DIAGNOSIS: [Your physics-specific diagnosis]
 CHANGES:
 - pino_weight: [value] (reason)
 - pino_eq_weight: [value] (reason)
-- pino_E: [value] (reason, usually keep at 1.0)
-- pino_nu: [value] (reason, usually keep at 0.3)
 
 REASONING: [Why these physics changes will help]
 EXPECTED_IMPACT: [What improvement you expect]
@@ -228,8 +220,6 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
         return PHYSICIST_PROMPT.format(
             pino_weight=current_config.get("pino_weight", 0.1),
             pino_eq_weight=current_config.get("pino_eq_weight", 0.1),
-            pino_E=current_config.get("pino_E", 1.0),
-            pino_nu=current_config.get("pino_nu", 0.3),
             primary_issue=critique.primary_issue.name,
             severity=critique.severity,
             diagnosis=critique.diagnosis,
@@ -306,7 +296,7 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
         changes = {}
 
         # Physics parameters (all floats)
-        params = ['pino_weight', 'pino_eq_weight', 'pino_E', 'pino_nu']
+        params = ['pino_weight', 'pino_eq_weight']
 
         for param in params:
             match = re.search(rf'{param}:\s*([0-9.e-]+)', text, re.IGNORECASE)

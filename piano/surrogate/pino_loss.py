@@ -23,6 +23,8 @@ Reference:
     Differential Equations", ICLR 2024.
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -80,50 +82,52 @@ def _compute_B_matrices(
     return B, areas
 
 
+def _build_C(nu: float) -> torch.Tensor:
+    """Plane-stress constitutive matrix (3×3, Voigt) with E=1.0 (dimensionless)."""
+    factor = 1.0 / (1.0 - nu ** 2)
+    return torch.tensor(
+        [
+            [1.0, nu, 0.0],
+            [nu, 1.0, 0.0],
+            [0.0, 0.0, (1.0 - nu) / 2.0],
+        ],
+        dtype=torch.float32,
+    ) * factor
+
+
 class PINOElasticityLoss(nn.Module):
     """
     PINO loss for 2D plane-stress linear elasticity.
 
+    E is fixed at 1.0 (dimensionless) because the trainer normalizes displacements —
+    the physical Young's modulus cancels in the equilibrium residual.
+    nu (Poisson's ratio) does affect the constitutive tensor's anisotropy and can be
+    passed per-sample via forward() to reflect the actual material properties.
+
     Attributes:
-        E:             Young's modulus. When the trainer normalizes outputs
-                       (the default), set E=1.0 so the loss is dimensionless
-                       but still captures the anisotropy from Poisson's ratio.
-                       Use the physical value (e.g. 200e9 Pa) only when passing
-                       denormalized displacements.
-        nu:            Poisson's ratio
+        nominal_nu:    Default Poisson's ratio (used when forward() receives no nu)
         eq_weight:     Weight for equilibrium residual term
         energy_weight: Weight for energy-norm error term
     """
 
     def __init__(
         self,
-        E: float = 1.0,
-        nu: float = 0.3,
+        nominal_nu: float = 0.3,
         eq_weight: float = 0.1,
         energy_weight: float = 0.1,
     ) -> None:
         super().__init__()
+        self.nominal_nu = nominal_nu
         self.eq_weight = eq_weight
         self.energy_weight = energy_weight
-
-        # Plane-stress constitutive matrix C (3×3, Voigt notation)
-        #   sigma = C @ epsilon,  epsilon = [eps_xx, eps_yy, 2*eps_xy]
-        factor = E / (1.0 - nu ** 2)
-        C = torch.tensor(
-            [
-                [1.0, nu, 0.0],
-                [nu, 1.0, 0.0],
-                [0.0, 0.0, (1.0 - nu) / 2.0],
-            ],
-            dtype=torch.float64,
-        ) * factor
-        self.register_buffer("C", C.float())
+        self.register_buffer("C", _build_C(nominal_nu))
 
     def forward(
         self,
         u_pred: torch.Tensor,
         u_true: torch.Tensor,
         coords: torch.Tensor,
+        nu: Optional[float] = None,
     ) -> torch.Tensor:
         """
         Compute physics loss for one training sample.
@@ -132,11 +136,13 @@ class PINOElasticityLoss(nn.Module):
             u_pred:  (N, D) predicted displacement field (D >= 2)
             u_true:  (N, D) ground-truth displacement field
             coords:  (N, 2) mesh node coordinates
+            nu:      Per-sample Poisson's ratio; uses nominal_nu when None
 
         Returns:
             Scalar physics loss (differentiable w.r.t. u_pred)
         """
         device = u_pred.device
+        C = _build_C(nu).to(device) if nu is not None and nu != self.nominal_nu else self.C
         N = coords.shape[0]
 
         # --- Delaunay triangulation (numpy, detached from autograd) ----------
@@ -161,7 +167,7 @@ class PINOElasticityLoss(nn.Module):
         eps = torch.einsum("mij,mj->mi", B, u_elem)
 
         # Voigt stress per element: (M, 3)
-        sig = torch.einsum("ij,mj->mi", self.C, eps)
+        sig = torch.einsum("ij,mj->mi", C, eps)
 
         # Nodal force contributions from each element: B^T sigma * area
         # f_elem: (M, 6)  — interlaced [fx1, fy1, fx2, fy2, fx3, fy3]
@@ -180,7 +186,7 @@ class PINOElasticityLoss(nn.Module):
         # --- Term 2: Energy-norm error  --------------------------------------
         u_err = (u_pred_2 - u_true_2)[elems].reshape(M, 6)
         eps_err = torch.einsum("mij,mj->mi", B, u_err)
-        C_eps_err = torch.einsum("ij,mj->mi", self.C, eps_err)
+        C_eps_err = torch.einsum("ij,mj->mi", C, eps_err)
         energy_per_elem = areas * torch.sum(eps_err * C_eps_err, dim=-1)
 
         total_area = areas.sum().clamp(min=1e-30)

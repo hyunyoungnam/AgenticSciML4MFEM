@@ -88,8 +88,6 @@ class TransolverConfig:
     checkpoint_dir: Optional[Path] = None
     pino_weight: float = 0.1
     pino_eq_weight: float = 0.1
-    pino_E: float = 1.0   # Dimensionless: trainer normalizes outputs, physical E cancels
-    pino_nu: float = 0.3
     tip_weight: float = 0.0      # >0 upweights nodes near singularity tip by (1 + tip_weight/r)
     ki_weight: float = 0.0       # K_I consistency loss weight
     bc_weight: float = 0.0       # Crack face traction-free BC loss weight
@@ -116,8 +114,6 @@ class TransolverConfig:
             "checkpoint_dir": str(self.checkpoint_dir) if self.checkpoint_dir else None,
             "pino_weight": self.pino_weight,
             "pino_eq_weight": self.pino_eq_weight,
-            "pino_E": self.pino_E,
-            "pino_nu": self.pino_nu,
             "tip_weight": self.tip_weight,
             "ki_weight": self.ki_weight,
             "bc_weight": self.bc_weight,

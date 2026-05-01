@@ -770,8 +770,6 @@ async def test_physicist_propose_physics_config():
     current_config = {
         "pino_weight": 0.1,
         "pino_eq_weight": 0.1,
-        "pino_E": 1.0,
-        "pino_nu": 0.3,
     }
     critique = CritiqueResult(
         primary_issue=TrainingIssue.UNDERFITTING,
@@ -1514,11 +1512,11 @@ def run_agentic_loop_demo(
         all_train_losses.extend(round_train)
         all_test_losses.extend(round_test)
 
-        curr_loss = result.test_loss
+        curr_loss = result.test_loss if result.success else float('inf')
         print(f"   Train: {result.train_loss:.6f}, Test: {curr_loss:.6f}")
 
         # Track best model across all rounds
-        if curr_loss < best_test_loss:
+        if result.success and curr_loss < best_test_loss:
             improvement_vs_best = (best_test_loss - curr_loss) / best_test_loss * 100.0 if best_test_loss < float('inf') else 100.0
             best_test_loss = curr_loss
             best_trainer = trainer

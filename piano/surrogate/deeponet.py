@@ -39,9 +39,8 @@ class DeepONetConfig:
     scheduler_type: str = "cosine"
     activation: str = "gelu"
     output_dim: int = 1       # 1 for scalar (von Mises), 2 for displacement
-    # Kept at 0 — PINO losses not applicable to DeepONet
     pino_weight: float = 0.0
-    pino_eq_weight: float = 0.0
+    pino_eq_weight: float = 0.1
     tip_weight: float = 0.0
     checkpoint_dir: Optional[str] = None
 

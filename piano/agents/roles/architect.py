@@ -368,8 +368,6 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
             output_dim=config_dict.get("output_dim", 1),
             pino_weight=config_dict.get("pino_weight", 0.0),
             pino_eq_weight=config_dict.get("pino_eq_weight", 0.0),
-            pino_E=config_dict.get("pino_E", 1.0),
-            pino_nu=config_dict.get("pino_nu", 0.3),
             optimizer_type=config_dict.get("optimizer_type", "adamw"),
             scheduler_type=config_dict.get("scheduler_type", "plateau"),
             activation=config_dict.get("activation", "gelu"),

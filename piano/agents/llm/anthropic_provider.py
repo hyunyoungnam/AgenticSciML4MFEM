@@ -118,7 +118,10 @@ class AnthropicProvider(LLMProvider):
             LLMResponse with generated content
         """
         client = self._get_client()
-        model = self._resolve_model(model or self.default_model)
+        resolved = self._resolve_model(model or self.default_model)
+        if not self.validate_model(resolved):
+            resolved = self.default_model
+        model = resolved
 
         messages = [
             {"role": "user", "content": user_prompt},
@@ -189,7 +192,10 @@ class AnthropicProvider(LLMProvider):
             LLMResponse with generated content
         """
         client = self._get_client()
-        model = self._resolve_model(model or self.default_model)
+        resolved = self._resolve_model(model or self.default_model)
+        if not self.validate_model(resolved):
+            resolved = self.default_model
+        model = resolved
 
         # Anthropic requires alternating user/assistant messages
         # Ensure the format is correct
