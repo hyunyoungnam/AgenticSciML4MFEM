@@ -19,8 +19,17 @@ class AgentRole(Enum):
     HYPERPARAMETER_CRITIC = "hyperparameter_critic"
     ARCHITECT = "architect"
     PHYSICIST = "physicist"
+    ANALYST = "analyst"
     # Active learning agents
     ADAPTIVE_PROPOSER = "adaptive_proposer"
+    MESH_STRATEGY = "mesh_strategy"
+    BUDGET = "budget"
+    # Knowledge and data agents
+    KNOWLEDGE_RETRIEVER = "knowledge_retriever"
+    DATA_ANALYST = "data_analyst"
+    # Code agents
+    DEBUGGER = "debugger"
+    SELECTOR_ENSEMBLE = "selector_ensemble"
 
 
 class MessageType(Enum):

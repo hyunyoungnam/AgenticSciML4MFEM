@@ -2,16 +2,18 @@
 """
 piano - CLI Entry Point
 
-Run the piano multi-agent system for autonomous MFEM-based FEA
-dataset generation.
+Subcommands:
+  active-learn   Agentic active-learning loop (phase field FEA + Transolver surrogate)
+  evolve         Legacy evolutionary MFEM tree search
 
 Usage:
-    piano <mesh_file> [options]
+    piano active-learn --output outputs/run1 [options]
+    piano evolve inputs/model.mesh [options]
 
 Examples:
-    piano inputs/model.mesh
-    piano inputs/model.mesh --config configs/morphing_config.md
-    piano inputs/model.mesh --generations 10 --population 5
+    piano active-learn --initial-samples 10 --max-samples 50 --agentic-hpo
+    piano active-learn --output outputs/debug --initial-samples 5 --no-ensemble
+    piano evolve inputs/model.mesh --generations 10 --population 5
 """
 
 import argparse
@@ -144,90 +146,158 @@ def setup_logging(level: str = "INFO", log_file: str = None) -> None:
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="AgenticSciML - Autonomous MFEM-based FEA Dataset Generation",
+        description="piano — Agentic SciML for phase field fracture",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  piano inputs/model.mesh
-  piano inputs/model.mesh --config configs/morphing_config.md
-  piano inputs/model.mesh --generations 10 --output outputs/run1
-        """,
     )
+    sub = parser.add_subparsers(dest="subcommand")
 
-    parser.add_argument(
-        "mesh_file",
-        type=str,
-        help="Path to the MFEM mesh file (.mesh)",
+    # ── active-learn subcommand ───────────────────────────────────────────────
+    al = sub.add_parser(
+        "active-learn",
+        help="Agentic active-learning loop: phase field FEA + Transolver + LLM agents",
     )
+    al.add_argument("--output", "-o", default="outputs/active_learn",
+                    help="Output directory (default: outputs/active_learn)")
+    al.add_argument("--initial-samples", type=int, default=10,
+                    help="Initial LHS samples (default: 10)")
+    al.add_argument("--max-samples", type=int, default=50,
+                    help="Total sample budget (default: 50)")
+    al.add_argument("--convergence-threshold", type=float, default=0.05,
+                    help="Relative L2 error target (default: 0.05)")
+    al.add_argument("--n-ensemble", type=int, default=3,
+                    help="Ensemble size for uncertainty (default: 3)")
+    al.add_argument("--no-ensemble", action="store_true",
+                    help="Disable ensemble (single model)")
+    al.add_argument("--agentic-hpo", action="store_true",
+                    help="Enable LLM-based hyperparameter optimisation")
+    al.add_argument("--agentic-proposer", action="store_true",
+                    help="Enable LLM-based active sample proposal")
+    al.add_argument("--max-hpo-rounds", type=int, default=3)
+    al.add_argument("--resolution", type=int, default=30,
+                    help="Phase field mesh resolution (default: 30)")
+    al.add_argument("--load-steps", type=int, default=20,
+                    help="Phase field load steps (default: 20)")
+    al.add_argument("--llm-model", default="claude-sonnet-4-6",
+                    help="LLM model for agents")
+    al.add_argument("--log-level", default="INFO",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    al.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument(
-        "--config", "-c",
-        type=str,
-        default=None,
-        help="Path to morphing configuration file (.md)",
-    )
-
-    parser.add_argument(
-        "--generations", "-g",
-        type=int,
-        default=5,
-        help="Number of generations to run (default: 5)",
-    )
-
-    parser.add_argument(
-        "--population", "-p",
-        type=int,
-        default=5,
-        help="Population size per generation (default: 5)",
-    )
-
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        default="outputs",
-        help="Output directory (default: outputs)",
-    )
-
-    parser.add_argument(
-        "--run-solver",
-        action="store_true",
-        help="Run MFEM solver (requires PyMFEM installation)",
-    )
-
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)",
-    )
-
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Initialize only, don't run evolution",
-    )
-
-    parser.add_argument(
-        "--test",
-        action="store_true",
-        help="Use mock LLM providers (no API calls)",
-    )
-
-    parser.add_argument(
-        "--physics",
-        type=str,
-        choices=["elasticity", "heat"],
-        default="elasticity",
-        help="Physics type for simulation (default: elasticity)",
-    )
+    # ── evolve subcommand (legacy) ────────────────────────────────────────────
+    ev = sub.add_parser("evolve", help="Legacy evolutionary MFEM tree search")
+    ev.add_argument("mesh_file", type=str, help="Path to .mesh file")
+    ev.add_argument("--config", "-c", default=None)
+    ev.add_argument("--generations", "-g", type=int, default=5)
+    ev.add_argument("--population", "-p", type=int, default=5)
+    ev.add_argument("--output", "-o", default="outputs")
+    ev.add_argument("--run-solver", action="store_true")
+    ev.add_argument("--log-level", default="INFO",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ev.add_argument("--dry-run", action="store_true")
+    ev.add_argument("--test", action="store_true")
+    ev.add_argument("--physics", choices=["elasticity", "heat"], default="elasticity")
 
     return parser.parse_args()
+
+
+def run_active_learn(args) -> int:
+    """Run the agentic active-learning loop with phase field FEA backend."""
+    setup_logging(args.log_level)
+    logger = logging.getLogger("piano.active_learn")
+
+    from piano.orchestration.adaptive import AdaptiveOrchestrator, AdaptiveConfig
+    from piano.agents.llm.anthropic_provider import AnthropicProvider
+
+    # Phase field fracture parameter space:
+    #   E, nu, G_c, crack_length sampled by LHS; load_ratio controls traction
+    #   as a fraction of Griffith critical stress so every sample is near-critical.
+    param_bounds = {
+        "E":            (150e9, 250e9),
+        "nu":           (0.25,  0.35),
+        "G_c":          (1000.0, 5000.0),
+        "crack_length": (0.20,  0.50),
+        "load_ratio":   (0.60,  1.40),
+    }
+
+    config = AdaptiveConfig(
+        base_mesh_path=None,
+        output_dir=Path(args.output),
+        parameter_bounds=param_bounds,
+        initial_samples=args.initial_samples,
+        max_samples=args.max_samples,
+        convergence_threshold=args.convergence_threshold,
+        patience=5,
+        n_ensemble=1 if args.no_ensemble else args.n_ensemble,
+        random_seed=args.seed,
+        use_phase_field=True,
+        phase_field_resolution=args.resolution,
+        phase_field_n_load_steps=args.load_steps,
+        use_agentic_hpo=args.agentic_hpo,
+        use_agentic_proposer=args.agentic_proposer,
+        max_hpo_rounds=args.max_hpo_rounds,
+        llm_model=args.llm_model,
+    )
+
+    llm_provider = None
+    if args.agentic_hpo or args.agentic_proposer:
+        try:
+            llm_provider = AnthropicProvider(model=args.llm_model)
+            logger.info(f"LLM provider: {args.llm_model}")
+        except Exception as e:
+            logger.warning(f"Could not initialise LLM provider: {e}. Agents disabled.")
+
+    orchestrator = AdaptiveOrchestrator(config, llm_provider=llm_provider)
+
+    logger.info("="*60)
+    logger.info("piano  —  Agentic SciML active-learning loop")
+    logger.info("="*60)
+    logger.info(f"Backend:            Phase field FEA (DOLFINx AT-2)")
+    logger.info(f"Surrogate:          Transolver (d_model=64, n_layers=3)")
+    logger.info(f"Parameter space:    E, nu, G_c, crack_length, load_ratio")
+    logger.info(f"Initial samples:    {args.initial_samples}")
+    logger.info(f"Total budget:       {args.max_samples}")
+    logger.info(f"Ensemble size:      {config.n_ensemble}")
+    logger.info(f"Agentic HPO:        {args.agentic_hpo}")
+    logger.info(f"Agentic proposer:   {args.agentic_proposer}")
+    logger.info(f"Output:             {args.output}")
+    logger.info("")
+
+    def progress(iteration, metrics):
+        logger.info(
+            f"[iter {iteration}] samples={metrics['n_samples']}  "
+            f"test_err={metrics['test_error']:.4f}  "
+            f"uncertainty={metrics.get('mean_uncertainty', 0):.4f}"
+        )
+
+    result = orchestrator.run(callback=progress)
+
+    logger.info("")
+    if result.success:
+        logger.info(f"Converged after {result.n_iterations} iterations")
+        logger.info(f"Final error:   {result.final_error:.4f}")
+        logger.info(f"Total samples: {result.total_samples}")
+        logger.info(f"Dataset:       {result.dataset_path}")
+        logger.info(f"Surrogate:     {result.surrogate_path}")
+        return 0
+    else:
+        logger.error(f"Loop stopped: {result.stopping_criterion}")
+        if result.error_message:
+            logger.error(result.error_message)
+        return 1
 
 
 async def main() -> int:
     """Main entry point."""
     args = parse_args()
+
+    if args.subcommand == "active-learn":
+        return run_active_learn(args)
+
+    if args.subcommand is None:
+        print("Usage: piano <subcommand> [options]\n"
+              "Subcommands: active-learn, evolve\n"
+              "Run `piano <subcommand> --help` for details.")
+        return 1
 
     # Load YAML configs
     yaml_config = load_configs()

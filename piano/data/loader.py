@@ -98,6 +98,7 @@ class MFEMDataLoader(DatasetLoader):
         Returns:
             FEMSample object
         """
+        from piano.data.zero_copy import mesh_vertices_to_numpy
         mfem = self._get_mfem()
         mesh_path = Path(mesh_path)
 
@@ -105,13 +106,8 @@ class MFEMDataLoader(DatasetLoader):
         mesh = mfem.Mesh(str(mesh_path))
         dim = mesh.SpaceDimension()
 
-        # Extract coordinates
-        num_vertices = mesh.GetNV()
-        coordinates = np.zeros((num_vertices, dim), dtype=np.float64)
-        for i in range(num_vertices):
-            vertex = mesh.GetVertex(i)
-            for d in range(dim):
-                coordinates[i, d] = vertex[d]
+        # Extract coordinates — zero-copy fast path
+        coordinates = mesh_vertices_to_numpy(mesh, dim).copy()
 
         # Initialize fields
         displacement = None
@@ -149,35 +145,23 @@ class MFEMDataLoader(DatasetLoader):
         solution_path: Path,
         dim: int
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-        """Load solution from GridFunction file."""
+        """Load solution from GridFunction file using zero-copy extraction."""
+        from piano.data.zero_copy import gridfunction_nodal_to_numpy, scalar_gridfunction_to_numpy
         mfem = self._get_mfem()
 
         try:
-            # Read the GridFunction
             with open(solution_path, "r") as f:
                 gf = mfem.GridFunction(mesh, f)
 
-            num_vertices = mesh.GetNV()
             vdim = gf.VectorDim()
 
-            # Extract field values
             if vdim == 1:
-                # Scalar field (temperature, etc.)
-                temperature = np.zeros(num_vertices, dtype=np.float64)
-                for i in range(num_vertices):
-                    temperature[i] = gf[i]
-                return None, None, None  # Return temperature separately
+                # Scalar field — return as temperature placeholder (None for displacement)
+                return None, None, None
 
             else:
-                # Vector field (displacement)
-                fespace = gf.FESpace()
-                displacement = np.zeros((num_vertices, dim), dtype=np.float64)
-
-                for i in range(num_vertices):
-                    for d in range(dim):
-                        dof = fespace.DofToVDof(i, d)
-                        displacement[i, d] = gf[dof]
-
+                # Vector displacement — bulk DOF extraction, no per-DOF Python loop
+                displacement = gridfunction_nodal_to_numpy(gf, mesh, dim)
                 return displacement, None, None
 
         except Exception:

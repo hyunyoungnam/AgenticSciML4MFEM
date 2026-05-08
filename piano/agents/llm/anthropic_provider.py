@@ -5,9 +5,20 @@ Provides integration with Anthropic's API (Claude models).
 """
 
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from piano.agents.llm.provider import LLMProvider, LLMResponse
+
+def _load_dotenv() -> None:
+    """Load .env from the project root (two levels up from this file)."""
+    try:
+        from dotenv import load_dotenv
+        env_path = Path(__file__).parent.parent.parent.parent / ".env"
+        if env_path.exists():
+            load_dotenv(env_path, override=False)
+    except ImportError:
+        pass
 
 
 class AnthropicProvider(LLMProvider):
@@ -57,6 +68,7 @@ class AnthropicProvider(LLMProvider):
             base_url: Custom API base URL (optional)
             **kwargs: Additional configuration
         """
+        _load_dotenv()
         super().__init__(api_key)
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         self.base_url = base_url

@@ -28,9 +28,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 PROJECT_ROOT = Path(__file__).parent.parent
-TRAIN01      = PROJECT_ROOT / "train01"
-TRAIN02      = PROJECT_ROOT / "train02"
-TRAIN_FINE   = PROJECT_ROOT / "train_fine"
+CRACK_DATA   = PROJECT_ROOT / "crack_data"
 
 PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
     "E":      (150e9,  250e9),
@@ -425,7 +423,7 @@ def test_mfem_manager_load():
     pytest.importorskip("mfem.ser")
     from piano.mesh.mfem_manager import MFEMManager
 
-    mgr = MFEMManager(str(TRAIN01 / "sample_000.mesh"))
+    mgr = MFEMManager(str(CRACK_DATA / "crack_000.mesh"))
     assert mgr.num_nodes > 0
     assert mgr.num_elements > 0
     assert mgr.dimension == 2
@@ -438,7 +436,7 @@ def test_mfem_manager_save(tmp_path):
     pytest.importorskip("mfem.ser")
     from piano.mesh.mfem_manager import MFEMManager
 
-    mgr   = MFEMManager(str(TRAIN01 / "sample_001.mesh"))
+    mgr   = MFEMManager(str(CRACK_DATA / "crack_001.mesh"))
     saved = mgr.save(str(tmp_path / "copy.mesh"))
     assert saved.exists()
 
@@ -448,34 +446,34 @@ def test_mfem_manager_boundary_attributes():
     pytest.importorskip("mfem.ser")
     from piano.mesh.mfem_manager import MFEMManager
 
-    mgr   = MFEMManager(str(TRAIN01 / "sample_002.mesh"))
+    mgr   = MFEMManager(str(CRACK_DATA / "crack_002.mesh"))
     attrs = mgr.get_boundary_attributes()
     assert attrs.ndim == 1
     assert len(attrs) > 0
 
 
 @pytest.mark.mfem
-def test_train_fine_mesh_loads():
-    """train_fine meshes (scipy Delaunay) must load correctly and have right boundary tags."""
+def test_crack_data_mesh_loads():
+    """crack_data meshes must load correctly and have the expected boundary tags."""
     pytest.importorskip("mfem.ser")
     import mfem.ser as mfem
     from collections import Counter
 
-    assert TRAIN_FINE.exists(), f"train_fine/ not found at {TRAIN_FINE}"
+    assert CRACK_DATA.exists(), f"crack_data/ not found at {CRACK_DATA}"
 
-    for stem in ["sample_000.mesh", "sample_050.mesh", "sample_099.mesh"]:
-        path = TRAIN_FINE / stem
+    for stem in ["crack_000.mesh", "crack_001.mesh", "crack_002.mesh"]:
+        path = CRACK_DATA / stem
         m    = mfem.Mesh(str(path), 1, 1)
         assert m.GetNV() > 400,  f"{stem}: too few nodes ({m.GetNV()})"
         assert m.GetNE() > 700,  f"{stem}: too few elements ({m.GetNE()})"
 
         tags = Counter(m.GetBdrAttribute(i) for i in range(m.GetNBE()))
-        # Each outer side ≥ 8 edges; hole ≥ 20 edges
+        # Each outer side ≥ 8 edges; crack boundary ≥ 20 edges
         for side in (1, 2, 3, 4):
             assert tags.get(side, 0) >= 8, \
                 f"{stem}: boundary tag {side} has only {tags.get(side,0)} edges"
         assert tags.get(5, 0) >= 20, \
-            f"{stem}: hole tag (5) has only {tags.get(5,0)} edges"
+            f"{stem}: crack tag (5) has only {tags.get(5,0)} edges"
 
 
 # ===========================================================================
@@ -544,7 +542,7 @@ def test_mfem_solver_elasticity(tmp_path):
     from piano.mesh.mfem_manager import MFEMManager
     from piano.solvers.mfem_solver import MFEMSolver
 
-    mgr   = MFEMManager(str(TRAIN01 / "sample_000.mesh"))
+    mgr   = MFEMManager(str(CRACK_DATA / "crack_000.mesh"))
     verts = _extract_verts(mgr.mesh)
     _retag_boundaries(mgr.mesh, verts)
 
@@ -564,7 +562,7 @@ def test_evaluation_pipeline_quick():
     from piano.mesh.mfem_manager import MFEMManager
     from piano.evaluation.pipeline import EvaluationPipeline, EvaluationStage
 
-    mgr    = MFEMManager(str(TRAIN01 / "sample_002.mesh"))
+    mgr    = MFEMManager(str(CRACK_DATA / "crack_002.mesh"))
     result = EvaluationPipeline(run_solver=False).quick_evaluate("q001", mgr)
 
     assert result.stage   == EvaluationStage.COMPLETE
@@ -580,7 +578,7 @@ def test_evaluation_pipeline_with_solver(tmp_path):
     from piano.solvers.mfem_solver import MFEMSolver
     from piano.evaluation.pipeline import EvaluationPipeline, EvaluationStage
 
-    mgr   = MFEMManager(str(TRAIN01 / "sample_003.mesh"))
+    mgr   = MFEMManager(str(CRACK_DATA / "crack_003.mesh"))
     verts = _extract_verts(mgr.mesh)
     _retag_boundaries(mgr.mesh, verts)
 
@@ -705,7 +703,7 @@ def _train_ensemble(ds, n_ensemble: int = 3, epochs: int = 80):
             d_model=128, n_heads=8, n_layers=4, slice_num=16,
             epochs=epochs, patience=50, batch_size=8,
             learning_rate=5e-4,
-            pino_weight=0.1, pino_eq_weight=0.1,
+            energy=0.1, equilibrium=0.1,
         ),
         use_ensemble=True,
         n_ensemble=n_ensemble,
@@ -1017,7 +1015,7 @@ if __name__ == "__main__":
                         help="Test mesh index within the held-out test pool (default 0)")
     parser.add_argument("--samples-dirs", type=str, nargs="+", default=None,
                         help="Mesh dirs — pass multiple to combine datasets "
-                             "(e.g. train_fine train01 train02)")
+                             "(e.g. crack_data)")
     parser.add_argument("--output",       type=str, default=None,
                         help="Output PNG path")
     parser.add_argument("--n-train",      type=int, default=-1,
@@ -1028,9 +1026,7 @@ if __name__ == "__main__":
                         help="Ensemble training epochs (default 300)")
     args = parser.parse_args()
 
-    # Default: train_fine if available, else fall back to train01 + train02
-    default_dirs = ([str(TRAIN_FINE)] if TRAIN_FINE.exists()
-                    else [str(TRAIN01), str(TRAIN02)])
+    default_dirs = [str(CRACK_DATA)]
     dirs       = args.samples_dirs or default_dirs
     output_dir = PROJECT_ROOT / "tests" / "test_outputs"
     out        = args.output or str(output_dir / "sciml_loop.png")

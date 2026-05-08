@@ -35,7 +35,7 @@ from ..solvers.base import (
     PhysicsType,
 )
 from ..solvers.mfem_solver import MFEMSolver
-from ..surrogate.base import SurrogateConfig, SurrogateModel
+from ..surrogate.base import SurrogateConfig, SurrogateModel, TransolverConfig
 from ..surrogate.evaluator import SurrogateEvaluator, UncertaintyAnalysis, WeakRegion
 from ..surrogate.trainer import SurrogateTrainer, TrainingConfig, TrainingResult
 from ..surrogate.acquisition import (
@@ -53,6 +53,28 @@ from ..agents.base import AgentContext
 from .metrics import ActiveLearningMetrics, ConvergenceMonitor
 
 logger = logging.getLogger(__name__)
+
+
+def _williams_enrich(coords: np.ndarray, crack_tip_x: float, crack_y: float = 0.5) -> np.ndarray:
+    """Append Williams near-tip polar features to (N,2) mesh coordinates.
+
+    Returns (N, 8): [x, y, r, log_r, sinθ, cosθ, sin(θ/2), cos(θ/2)]
+    The half-angle basis (sin/cos of θ/2) encodes the crack-face displacement
+    jump discontinuity required by mode-I Williams expansion.
+    """
+    dx = coords[:, 0] - crack_tip_x
+    dy = coords[:, 1] - crack_y
+    r  = np.hypot(dx, dy).clip(1e-8).astype(np.float32)
+    th = np.arctan2(dy, dx).astype(np.float32)
+    return np.concatenate([
+        coords,
+        r[:, None],
+        np.log(r)[:, None],
+        np.sin(th)[:, None],
+        np.cos(th)[:, None],
+        np.sin(th / 2)[:, None],
+        np.cos(th / 2)[:, None],
+    ], axis=1)
 
 
 class StoppingCriterion(Enum):
@@ -88,7 +110,7 @@ class AdaptiveConfig:
         max_hpo_rounds: Maximum HPO rounds per training session
         llm_model: LLM model for agents
     """
-    base_mesh_path: Path
+    base_mesh_path: Optional[Path]   # None when use_phase_field=True
     output_dir: Path
     parameter_bounds: Dict[str, Tuple[float, float]] = field(
         default_factory=lambda: {"delta_R": (-0.5, 0.5)}
@@ -103,32 +125,48 @@ class AdaptiveConfig:
     use_agentic_hpo: bool = False
     use_agentic_proposer: bool = False
     max_hpo_rounds: int = 3
-    llm_model: str = "gpt-4-turbo"
+    llm_model: str = "claude-sonnet-4-6"
+    use_budget_agent: bool = False
+    use_mesh_strategy_agent: bool = False
+    tip_coords: Optional[np.ndarray] = None
+    # Phase field fracture backend (replaces MFEM when True)
+    use_phase_field: bool = False
+    phase_field_resolution: int = 30
+    phase_field_n_load_steps: int = 20
+    # Surrogate config override — if None, a default is chosen per backend
+    surrogate_config_override: Optional[Any] = None
 
     # Derived at runtime
     @property
     def parameter_names(self) -> List[str]:
-        """Derive parameter names from bounds keys."""
         return list(self.parameter_bounds.keys())
 
     @property
     def samples_per_iteration(self) -> int:
-        """Base samples per iteration (dynamically adjusted)."""
-        return 10
+        return 5
 
     @property
     def max_iterations(self) -> int:
-        """Derive max iterations from budget."""
         return (self.max_samples - self.initial_samples) // self.samples_per_iteration + 1
 
     @property
-    def surrogate_config(self) -> SurrogateConfig:
-        """Default surrogate configuration."""
+    def surrogate_config(self):
+        if self.surrogate_config_override is not None:
+            return self.surrogate_config_override
+        if self.use_phase_field:
+            # Compact Transolver sized for small FEA datasets
+            return TransolverConfig(
+                d_model=64, n_layers=3, n_heads=4, slice_num=16,
+                mlp_ratio=2.0, dropout=0.1, learning_rate=5e-4,
+                batch_size=4, epochs=300, patience=100,
+                scheduler_type="cosine", optimizer_type="adamw",
+            )
         return SurrogateConfig()
 
     def __post_init__(self):
         self.output_dir = Path(self.output_dir)
-        self.base_mesh_path = Path(self.base_mesh_path)
+        if self.base_mesh_path is not None:
+            self.base_mesh_path = Path(self.base_mesh_path)
 
 
 @dataclass
@@ -235,6 +273,28 @@ class AdaptiveOrchestrator:
 
         # Initialize acquisition function (for non-agentic mode)
         self._acquisition_fn = get_acquisition_function("uncertainty")
+
+        # Initialize Budget Agent if enabled
+        self.budget_agent: Optional[Any] = None
+        if config.use_budget_agent:
+            from piano.agents.roles.budget import BudgetAgent
+            self.budget_agent = BudgetAgent(
+                model=config.llm_model,
+                convergence_threshold=config.convergence_threshold,
+                max_samples=config.max_samples,
+                patience=config.patience,
+                base_samples_per_iter=config.samples_per_iteration,
+            )
+            if llm_provider:
+                self.budget_agent.set_llm_provider(llm_provider)
+
+        # Initialize Mesh Strategy Agent if enabled
+        self.mesh_strategy_agent: Optional[Any] = None
+        if config.use_mesh_strategy_agent:
+            from piano.agents.roles.mesh_strategy import MeshStrategyAgent
+            self.mesh_strategy_agent = MeshStrategyAgent(model=config.llm_model)
+            if llm_provider:
+                self.mesh_strategy_agent.set_llm_provider(llm_provider)
 
         # Initialize agentic proposer if enabled
         self.proposer: Optional[AdaptiveProposerAgent] = None
@@ -347,24 +407,69 @@ class AdaptiveOrchestrator:
                 logger.info(f"  Weak regions: {len(analysis.weak_regions)}")
 
                 # Check convergence criteria
-                stopping_criterion = self._check_convergence(
-                    test_error=test_error,
-                    n_samples=len(self.dataset),
-                    n_weak_regions=len(analysis.weak_regions),
-                    mean_uncertainty=uncertainty_stats.get("mean_uncertainty", 0),
-                    iteration=iteration,
-                )
+                mean_uncertainty = uncertainty_stats.get("mean_uncertainty", 0)
 
-                if stopping_criterion is not None:
-                    logger.info(f"Stopping: {stopping_criterion.name}")
-                    break
+                if self.budget_agent is not None:
+                    budget_decision = self.budget_agent.decide_sync(
+                        iteration=iteration + 1,
+                        test_error=test_error,
+                        mean_uncertainty=mean_uncertainty,
+                        n_samples=len(self.dataset),
+                        n_hpo_rounds=iteration_metrics.get("n_hpo_rounds", 0),
+                    )
+                    logger.info(f"BudgetAgent: {budget_decision.decision} — {budget_decision.reasoning[:100]}")
+                    if budget_decision.should_stop() or budget_decision.should_switch_hpo():
+                        stopping_criterion = (
+                            StoppingCriterion.CONVERGED
+                            if budget_decision.should_stop()
+                            else StoppingCriterion.DIMINISHING_RETURNS
+                        )
+                        logger.info(f"Stopping per BudgetAgent: {stopping_criterion.name}")
+                        break
+                    n_new_samples = budget_decision.samples_next
+                else:
+                    stopping_criterion = self._check_convergence(
+                        test_error=test_error,
+                        n_samples=len(self.dataset),
+                        n_weak_regions=len(analysis.weak_regions),
+                        mean_uncertainty=mean_uncertainty,
+                        iteration=iteration,
+                    )
+                    if stopping_criterion is not None:
+                        logger.info(f"Stopping: {stopping_criterion.name}")
+                        break
+                    n_new_samples = self._compute_adaptive_budget(test_error)
 
-                # Phase 4: Select new samples using acquisition function
+                # Phase 3b: Mesh strategy (optional)
+                if (
+                    self.mesh_strategy_agent is not None
+                    and self._coordinates is not None
+                    and self.config.tip_coords is not None
+                ):
+                    node_uncertainties = self._get_node_uncertainties()
+                    from piano.agents.base import AgentContext
+                    mesh_ctx = AgentContext(iteration=iteration + 1)
+                    mesh_decision = self.mesh_strategy_agent.decide_sync(
+                        context=mesh_ctx,
+                        coordinates=self._coordinates,
+                        errors=node_uncertainties,
+                        tip_coords=self.config.tip_coords,
+                        iteration=iteration + 1,
+                        n_samples=len(self.dataset),
+                    )
+                    logger.info(f"MeshStrategy: {mesh_decision.to_summary()}")
+                    if mesh_decision.needs_h_refinement():
+                        self._apply_h_refinement()
+
+                # Phase 4: Select new samples
                 logger.info("Phase 4: Selecting informative samples...")
-                n_new_samples = self._compute_adaptive_budget(test_error)
-                new_params = self._select_informative_samples(n_new_samples)
+                if self.config.use_agentic_proposer and self.proposer is not None:
+                    new_params = self._select_informative_samples(n_new_samples)
+                else:
+                    new_params = self._suggest_new_parameters(analysis, budget=n_new_samples)
 
-                logger.info(f"  Selected {len(new_params)} new samples using {self.config.acquisition_strategy}")
+                _acq_name = "agentic_proposer" if self.config.use_agentic_proposer else self._acquisition_fn.name
+                logger.info(f"  Selected {len(new_params)} new samples using {_acq_name}")
 
                 # Phase 5: Run simulations for new samples
                 logger.info("Phase 5: Running FEM simulations...")
@@ -461,8 +566,9 @@ class AdaptiveOrchestrator:
         if self._no_improvement_count >= self.config.patience:
             return StoppingCriterion.PATIENCE_EXHAUSTED
 
-        # Check uncertainty (use convergence_threshold as uncertainty threshold)
-        if mean_uncertainty < self.config.convergence_threshold:
+        # Check uncertainty — only after iteration 2 and only when we have a real signal
+        # (0.0 means no ensemble yet, not that the model is already confident)
+        if mean_uncertainty > 0 and iteration >= 2 and mean_uncertainty < self.config.convergence_threshold:
             return StoppingCriterion.LOW_UNCERTAINTY
 
         # Check diminishing returns
@@ -619,16 +725,23 @@ class AdaptiveOrchestrator:
 
     def _suggest_new_parameters(
         self,
-        analysis: UncertaintyAnalysis
+        analysis: UncertaintyAnalysis,
+        budget: Optional[int] = None,
     ) -> List[Dict[str, float]]:
-        """Suggest new parameters based on uncertainty analysis."""
-        if self.evaluator is None:
-            return self._generate_random_parameters(self.config.samples_per_iteration)
+        """Suggest new parameters based on uncertainty analysis and acquisition function."""
+        n = budget or self.config.samples_per_iteration
 
-        return self.evaluator.suggest_samples(
-            analysis,
-            budget=self.config.samples_per_iteration
-        )
+        if self.evaluator is None:
+            return self._generate_random_parameters(n)
+
+        if self._coordinates is not None:
+            return self.evaluator.suggest_samples_active(
+                budget=n,
+                coordinates=self._coordinates,
+                acquisition_type=self._acquisition_fn.name,
+            )
+
+        return self.evaluator.suggest_samples(analysis, budget=n)
 
     def _run_simulations(self, param_list: List[Dict[str, float]]) -> None:
         """
@@ -664,29 +777,63 @@ class AdaptiveOrchestrator:
         params: Dict[str, float],
         result_loader: SimulationResultLoader
     ) -> FEMSample:
-        """
-        Run a single FEM simulation.
+        if self.config.use_phase_field:
+            return self._run_phase_field_simulation(params)
+        return self._run_mfem_simulation(params, result_loader)
 
-        Args:
-            params: Parameter dictionary
-            result_loader: Loader for converting results
+    def _run_phase_field_simulation(self, params: Dict[str, float]) -> FEMSample:
+        """Run a single phase field FEA sample via DOLFINx."""
+        from ..data.phase_field_generator import PhaseFieldFEMConfig, generate_phase_field_sample
 
-        Returns:
-            FEMSample with simulation results
-        """
-        # Load base mesh
+        E            = params["E"]
+        nu           = params["nu"]
+        G_c          = params["G_c"]
+        crack_length = params["crack_length"]
+        load_ratio   = params["load_ratio"]
+
+        # Griffith critical traction, scaled by load_ratio so every sample is near-critical
+        Y      = 1.12
+        K_Ic   = np.sqrt(E * G_c / (1.0 - nu ** 2))
+        sigma_c = K_Ic / (Y * np.sqrt(np.pi * crack_length))
+        traction = sigma_c * load_ratio
+
+        cfg = PhaseFieldFEMConfig(
+            geometry_type="edge_crack",
+            crack_length=crack_length,
+            resolution=self.config.phase_field_resolution,
+            n_load_steps=self.config.phase_field_n_load_steps,
+            output_dir=self.meshes_dir,
+        )
+
+        sample = generate_phase_field_sample(
+            E=E, nu=nu, traction=traction, G_c=G_c, config=cfg
+        )
+
+        if sample is None or not sample.is_valid:
+            raise RuntimeError(
+                f"Phase field simulation failed — params: E={E:.2e}, nu={nu:.3f}, "
+                f"traction={traction:.2e}, G_c={G_c:.0f}, crack={crack_length:.3f}"
+            )
+
+        # Expose traction and load_ratio so agents can reason about loading
+        sample.parameters["traction"]   = float(traction)
+        sample.parameters["load_ratio"] = float(load_ratio)
+        return sample
+
+    def _run_mfem_simulation(
+        self,
+        params: Dict[str, float],
+        result_loader: SimulationResultLoader
+    ) -> FEMSample:
+        """Run a single MFEM linear-elasticity simulation."""
         mesh_manager = MFEMManager(self.config.base_mesh_path)
 
-        # Apply morphing if delta_R is specified
         if "delta_R" in params:
-            delta_R = params["delta_R"]
-            morphed_coords = self._apply_morphing(mesh_manager, delta_R)
+            morphed_coords = self._apply_morphing(mesh_manager, params["delta_R"])
             mesh_manager.update_nodes(morphed_coords)
 
-        # Setup physics
         physics = self.config.physics_config
         if physics is None:
-            # Default physics
             physics = PhysicsConfig(
                 physics_type=PhysicsType.LINEAR_ELASTICITY,
                 material=MaterialProperties(
@@ -707,7 +854,6 @@ class AdaptiveOrchestrator:
                 ],
             )
 
-        # Run solver
         solver = MFEMSolver(order=1)
         solver.setup(mesh_manager, physics)
 
@@ -716,8 +862,6 @@ class AdaptiveOrchestrator:
         output_dir.mkdir(exist_ok=True)
 
         result = solver.solve(output_dir)
-
-        # Convert to FEMSample
         return result_loader.from_solver_result(
             solver_result=result,
             mesh_manager=mesh_manager,
@@ -727,6 +871,12 @@ class AdaptiveOrchestrator:
 
     def _train_surrogate(self) -> TrainingResult:
         """Train surrogate model on current dataset."""
+        if self.config.use_phase_field:
+            return self._train_surrogate_phase_field()
+        return self._train_surrogate_mfem()
+
+    def _train_surrogate_mfem(self) -> TrainingResult:
+        """Standard MFEM training path."""
         try:
             parameters, coordinates_list, outputs_list = self.dataset.prepare_training_data(
                 output_field="displacement",
@@ -735,15 +885,47 @@ class AdaptiveOrchestrator:
         except ValueError as e:
             return TrainingResult(success=False, error_message=str(e))
 
-        # Use the base mesh as the representative coordinate set for
-        # acquisition function probing and uncertainty estimation.
         base_manager = MFEMManager(str(self.config.base_mesh_path))
         self._coordinates = base_manager.get_nodes()
 
         if self.config.use_agentic_hpo:
             return self._train_with_agentic_hpo(parameters, coordinates_list, outputs_list)
-        else:
-            return self._train_standard(parameters, coordinates_list, outputs_list)
+        return self._train_standard(parameters, coordinates_list, outputs_list)
+
+    def _train_surrogate_phase_field(self) -> TrainingResult:
+        """Phase field training path: Williams-enriched coords, stacked [u_x, u_y, log1p(σ_vm)]."""
+        try:
+            parameters, coords_list, disp_list = self.dataset.prepare_training_data(
+                output_field="displacement", valid_only=True,
+            )
+            _, _, vm_list = self.dataset.prepare_training_data(
+                output_field="von_mises", valid_only=True,
+            )
+        except ValueError as e:
+            return TrainingResult(success=False, error_message=str(e))
+
+        # Stack outputs: [u_x, u_y, log1p(σ_vm)] — (N, 3) per sample
+        # log1p collapses the 4-decade stress spike at the tip to a smooth 1-decade field
+        outputs_list = [
+            np.concatenate([disp, np.log1p(vm)], axis=1).astype(np.float32)
+            for disp, vm in zip(disp_list, vm_list)
+        ]
+
+        # Williams enrichment: append [r, log_r, sinθ, cosθ, sin(θ/2), cos(θ/2)] to (x,y)
+        param_names = self.dataset.config.parameter_names
+        cl_idx = param_names.index("crack_length")
+        enriched_coords = [
+            _williams_enrich(coords.astype(np.float32), float(param_row[cl_idx]))
+            for coords, param_row in zip(coords_list, parameters)
+        ]
+
+        # Store enriched first-sample coords so the acquisition function can probe
+        # the input space at inference time (variable-mesh: just use first sample)
+        self._coordinates = enriched_coords[0]
+
+        if self.config.use_agentic_hpo:
+            return self._train_with_agentic_hpo(parameters, enriched_coords, outputs_list)
+        return self._train_standard(parameters, enriched_coords, outputs_list)
 
     def _train_standard(
         self,
@@ -833,6 +1015,37 @@ class AdaptiveOrchestrator:
             n_probe_samples=100,
             uncertainty_threshold=self.config.convergence_threshold,
         )
+
+    def _get_node_uncertainties(self) -> np.ndarray:
+        """Return per-node ensemble uncertainty at the median parameter point."""
+        if self.surrogate is None or self._coordinates is None:
+            return np.zeros(len(self._coordinates) if self._coordinates is not None else 0)
+
+        # Probe at the parameter-space centre
+        centre = np.array([[
+            (lo + hi) / 2.0
+            for lo, hi in (
+                self.config.parameter_bounds[n]
+                for n in self.config.parameter_names
+            )
+        ]])
+        result = self.surrogate.predict(centre, self._coordinates)
+        if result.uncertainty is not None:
+            unc = result.uncertainty
+            return unc.mean(axis=-1) if unc.ndim > 1 else unc
+        return np.zeros(len(self._coordinates))
+
+    def _apply_h_refinement(self) -> None:
+        """Uniformly refine the base mesh and update the stored path."""
+        try:
+            mgr = MFEMManager(str(self.config.base_mesh_path))
+            mgr.apply_uniform_refinement(n_levels=1)
+            refined_path = self.meshes_dir / "base_mesh_refined.mesh"
+            mgr.save(refined_path)
+            self.config.base_mesh_path = refined_path
+            logger.info(f"h-refinement applied → {refined_path} ({mgr.num_nodes} nodes)")
+        except Exception as e:
+            logger.warning(f"h-refinement failed: {e}")
 
     def get_dataset(self) -> FEMDataset:
         """Get the current dataset."""

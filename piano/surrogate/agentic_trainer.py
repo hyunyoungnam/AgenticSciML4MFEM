@@ -2,10 +2,11 @@
 Agentic Surrogate Trainer.
 
 Wraps SurrogateTrainer with LLM-based hyperparameter optimization.
-Uses a 3-agent system:
+Uses a 4-agent system:
 - HyperparameterCriticAgent: Diagnoses training issues
-- ArchitectAgent: Proposes architecture/optimizer changes
+- ArchitectAgent: Proposes architecture/optimizer changes + flags code changes
 - PhysicistAgent: Proposes physics loss configuration changes
+- EngineerAgent: Implements code-level changes via Claude Code CLI
 """
 
 import logging
@@ -44,20 +45,30 @@ class AgenticTrainingConfig:
         n_ensemble: Number of ensemble members
         llm_model: LLM model for agents
         random_seed: Random seed
-        use_physicist: Whether to use PhysicistAgent for physics loss tuning
         problem_type: Type of physics problem (crack, plate, thermal, etc.)
         has_singularity: Whether the problem has stress singularities
+        use_engineer: Whether to invoke EngineerAgent for code-level changes
+        working_dir: Working directory for EngineerAgent (defaults to cwd)
+        n_candidates: Number of debate candidates per HPO round (1 = no ensemble)
+        eval_epochs: Brief-training epochs for candidate selection
     """
     base_config: TransolverConfig = field(default_factory=TransolverConfig)
     max_hpo_rounds: int = 3
     trigger_threshold: float = 0.1
     use_ensemble: bool = True
     n_ensemble: int = 5
-    llm_model: str = "gpt-4-turbo"
+    llm_model: str = "claude-sonnet-4-6"
     random_seed: int = 42
-    use_physicist: bool = True
     problem_type: str = "crack"
     has_singularity: bool = True
+    use_engineer: bool = False
+    working_dir: Optional[str] = None
+    n_candidates: int = 1
+    eval_epochs: int = 20
+    use_data_analyst: bool = True
+    data_analysis_report_path: Optional[str] = None
+    tip_coords: Optional[Any] = None
+    parameter_names: Optional[Any] = None
 
 
 @dataclass
@@ -86,17 +97,16 @@ class AgenticSurrogateTrainer:
     """
     Agentic wrapper for SurrogateTrainer.
 
-    Implements adaptive hyperparameter optimization using a 3-agent system:
-    1. Train with initial config
-    2. CriticAgent analyzes training results and diagnoses issues
-    3. If architecture issues: ArchitectAgent proposes model/optimizer changes
-    4. If physics issues: PhysicistAgent proposes physics loss changes
-    5. Merge proposals and retrain, repeat up to max_hpo_rounds
+    Implements adaptive HPO via 4-round structured agent debate:
+      Round 1 (OBSERVATION)  — Analyst + Critic describe training state
+      Round 2 (ANALYSIS)     — Architect + Physicist reason about root causes
+      Round 3 (SYNTHESIS)    — Architect + Physicist propose concrete changes
+      Round 4 (FINALIZATION) — Critic validates proposals before applying
 
     Features:
-    - Separation of concerns: Architecture vs Physics tuning
-    - Adaptive trigger: Only invoke agents when needed
-    - History tracking: Learns from previous attempts
+    - Multi-round debate prevents premature proposals
+    - Peer validation catches capacity/physics ordering violations
+    - History tracking: each round sees previous HPO attempts
     """
 
     def __init__(
@@ -118,16 +128,55 @@ class AgenticSurrogateTrainer:
         from piano.agents.roles.hyperparameter_critic import HyperparameterCriticAgent
         from piano.agents.roles.architect import ArchitectAgent
         from piano.agents.roles.physicist import PhysicistAgent
+        from piano.agents.roles.result_analyst import ResultAnalystAgent
+        from piano.agents.roles.engineer import EngineerAgent
 
         # Initialize agents
         self.critic = HyperparameterCriticAgent(model=config.llm_model)
         self.architect = ArchitectAgent(model=config.llm_model)
         self.physicist = PhysicistAgent(model=config.llm_model)
+        self.analyst = ResultAnalystAgent(model=config.llm_model)
 
         if llm_provider:
             self.critic.set_llm_provider(llm_provider)
             self.architect.set_llm_provider(llm_provider)
             self.physicist.set_llm_provider(llm_provider)
+            self.analyst.set_llm_provider(llm_provider)
+
+        # Data Analyst (Phase 0 — runs once before first training)
+        self.data_analyst = None
+        if config.use_data_analyst and llm_provider:
+            from piano.agents.roles.data_analyst import DataAnalystAgent
+            self.data_analyst = DataAnalystAgent(model=config.llm_model)
+            self.data_analyst.set_llm_provider(llm_provider)
+        self._data_analysis = None  # Cached result, shared via context
+
+        # Knowledge Retriever (wired into debate)
+        from piano.agents.roles.knowledge_retriever import KnowledgeRetrieverAgent
+        self.knowledge_retriever = KnowledgeRetrieverAgent()
+
+        # Debate orchestrator (4-round structured debate — always active)
+        from piano.orchestration.debate import DebateOrchestrator
+        self.debate = DebateOrchestrator(
+            analyst=self.analyst,
+            critic=self.critic,
+            architect=self.architect,
+            physicist=self.physicist,
+            knowledge_retriever=self.knowledge_retriever,
+        )
+
+        # Selector Ensemble (3-LLM voting for multi-candidate selection)
+        self.selector: Optional[Any] = None
+        if llm_provider and config.n_candidates > 1:
+            from piano.agents.roles.selector_ensemble import SelectorEnsembleAgent
+            self.selector = SelectorEnsembleAgent(llm_provider=llm_provider)
+
+        # Engineer agent (optional — uses Claude Code CLI independently of llm_provider)
+        self.engineer: Optional[EngineerAgent] = None
+        if config.use_engineer:
+            import os
+            working_dir = config.working_dir or os.getcwd()
+            self.engineer = EngineerAgent(working_dir=working_dir)
 
         # State
         self._current_config = config.base_config
@@ -135,6 +184,12 @@ class AgenticSurrogateTrainer:
         self._best_result: Optional[TrainingResult] = None
         self._best_config: Optional[TransolverConfig] = None
         self._trainer: Optional[SurrogateTrainer] = None
+        self._all_train_losses: List[float] = []
+        self._all_test_losses: List[float] = []
+        # Stored training data for brief-training during ensemble selection
+        self._params: Optional[np.ndarray] = None
+        self._coordinates: Optional[List[np.ndarray]] = None
+        self._outputs: Optional[List[np.ndarray]] = None
 
     def train(
         self,
@@ -172,9 +227,42 @@ class AgenticSurrogateTrainer:
         callback: Optional[Callable[[int, float], None]] = None,
     ) -> AgenticTrainingResult:
         """Internal training loop with HPO."""
+        self._params = parameters
+        self._coordinates = coordinates
+        self._outputs = outputs
         dataset_size = len(parameters)
         initial_error = float('inf')
         n_rounds = 0
+
+        # Phase 0: Dataset analysis (runs once, before first training)
+        if self.data_analyst is not None and self._data_analysis is None:
+            logger.info("Phase 0: Dataset analysis...")
+            from pathlib import Path
+            report_path = (
+                Path(self.config.data_analysis_report_path)
+                if self.config.data_analysis_report_path
+                else None
+            )
+            tip = (
+                np.array(self.config.tip_coords)
+                if self.config.tip_coords is not None
+                else None
+            )
+            try:
+                self._data_analysis = self.data_analyst.analyze_sync(
+                    coordinates=coordinates,
+                    outputs=outputs,
+                    parameters=parameters,
+                    tip_coords=tip,
+                    parameter_names=self.config.parameter_names,
+                    report_path=report_path,
+                )
+                logger.info(
+                    f"  Dataset quality: {self._data_analysis.dataset_quality}, "
+                    f"near-tip fraction: {self._data_analysis.near_tip_fraction:.3f}"
+                )
+            except Exception as e:
+                logger.warning(f"DataAnalystAgent failed (non-fatal): {e}")
 
         # Initial training
         logger.info("Starting initial training...")
@@ -281,26 +369,39 @@ class AgenticSurrogateTrainer:
         return self._trainer.train(parameters, coordinates, outputs, callback)
 
     def _extract_history(self, result: TrainingResult) -> "TrainingHistory":
-        """Extract TrainingHistory from TrainingResult."""
+        """Extract TrainingHistory from TrainingResult, accumulating across rounds."""
         from piano.agents.roles.hyperparameter_critic import TrainingHistory
 
         history = result.history or {}
 
-        train_losses = history.get('train_loss', [])
-        test_losses = history.get('test_loss', [])
+        round_train = history.get('train_loss', [])
+        round_test = history.get('test_loss', [])
         pino_losses = history.get('pino_loss', [])
 
-        # Check for NaN
-        has_nan = any(np.isnan(l) for l in train_losses + test_losses)
+        self._all_train_losses.extend(round_train)
+        self._all_test_losses.extend(round_test)
+
+        has_nan = any(np.isnan(l) for l in round_train + round_test)
+
+        # Per-term PINO losses (only from the current round — most recent context)
+        pino_term_losses = {}
+        for key in ('elasticity_loss', 'crack_loss'):
+            vals = history.get(key, [])
+            if vals:
+                pino_term_losses[key.replace('_loss', '')] = vals
+
+        ensemble_std = history.get('ensemble_std', 0.0)
 
         return TrainingHistory(
-            train_losses=train_losses,
-            test_losses=test_losses,
+            train_losses=self._all_train_losses,
+            test_losses=self._all_test_losses,
             pino_losses=pino_losses,
-            epochs_completed=len(train_losses),
-            best_test_loss=min(test_losses) if test_losses else float('inf'),
-            final_train_loss=train_losses[-1] if train_losses else float('inf'),
-            final_test_loss=test_losses[-1] if test_losses else float('inf'),
+            pino_term_losses=pino_term_losses,
+            ensemble_std=ensemble_std,
+            epochs_completed=len(self._all_train_losses),
+            best_test_loss=min(self._all_test_losses) if self._all_test_losses else float('inf'),
+            final_train_loss=round_train[-1] if round_train else float('inf'),
+            final_test_loss=round_test[-1] if round_test else float('inf'),
             has_nan=has_nan,
             metrics=result.metrics,
         )
@@ -325,91 +426,155 @@ class AgenticSurrogateTrainer:
         history: "TrainingHistory",
         dataset_size: int,
     ) -> TransolverConfig:
-        """Get config using LLM agents (sync wrapper for async)."""
-        import asyncio
-        from piano.agents.base import AgentContext
+        """Get new config via 4-round agent debate, with optional ensemble selection."""
+        n_cand = self.config.n_candidates
 
-        # Create agent context
-        context = AgentContext()
-
-        # Run async agents synchronously
-        loop = asyncio.new_event_loop()
-        try:
-            # Get critique from CriticAgent
-            critique = loop.run_until_complete(
-                self.critic.analyze_training(
-                    context=context,
-                    training_history=history,
-                    config=self._current_config.to_dict(),
-                    previous_attempts=[
-                        {"summary": f"Loss={h['result']}"}
-                        for h in self._config_history
-                    ],
-                )
+        if n_cand > 1:
+            # Ensemble: generate N candidates, select via SelectorEnsemble (or brief-train fallback)
+            debate_results = self.debate.run_ensemble_debates_sync(
+                history=history,
+                current_config=self._current_config,
+                dataset_size=dataset_size,
+                config_history=self._config_history,
+                problem_type=self.config.problem_type,
+                has_singularity=self.config.has_singularity,
+                n_candidates=n_cand,
             )
-
-            logger.info(f"Critic diagnosis: {critique.primary_issue.name} ({critique.severity})")
-
-            # Get architecture proposal from ArchitectAgent
-            arch_proposal = loop.run_until_complete(
-                self.architect.propose_config(
-                    context=context,
-                    current_config=self._current_config,
-                    critique=critique,
-                    dataset_size=dataset_size,
-                    previous_configs=self._config_history,
+            if self.selector is not None:
+                # SelectorEnsemble: 3-LLM majority vote
+                history_summary = (
+                    f"Test loss: {history.final_test_loss:.6f}, "
+                    f"Train loss: {history.final_train_loss:.6f}, "
+                    f"Issue: {history.best_test_loss:.6f} best"
                 )
-            )
-
-            logger.info(f"Architect proposal: {arch_proposal.changes}")
-
-            # Get physics proposal from PhysicistAgent (if enabled)
-            physics_changes = {}
-            if self.config.use_physicist:
-                physics_proposal = loop.run_until_complete(
-                    self.physicist.propose_physics_config(
-                        context=context,
-                        current_config=self._current_config.to_dict(),
-                        critique=critique,
-                        training_history=history,
-                        dataset_size=dataset_size,
-                        problem_type=self.config.problem_type,
-                        has_singularity=self.config.has_singularity,
-                        previous_configs=self._config_history,
-                    )
+                sel_result = self.selector.select_sync(debate_results, history_summary)
+                winner_idx = sel_result.selected_index
+                winner_result = debate_results[winner_idx]
+                best_config = self._merge_proposals(
+                    winner_result.arch_proposal.config, winner_result.physics_changes
                 )
-                physics_changes = physics_proposal.changes
-                logger.info(f"Physicist proposal: {physics_changes}")
-                if physics_proposal.physics_diagnosis:
-                    logger.info(f"Physics diagnosis: {physics_proposal.physics_diagnosis[:200]}...")
-
-            # Merge proposals: architecture + physics
-            merged_config = self._merge_proposals(
-                arch_proposal.config,
-                physics_changes,
+                logger.info(
+                    f"  SelectorEnsemble winner: candidate[{winner_idx}] "
+                    f"(confidence={sel_result.confidence:.2f})"
+                )
+            else:
+                # Fallback: brief-train each candidate
+                best_config = None
+                best_loss = float('inf')
+                for i, result in enumerate(debate_results):
+                    candidate = self._merge_proposals(result.arch_proposal.config, result.physics_changes)
+                    brief_loss = self._train_brief(candidate)
+                    logger.info(f"  Ensemble candidate {i+1}/{n_cand}: brief_loss={brief_loss:.6f}")
+                    if brief_loss < best_loss:
+                        best_loss = brief_loss
+                        best_config = candidate
+                        winner_result = result
+                logger.info(f"  Ensemble winner (brief-train): loss={best_loss:.6f}")
+            selected = winner_result
+        else:
+            selected = self.debate.run_debate_sync(
+                history=history,
+                current_config=self._current_config,
+                dataset_size=dataset_size,
+                config_history=self._config_history,
+                problem_type=self.config.problem_type,
+                has_singularity=self.config.has_singularity,
             )
+            best_config = None  # set below
 
-            return merged_config
+        arch_proposal = selected.arch_proposal
 
-        finally:
-            loop.close()
+        if (
+            self.engineer is not None
+            and arch_proposal.code_change_description
+            and arch_proposal.code_change_description.lower() != "none"
+        ):
+            logger.info(f"EngineerAgent: {arch_proposal.code_change_description[:120]}...")
+            eng_result = self.engineer.implement_change_sync(
+                change_description=arch_proposal.code_change_description,
+                context_files=[
+                    "piano/surrogate/deeponet.py",
+                    "piano/surrogate/pino_loss.py",
+                    "piano/surrogate/crack_pino_loss.py",
+                    "piano/surrogate/trainer.py",
+                ],
+                validation_command="python -m pytest tests/ -x -q 2>&1 | tail -20",
+            )
+            if eng_result.success:
+                logger.info(f"EngineerAgent: {eng_result.changes_made[:200]}")
+            else:
+                logger.warning(f"EngineerAgent failed: {eng_result.error}")
+
+        if best_config is None:
+            best_config = self._merge_proposals(arch_proposal.config, selected.physics_changes)
+        return best_config
+
+    def _train_brief(self, config: Any) -> float:
+        """Brief-train a candidate config for eval_epochs; return final test loss."""
+        if self._params is None:
+            return float('inf')
+
+        import copy
+        brief_config = copy.deepcopy(config)
+        brief_config.epochs = self.config.eval_epochs
+        brief_config.patience = self.config.eval_epochs
+
+        training_config = TrainingConfig(
+            surrogate_config=brief_config,
+            use_ensemble=False,
+            normalize_inputs=True,
+            normalize_outputs=True,
+            train_test_split=0.2,
+            random_seed=self.config.random_seed,
+        )
+        trainer = SurrogateTrainer(training_config)
+        result = trainer.train(self._params, self._coordinates, self._outputs)
+        return result.test_loss if result.success else float('inf')
 
     def _merge_proposals(
         self,
-        arch_config: TransolverConfig,
+        arch_config: Any,
         physics_changes: Dict[str, Any],
-    ) -> TransolverConfig:
+    ) -> Any:
         """
         Merge architecture and physics proposals into a single config.
 
-        Physics changes override architecture config for physics-related params.
+        The Physicist's changes override the arch config for all physics weights.
+        The Architect owns only NN/optimizer params; it preserves but does not modify physics weights.
         """
-        config_dict = arch_config.to_dict()
+        from piano.surrogate.deeponet import DeepONetConfig
 
-        # Apply physics changes (pino_* params)
+        _physics_keys = {"energy", "equilibrium", "traction_free", "stress_intensity",
+                         "near_tip", "j_integral"}
+
+        config_dict = arch_config.to_dict()
         for key, value in physics_changes.items():
-            if key.startswith("pino"):
+            if key in _physics_keys:
                 config_dict[key] = value
+
+        if config_dict.get("arch_type") == "deeponet":
+            return DeepONetConfig(
+                hidden_dim=config_dict.get('hidden_dim', 64),
+                n_basis=config_dict.get('n_basis', 32),
+                n_layers=config_dict.get('n_layers', 3),
+                dropout=config_dict.get('dropout', 0.0),
+                trunk_dropout=config_dict.get('trunk_dropout', 0.1),
+                learning_rate=config_dict.get('learning_rate', 1e-3),
+                batch_size=config_dict.get('batch_size', 4),
+                epochs=config_dict.get('epochs', 200),
+                patience=config_dict.get('patience', 50),
+                optimizer_type=config_dict.get('optimizer_type', 'adamw'),
+                scheduler_type=config_dict.get('scheduler_type', 'cosine'),
+                activation=config_dict.get('activation', 'gelu'),
+                output_dim=config_dict.get('output_dim', 1),
+                energy=config_dict.get('energy', 0.0),
+                equilibrium=config_dict.get('equilibrium', 0.0),
+                tip_weight=config_dict.get('tip_weight', 0.0),
+                stress_intensity=config_dict.get('stress_intensity', 0.0),
+                traction_free=config_dict.get('traction_free', 0.0),
+                near_tip=config_dict.get('near_tip', 0.0),
+                j_integral=config_dict.get('j_integral', 0.0),
+            )
 
         return TransolverConfig(
             slice_num=config_dict.get('slice_num', 32),
@@ -423,8 +588,12 @@ class AgenticSurrogateTrainer:
             epochs=config_dict.get('epochs', 1000),
             patience=config_dict.get('patience', 100),
             output_dim=config_dict.get('output_dim', 3),
-            pino_weight=config_dict.get('pino_weight', 0.1),
-            pino_eq_weight=config_dict.get('pino_eq_weight', 0.1),
+            energy=config_dict.get('energy', 0.0),
+            equilibrium=config_dict.get('equilibrium', 0.0),
+            stress_intensity=config_dict.get('stress_intensity', 0.0),
+            traction_free=config_dict.get('traction_free', 0.0),
+            near_tip=config_dict.get('near_tip', 0.0),
+            j_integral=config_dict.get('j_integral', 0.0),
             optimizer_type=config_dict.get('optimizer_type', 'adamw'),
             scheduler_type=config_dict.get('scheduler_type', 'plateau'),
             activation=config_dict.get('activation', 'gelu'),

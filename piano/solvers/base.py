@@ -208,6 +208,9 @@ class PhaseFieldConfig:
     stagger_max_iter: int = 100
     n_load_steps: int = 50
     damage_threshold: float = 0.9  # d > 0.9 considered as crack
+    # Pre-existing crack geometry for d=1 initialization (None = skip)
+    crack_tip_x: Optional[float] = None   # x-coordinate of crack tip (m)
+    crack_y: Optional[float] = None       # y-coordinate of crack midline (m)
 
     def __post_init__(self):
         """Validate phase field parameters."""

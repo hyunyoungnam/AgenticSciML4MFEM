@@ -4,29 +4,34 @@
 
 PIANO is a self-improving surrogate framework for computational mechanics. It combines neural operator architectures (Transolver and DeepONet) with physics-informed loss (PINO) and an **autonomous 3-agent HPO system** that diagnoses training issues and proposes fixes — without manual tuning.
 
+The agentic loop is inspired by [AgenticSciML (Jiang, 2024)](paper/AGENTICSCIML_QJiang.pdf) and implements three key ideas from that paper: a structured Critic–Architect debate, best-config selection across rounds, and persistent failure memory fed back to the Architect.
+
 ---
 
 ## Demo Result
 
-V-notch stress prediction: 30 FEM samples, 4 agentic HPO rounds, 53.7% improvement. PINO equilibrium loss active from round 1.
+V-notch stress prediction: 30 FEM samples, 5 agentic HPO rounds, 78.2% test-loss improvement. Physics terms enabled sequentially by the Physicist agent. Peak stress error: 55.5%.
 
 ![V-Notch Demo](tests/test_outputs/agentic_vnotch_demo.png)
+
+**Top row (left to right):**
+- **Loss evolution** — cumulative training and test loss across all HPO rounds; round boundaries marked
+- **HPO convergence** — test loss per round with best-round annotation
+- **Physics weight progression** — Physicist sequentially enables equilibrium → energy → traction_free → stress_intensity → near_tip
 
 **Bottom row (left to right):**
 - **Surrogate** — predicted von Mises stress derived from displacement output `(N, 2)`
 - **Ground Truth** — FEM solution (Williams eigenfunction expansion)
-- **Error** — Absolute pointwise error (mean: 1.07×10⁸ Pa)
-
-The surrogate captures the 1/√r stress singularity at the notch tip and the stress-free notch faces from 30 training samples. The PINO equilibrium residual (`pino_eq_weight=0.1`) is active throughout and tuned further each round by the Physicist agent.
+- **Peak stress comparison** — bar chart of surrogate vs GT peak σ_VM with percentage error
 
 ### Run the Demo
 
 ```bash
-# Default: 30 samples, 80 epochs/round, 8 rounds (mock LLM)
+# Default: 30 samples, 80 epochs/round, up to 8 rounds (mock LLM)
 python tests/test_agentic_sciml.py
 
 # Faster run
-python tests/test_agentic_sciml.py --n-samples 30 --epochs 80 --rounds 3
+python tests/test_agentic_sciml.py --n-samples 30 --epochs 80 --rounds 4
 
 # With real LLM agents (requires ANTHROPIC_API_KEY)
 python tests/test_agentic_sciml.py --use-real-llm
@@ -36,54 +41,66 @@ python tests/test_agentic_sciml.py --use-real-llm
 
 ## What Makes PIANO Different?
 
-Traditional neural operators require manual hyperparameter tuning. PIANO uses **LLM-based agents** that automatically diagnose training issues and propose fixes:
+Traditional neural operators require manual hyperparameter tuning. PIANO uses **LLM-based agents** that automatically diagnose training issues, debate solutions, and propose fixes:
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     3-AGENT HPO SYSTEM                              │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│                         Train Model                                 │
-│                              ↓                                      │
-│                    ┌─────────────────┐                              │
-│                    │  CRITIC AGENT   │                              │
-│                    │  Analyzes loss  │                              │
-│                    │  curves, detects│                              │
-│                    │  issues via LLM │                              │
-│                    └────────┬────────┘                              │
-│                             ↓                                       │
-│              ┌──────────────┴──────────────┐                        │
-│              ↓                              ↓                       │
-│    ┌─────────────────┐            ┌─────────────────┐               │
-│    │ ARCHITECT AGENT │            │ PHYSICIST AGENT │               │
-│    │                 │            │                 │               │
-│    │ • arch_type     │            │ • pino_weight   │               │
-│    │ • d_model       │            │ • pino_eq_weight│               │
-│    │ • n_layers      │            │ • Singularity   │               │
-│    │ • learning_rate │            │   handling      │               │
-│    │ • dropout       │            │ • PDE residual  │               │
-│    │ • trunk_dropout │            │                 │               │
-│    └────────┬────────┘            └────────┬────────┘               │
-│             └──────────────┬───────────────┘                        │
-│                            ↓                                        │
-│                     Merge Proposals                                 │
-│                            ↓                                        │
-│                    Retrain & Repeat                                 │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                    3-AGENT HPO SYSTEM (with Debate)                   │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│         Train from best known config (Gap 2: best-config select)       │
+│                              ↓                                         │
+│                    ┌─────────────────┐                                 │
+│                    │  CRITIC AGENT   │ ← failure memory (Gap 3)        │
+│                    │  Analyzes loss  │                                 │
+│                    │  curves via LLM │                                 │
+│                    └────────┬────────┘                                 │
+│                             ↓                                          │
+│                    ┌─────────────────┐                                 │
+│                    │ ARCHITECT AGENT │ ← best_config + attempt history │
+│                    │  Proposes config│                                 │
+│                    └────────┬────────┘                                 │
+│                             ↓                                          │
+│                    ┌─────────────────┐                                 │
+│                    │  CRITIC reviews │ ← structured debate (Gap 1)     │
+│                    │  proposal for   │                                 │
+│                    │  feasibility    │                                 │
+│                    └────────┬────────┘                                 │
+│                             ↓ (revise if not feasible)                 │
+│              ┌──────────────┴──────────────┐                           │
+│              ↓                              ↓                          │
+│    ┌─────────────────┐            ┌─────────────────┐                  │
+│    │ ARCHITECT AGENT │            │ PHYSICIST AGENT │                  │
+│    │ (final config)  │            │ sequential      │                  │
+│    │ • arch_type     │            │ physics enabling│                  │
+│    │ • d_model       │            │ eq → energy →   │                  │
+│    │ • learning_rate │            │ traction_free → │                  │
+│    │ • dropout       │            │ stress_intensity │                  │
+│    │ • trunk_dropout │            │ → near_tip      │                  │
+│    └────────┬────────┘            └────────┬────────┘                  │
+│             └──────────────┬───────────────┘                           │
+│                            ↓                                           │
+│                     Merge & Retrain                                    │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Why 3 agents?** Physics-informed learning has two distinct concerns:
-- **Architecture tuning** (capacity, optimization, architecture selection, regularisation) — handled by Architect
-- **Physics enforcement** (PDE constraints, singularities, PINO weights) — handled by Physicist
+### Three paper-inspired improvements (AgenticSciML, Jiang 2024)
 
-Separating these allows each agent to be an expert in its domain. All three agents require a real LLM provider — there is no heuristic fallback.
+**Gap 1 — Structured Critic–Architect debate:**
+After the Architect proposes a config, the Critic reviews it for feasibility. If the proposal doesn't address the diagnosed issue (e.g. overfitting proposal has no regularisation), the Architect revises before training begins. This prevents wasted FEM/training budget on obviously wrong configs.
+
+**Gap 2 — Best-config selection:**
+The Architect always receives the configuration that achieved the best test loss so far, not the most recent one. When a round gets worse, the next proposal builds on the best known state rather than the regressed state.
+
+**Gap 3 — Failure memory:**
+Every completed round appends a plain-text summary `(round, changes, train_loss, test_loss, diagnosis)` to `attempt_history`. This is passed to the Architect so it never repeats a failed strategy.
 
 ---
 
 ## The Agents
 
 ### 1. HyperparameterCriticAgent
-**Role:** Training diagnostician (LLM-required)
+**Role:** Training diagnostician + proposal reviewer (LLM-required)
 
 Analyzes loss curves to detect:
 - `OVERFITTING` — train/test loss divergence
@@ -93,13 +110,14 @@ Analyzes loss curves to detect:
 - `UNSTABLE_TRAINING` — large epoch-to-epoch fluctuations
 - `GRADIENT_EXPLOSION` — NaN values detected
 
-Requires `set_llm_provider()` before `analyze_training()` — raises `RuntimeError` otherwise.
-Lightweight heuristics (`detect_issues_heuristic`) remain available for gating decisions (e.g. `should_trigger_hpo`), but the full LLM diagnosis is always used for HPO.
+Also implements `review_proposal()` — the debate round 2 method that checks whether an Architect proposal addresses the diagnosed issue and returns `feasible`, `concerns`, `suggestion`.
+
+Requires `set_llm_provider()` before `analyze_training()` or `review_proposal()` — raises `RuntimeError` otherwise. Lightweight heuristics (`detect_issues_heuristic`) remain available for gating decisions (e.g. `should_trigger_hpo`) but are not used as an LLM substitute.
 
 ### 2. ArchitectAgent
 **Role:** Neural network architect
 
-Selects architecture and proposes hyperparameters:
+Selects architecture and proposes hyperparameters based on the Critic's diagnosis, the best known config, and the full attempt history:
 
 | Concern | Parameters |
 |---------|------------|
@@ -107,7 +125,6 @@ Selects architecture and proposes hyperparameters:
 | Optimization | `learning_rate`, `optimizer_type`, `scheduler_type` |
 | Regularization | `dropout` (branch), `trunk_dropout` (trunk — independent) |
 | Capacity | `slice_num`, `hidden_dim`, `n_basis` |
-| Physics | `pino_weight`, `pino_eq_weight` |
 
 **Architecture selection:**
 - `transolver` — varied geometry or large datasets (> 200 samples)
@@ -116,11 +133,22 @@ Selects architecture and proposes hyperparameters:
 ### 3. PhysicistAgent
 **Role:** Physics loss specialist
 
-Proposes changes to:
-| Category | Parameters |
-|----------|------------|
-| Energy loss | `pino_weight` (strain energy consistency, needs ground truth) |
-| Equilibrium | `pino_eq_weight` (force balance residual, label-free) |
+Sequentially enables fracture mechanics terms — each term is only activated once the previous one has stabilised:
+
+```
+equilibrium → energy → traction_free → stress_intensity → near_tip → j_integral
+```
+
+| Term | What it enforces | Activated when |
+|------|-----------------|----------------|
+| `equilibrium` | Nodal force balance residual (label-free) | Round 1 |
+| `energy` | Strain energy norm consistency | Equilibrium stable |
+| `traction_free` | σ = 0 on crack/notch faces | Energy stable |
+| `stress_intensity` | K_I least-squares consistency | BC stable |
+| `near_tip` | Williams Mode I expansion | K_I stable |
+| `j_integral` | Domain J = K_I²/E | All others stable |
+
+If the physics-to-data loss ratio exceeds 10%, the Physicist halves all active weights to prevent physics from overriding the data signal.
 
 ---
 
@@ -141,7 +169,7 @@ output(x; μ) = Σ_k  branch_k(μ) × trunk_k(x)  + bias
 
 **Two independent dropout rates:**
 - `dropout` — branch MLP regularisation (keep low; branch just maps parameters to coefficients)
-- `trunk_dropout` — trunk MLP regularisation (prevents oscillatory basis function artifacts in the far-field; both are tunable by the Architect agent)
+- `trunk_dropout` — trunk MLP regularisation (prevents oscillatory basis function artifacts in the far-field; both tunable by the Architect agent)
 
 **Singularity-aware trunk coordinates:**
 Raw `(x, y)` are enriched with polar features relative to the notch/crack tip:
@@ -155,7 +183,7 @@ Raw `(x, y)` are enriched with polar features relative to the notch/crack tip:
 ## Physics-Informed Training
 
 ### Training Target: Displacement Field
-The surrogate predicts nodal **displacement** `(N, 2)` in physical units. Von Mises stress is derived from the predicted displacement at evaluation time via the plane-stress constitutive law — this keeps the output space physics-consistent and enables the PINO loss.
+The surrogate predicts nodal **displacement** `(N, 2)` in physical units. Von Mises stress is derived from the predicted displacement at evaluation time via the plane-stress constitutive law (CST B-matrix). This keeps the output space physics-consistent and enables the PINO loss.
 
 ### Tip-Weighted MSE
 Nodes near the notch tip get higher loss weight: `w_i = 1 + tip_weight / r_i`, normalized so `mean(w) = 1`. This prevents the model from ignoring the singularity in favour of the smooth far-field.
@@ -172,16 +200,12 @@ L_total = L_MSE + pino_weight × L_energy + pino_eq_weight × L_equilibrium
 
 Both terms use fully differentiable PyTorch `einsum` + `scatter_add_`. Coordinates are always sliced to `(x, y)` before being passed to the physics losses, so enriched 6-feature trunk inputs are handled correctly.
 
-`pino_eq_weight=0.1` is active from round 1 by default. `pino_weight` starts at 0.0 and is enabled by the Physicist agent when the training history warrants it.
-
 ### Fracture Mechanics Loss (CrackFractureLoss)
-Four additional terms for explicit fracture mechanics:
+Four additional terms enabled sequentially by the Physicist:
 - **K_I consistency** — least-squares SIF extraction from near-tip displacement
-- **Crack face BC** — σ_yy = σ_xy = 0 on crack-face elements
+- **Crack face BC** — traction-free condition on crack/notch faces (normalised by `K_I²/(2π·r_min)` for scale consistency)
 - **Williams residual** — near-tip displacement matches Mode I expansion
 - **J-integral** — domain J = K_I²/E (plane stress)
-
-All four terms require displacement `(N, 2)` input. Weights (`ki_weight`, `bc_weight`, `williams_weight`, `j_weight`) are off by default and can be enabled once the surrogate produces physically plausible displacements.
 
 ---
 
@@ -194,7 +218,7 @@ piano/
 │   ├── deeponet.py             # DeepONet (Branch-Trunk operator)
 │   ├── trainer.py              # Training loop (PINO-enabled, coord slicing)
 │   ├── agentic_trainer.py      # 3-agent HPO wrapper
-│   ├── ensemble.py             # Ensemble for uncertainty (seed-diverse)
+│   ├── ensemble.py             # Ensemble (seed-diverse members)
 │   ├── pino_loss.py            # PINO elasticity loss (equilibrium + energy)
 │   ├── crack_pino_loss.py      # Fracture mechanics loss (K_I, J-integral)
 │   └── base.py                 # TransolverConfig, DeepONetConfig, CrackConfig
@@ -202,9 +226,9 @@ piano/
 ├── agents/                      # LLM-based agents
 │   ├── base.py                 # BaseAgent, AgentContext
 │   ├── roles/
-│   │   ├── hyperparameter_critic.py  # LLM diagnosis (no heuristic fallback)
+│   │   ├── hyperparameter_critic.py  # Diagnosis + proposal review (debate)
 │   │   ├── architect.py              # Architecture, optimizer, trunk_dropout tuning
-│   │   └── physicist.py              # Physics loss tuning
+│   │   └── physicist.py              # Sequential physics loss enabling
 │   └── llm/                    # Providers: Anthropic (Claude 4), OpenAI
 │
 ├── data/                        # Dataset utilities
@@ -216,7 +240,7 @@ piano/
 │   └── crack.py                # Edge crack geometry
 │
 ├── mesh/                        # Mesh handling
-│   └── mfem_manager.py         # PyMFEM wrapper (get_nodes, get_elements)
+│   └── mfem_manager.py         # PyMFEM wrapper
 │
 └── solvers/                     # FEM solvers
     └── mfem_solver.py          # PyMFEM linear-elasticity
@@ -250,10 +274,23 @@ piano/
 | `slice_num` | 32 | Architect | Physics-attention slices |
 | `dropout` | 0.0 | Architect | Dropout rate |
 | `learning_rate` | 1e-3 | Architect | Learning rate |
-| `pino_weight` | 0.1 | Physicist | Energy-norm loss weight |
-| `pino_eq_weight` | 0.1 | Physicist | Equilibrium residual weight |
-| `tip_weight` | 0.0 | Fixed | Notch-tip loss amplification |
+| `equilibrium` | 0.01 | Physicist | Equilibrium residual weight (enabled round 1) |
+| `energy` | 0.0 | Physicist | Strain energy loss weight |
+| `traction_free` | 0.0 | Physicist | Crack face BC weight |
+| `stress_intensity` | 0.0 | Physicist | K_I consistency weight |
+| `near_tip` | 0.0 | Physicist | Williams expansion weight |
+| `tip_weight` | 2.0 | Fixed | Notch-tip loss amplification |
 | `output_dim` | 2 | Fixed | Displacement field (x, y) |
+
+---
+
+## Known Limitations
+
+**Mock LLM critic cannot detect regime shift (overfitting after round 2)**
+When using `MockLLMProvider`, the critic reads actual train/test losses from the prompt and returns OVERFITTING when the ratio exceeds 5×. However, the mock Architect's config repertoire is limited to three pre-written responses per issue type. For full benefit of the debate loop and failure memory, use `--use-real-llm`.
+
+**Peak stress error remains high (~55%) with 30 samples**
+The surrogate predicts displacement (smooth field); Von Mises is derived post-hoc via the B-matrix. Near-tip derivative amplification means small displacement errors produce large stress errors. Mitigation: more samples, higher `tip_weight`, or direct stress supervision.
 
 ---
 
@@ -268,12 +305,13 @@ pip install pytest-asyncio  # required for async agent tests
 
 PyMFEM is required for real FEM data generation. If unavailable, the demo falls back to a Williams eigenfunction synthetic solver automatically.
 
-**LLM provider:** Set `ANTHROPIC_API_KEY` in your environment and pass `--use-real-llm` to use Claude 4 for all three agents. Without it, a `MockLLMProvider` is used for development and testing.
+**LLM provider:** Set `ANTHROPIC_API_KEY` in your environment and pass `--use-real-llm` to use Claude 4 (`claude-haiku-4-5-20251001` by default) for all three agents. Without it, `MockLLMProvider` is used for development and testing.
 
 ---
 
 ## References
 
+- Jiang (2024): *AgenticSciML* — evolutionary multi-agent system for SciML (inspiration for debate loop, best-config selection, failure memory)
 - Wu et al. (2024): *Transolver: A Fast Transformer Solver for PDEs on General Geometries*, ICML 2024
 - Lu et al. (2021): *Learning Nonlinear Operators via DeepONet*, Nature Machine Intelligence
 - Li et al. (2024): *Physics-Informed Neural Operator for Learning Partial Differential Equations*

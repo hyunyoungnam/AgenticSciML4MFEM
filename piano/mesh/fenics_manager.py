@@ -15,7 +15,7 @@ try:
     import dolfinx
     from dolfinx import mesh as dfx_mesh
     from dolfinx import fem
-    from dolfinx.io import gmshio
+    from dolfinx.io import gmsh as gmshio
     HAS_DOLFINX = True
 except ImportError:
     HAS_DOLFINX = False
@@ -86,12 +86,8 @@ class FEniCSManager(MeshManager):
 
     def _load_gmsh(self) -> None:
         """Load mesh from Gmsh .msh file."""
-        self._mesh, self._cell_markers, self._facet_markers = gmshio.read_from_msh(
-            str(self.file_path),
-            MPI.COMM_WORLD,
-            rank=0,
-            gdim=2,
-        )
+        md = gmshio.read_from_msh(str(self.file_path), MPI.COMM_WORLD, rank=0, gdim=2)
+        self._mesh, self._cell_markers, self._facet_markers = md.mesh, md.cell_tags, md.facet_tags
 
     def _load_xdmf(self) -> None:
         """Load mesh from XDMF file."""
@@ -124,14 +120,8 @@ class FEniCSManager(MeshManager):
         """
         import gmsh
 
-        mesh, cell_markers, facet_markers = gmshio.model_to_mesh(
-            gmsh.model,
-            MPI.COMM_WORLD,
-            rank=0,
-            gdim=gdim,
-        )
-
-        return cls(mesh=mesh, cell_markers=cell_markers, facet_markers=facet_markers)
+        md = gmshio.model_to_mesh(gmsh.model, MPI.COMM_WORLD, rank=0, gdim=gdim)
+        return cls(mesh=md.mesh, cell_markers=md.cell_tags, facet_markers=md.facet_tags)
 
     def get_nodes(self) -> np.ndarray:
         """

@@ -110,9 +110,6 @@ class ClaudeCodeProvider(LLMProvider):
         Returns:
             LLMResponse with the result
         """
-        # Combine prompts
-        full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
-
         # Get overrides from kwargs
         allowed_tools = kwargs.get("allowed_tools", self.allowed_tools)
         max_turns = kwargs.get("max_turns", self.max_turns)
@@ -120,7 +117,8 @@ class ClaudeCodeProvider(LLMProvider):
 
         # Execute Claude Code
         result = await self._execute_claude_code(
-            prompt=full_prompt,
+            prompt=user_prompt,
+            system_prompt=system_prompt,
             model=model or self.model,
             allowed_tools=allowed_tools,
             max_turns=max_turns,
@@ -210,6 +208,7 @@ class ClaudeCodeProvider(LLMProvider):
             allowed_tools=self.allowed_tools,
             max_turns=max_turns or self.max_turns,
             output_format=output_format,
+            system_prompt=None,
         )
 
     async def _execute_claude_code(
@@ -219,16 +218,18 @@ class ClaudeCodeProvider(LLMProvider):
         allowed_tools: List[str],
         max_turns: int,
         output_format: str = "text",
+        system_prompt: Optional[str] = None,
     ) -> ClaudeCodeResult:
         """
         Execute the Claude Code CLI.
 
         Args:
-            prompt: The prompt/task
+            prompt: The user prompt/task
             model: Model to use
             allowed_tools: Tools Claude can use
             max_turns: Maximum turns
             output_format: Output format
+            system_prompt: System prompt passed via --system-prompt
 
         Returns:
             ClaudeCodeResult
@@ -236,12 +237,15 @@ class ClaudeCodeProvider(LLMProvider):
         # Build command
         cmd = [
             "claude",
-            "-p", prompt,  # Non-interactive print mode
+            "-p", prompt,
             "--model", model,
             "--max-turns", str(max_turns),
             "--output-format", output_format,
-            "--dangerously-skip-permissions",  # For automation
+            "--dangerously-skip-permissions",
         ]
+
+        if system_prompt:
+            cmd.extend(["--system-prompt", system_prompt])
 
         # Add allowed tools
         if allowed_tools:

@@ -1,0 +1,50 @@
+[
+  {
+    "method_name": "Williams Asymptotic Expansion",
+    "category": "feature_engineering",
+    "description": "Augment trunk coordinates with r^{-1/2} singular basis terms (1/sqrt(r), sin/cos theta/2) to give the network an explicit representation of crack-tip stress singularity",
+    "keywords": ["singularity", "near-tip", "stress_intensity", "williams", "r^-0.5", "feature", "trunk", "K_I"],
+    "filepath": "knowledge_base/williams_expansion.md",
+    "apply_when": "near-tip error high, ensemble_std large near tip, stress_intensity or near_tip loss terms not converging"
+  },
+  {
+    "method_name": "XFEM Discontinuity Enrichment",
+    "category": "architecture",
+    "description": "Append Heaviside sign function H(x) as a trunk feature so the network can represent displacement discontinuity across crack faces and satisfy traction-free BC",
+    "keywords": ["traction_free", "BC", "discontinuity", "crack_face", "heaviside", "xfem"],
+    "filepath": "knowledge_base/xfem_enrichment.md",
+    "apply_when": "bc_weight loss not decreasing, traction-free BC violations, displacement shows no opening discontinuity"
+  },
+  {
+    "method_name": "Adaptive Collocation Near Singularities",
+    "category": "training_strategy",
+    "description": "Concentrate PINO collocation points within a small disk around the crack tip (60-80%) rather than uniform placement, so physics loss targets the high-residual singularity zone",
+    "keywords": ["collocation", "PINO", "adaptive", "equilibrium", "pino_eq_weight", "residual", "near_tip"],
+    "filepath": "knowledge_base/adaptive_collocation.md",
+    "apply_when": "PINO equilibrium loss converging slowly, physics loss < 0.5% of data loss, near-tip error persists after Williams features"
+  },
+  {
+    "method_name": "Phase-Field Fracture Model",
+    "category": "output_representation",
+    "description": "Predict phase-field damage variable d alongside displacement (output_dim=3) to handle crack propagation datasets where crack tip position varies between samples",
+    "keywords": ["phase_field", "propagation", "damage", "output_dim", "crack_path", "varying_tip"],
+    "filepath": "knowledge_base/phase_field_fracture.md",
+    "apply_when": "dataset has varying crack tip positions, J-integral loss not converging, surrogate fails to generalize across crack configurations"
+  },
+  {
+    "method_name": "J-Integral Consistency Loss",
+    "category": "physics_loss",
+    "description": "Add energy-release-rate consistency loss (J_pred vs J_ref) after Williams and K_I terms are stable, to improve fracture parameter accuracy for life-prediction use",
+    "keywords": ["j_integral", "energy_release_rate", "K_I", "fracture_parameter", "j_weight", "accuracy"],
+    "filepath": "knowledge_base/j_integral_methods.md",
+    "apply_when": "K_I prediction error > 5%, j_weight inactive, stress_intensity and near_tip terms already stable and active"
+  },
+  {
+    "method_name": "Symmetric/Antisymmetric Displacement Decomposition",
+    "category": "architecture",
+    "description": "Decompose trunk features into symmetric (u_y) and antisymmetric (u_x) components using Heaviside, exploiting crack-plane symmetry to halve effective learning difficulty",
+    "keywords": ["symmetry", "decomposition", "mode_I", "antisymmetric", "artifacts", "far_field"],
+    "filepath": "knowledge_base/displacement_decomposition.md",
+    "apply_when": "symmetric geometry, far-field swirling artifacts despite sin/cos trunk features, Mode II contribution < 5%"
+  }
+]

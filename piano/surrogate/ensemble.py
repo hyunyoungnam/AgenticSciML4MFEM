@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from .base import SurrogateModel, EnsembleConfig, PredictionResult, TransolverConfig
+from ..data.zero_copy import numpy_to_tensor
 from .transolver import TransolverModel
 from .deeponet import DeepONetConfig, DeepONetModel
 
@@ -149,8 +150,8 @@ class EnsembleModel(SurrogateModel, nn.Module):
             params = params[np.newaxis, :]
 
         # Convert to tensors
-        params_t = torch.tensor(params, dtype=torch.float32, device=self._device)
-        coords_t = torch.tensor(coords, dtype=torch.float32, device=self._device)
+        params_t = numpy_to_tensor(params, self._device)
+        coords_t = numpy_to_tensor(coords, self._device)
 
         # Expand coords for batch: (N, coord_dim) -> (B, N, coord_dim)
         if coords_t.ndim == 2:

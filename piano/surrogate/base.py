@@ -86,13 +86,13 @@ class TransolverConfig:
     patience: int = 100
     output_dim: int = 3
     checkpoint_dir: Optional[Path] = None
-    pino_weight: float = 0.1
-    pino_eq_weight: float = 0.1
+    energy: float = 0.0          # elastic energy norm loss weight
+    equilibrium: float = 0.0     # equilibrium PDE residual weight (∇·σ = 0)
     tip_weight: float = 0.0      # >0 upweights nodes near singularity tip by (1 + tip_weight/r)
-    ki_weight: float = 0.0       # K_I consistency loss weight
-    bc_weight: float = 0.0       # Crack face traction-free BC loss weight
-    williams_weight: float = 0.0 # Williams asymptotic residual loss weight
-    j_weight: float = 0.0        # J-integral conservation loss weight
+    stress_intensity: float = 0.0  # K_I consistency loss weight
+    traction_free: float = 0.0     # crack face traction-free BC loss weight
+    near_tip: float = 0.0          # Williams near-tip asymptotic residual loss weight
+    j_integral: float = 0.0        # J-integral conservation loss weight
     optimizer_type: str = "adamw"
     scheduler_type: str = "plateau"
     activation: str = "gelu"
@@ -112,13 +112,13 @@ class TransolverConfig:
             "patience": self.patience,
             "output_dim": self.output_dim,
             "checkpoint_dir": str(self.checkpoint_dir) if self.checkpoint_dir else None,
-            "pino_weight": self.pino_weight,
-            "pino_eq_weight": self.pino_eq_weight,
+            "energy": self.energy,
+            "equilibrium": self.equilibrium,
             "tip_weight": self.tip_weight,
-            "ki_weight": self.ki_weight,
-            "bc_weight": self.bc_weight,
-            "williams_weight": self.williams_weight,
-            "j_weight": self.j_weight,
+            "stress_intensity": self.stress_intensity,
+            "traction_free": self.traction_free,
+            "near_tip": self.near_tip,
+            "j_integral": self.j_integral,
             "optimizer_type": self.optimizer_type,
             "scheduler_type": self.scheduler_type,
             "activation": self.activation,

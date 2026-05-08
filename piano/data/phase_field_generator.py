@@ -5,12 +5,20 @@ Generates FEM samples using the DOLFINx phase field solver for
 training surrogate models on crack propagation problems.
 """
 
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+
+# Ensure conda env's compiler is on PATH for UFL/FFCx JIT compilation
+_conda_bin = Path(__file__).parent.parent.parent / "miniforge3" / "envs" / "piano" / "bin"
+_home_conda_bin = Path.home() / "miniforge3" / "envs" / "piano" / "bin"
+for _bin in (_conda_bin, _home_conda_bin):
+    if _bin.exists() and str(_bin) not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = str(_bin) + os.pathsep + os.environ.get("PATH", "")
 
 from .dataset import FEMSample, FEMDataset, DatasetConfig
 
@@ -172,88 +180,97 @@ def generate_phase_field_sample(
     try:
         generator = GmshMeshGenerator(geometry, mesh_config)
 
-        # Generate mesh but don't finalize gmsh yet
+        # Use OCC kernel so BooleanFragments correctly splits the domain at the
+        # crack (geo.embed fails when the crack starts on the boundary).
         W = geometry.width
         H = geometry.height
+        occ = gmsh.model.occ
 
-        # Create domain
-        p1 = gmsh.model.geo.addPoint(0, 0, 0, mesh_config.base_size)
-        p2 = gmsh.model.geo.addPoint(W, 0, 0, mesh_config.base_size)
-        p3 = gmsh.model.geo.addPoint(W, H, 0, mesh_config.base_size)
-        p4 = gmsh.model.geo.addPoint(0, H, 0, mesh_config.base_size)
+        rect = occ.addRectangle(0, 0, 0, W, H)
 
-        l1 = gmsh.model.geo.addLine(p1, p2)
-        l2 = gmsh.model.geo.addLine(p2, p3)
-        l3 = gmsh.model.geo.addLine(p3, p4)
-        l4 = gmsh.model.geo.addLine(p4, p1)
-
-        loop = gmsh.model.geo.addCurveLoop([l1, l2, l3, l4])
-        surface = gmsh.model.geo.addPlaneSurface([loop])
-
-        # Add crack
         crack_path = geometry.get_crack_path()
-        crack_points = []
-        for pt in crack_path:
-            is_tip = any(np.linalg.norm(pt - tip.position) < 1e-10 for tip in geometry.tips)
-            size = mesh_config.tip_size if is_tip else mesh_config.base_size
-            crack_points.append(gmsh.model.geo.addPoint(pt[0], pt[1], 0, size))
+        crack_occ_pts = [occ.addPoint(pt[0], pt[1], 0) for pt in crack_path]
+        crack_occ_lines = [
+            occ.addLine(crack_occ_pts[i], crack_occ_pts[i + 1])
+            for i in range(len(crack_occ_pts) - 1)
+        ]
 
-        crack_lines = []
-        for i in range(len(crack_points) - 1):
-            crack_lines.append(gmsh.model.geo.addLine(crack_points[i], crack_points[i + 1]))
+        occ.synchronize()
 
-        gmsh.model.geo.synchronize()
+        # Fragment domain surface at the crack so triangles are generated
+        occ.fragment([(2, rect)], [(1, cl) for cl in crack_occ_lines])
+        occ.synchronize()
 
-        # Embed crack
-        for line in crack_lines:
-            gmsh.model.mesh.embed(1, [line], 2, surface)
+        # Identify boundaries by bounding-box matching
+        eps = 1e-6
+        def curves_on_bbox(xmin, xmax, ymin, ymax):
+            found = []
+            for _, tag in gmsh.model.getEntities(1):
+                bb = gmsh.model.getBoundingBox(1, tag)
+                if (bb[0] >= xmin - eps and bb[3] <= xmax + eps and
+                        bb[1] >= ymin - eps and bb[4] <= ymax + eps):
+                    found.append(tag)
+            return found
 
-        # Physical groups
-        gmsh.model.addPhysicalGroup(1, [l1], 1, "bottom")
-        gmsh.model.addPhysicalGroup(1, [l2], 2, "right")
-        gmsh.model.addPhysicalGroup(1, [l3], 3, "top")
-        gmsh.model.addPhysicalGroup(1, [l4], 4, "left")
-        gmsh.model.addPhysicalGroup(1, crack_lines, 5, "crack")
-        gmsh.model.addPhysicalGroup(2, [surface], 1, "domain")
+        bot   = curves_on_bbox(0, W,  0,   eps)
+        right = curves_on_bbox(W-eps, W+eps, 0, H)
+        top   = curves_on_bbox(0, W,  H-eps, H+eps)
+        left  = curves_on_bbox(0, eps, 0, H)
 
-        # Size fields for refinement
-        for i, tip in enumerate(geometry.tips):
-            tip_pt = gmsh.model.geo.addPoint(tip.position[0], tip.position[1], 0, mesh_config.tip_size)
-            gmsh.model.geo.synchronize()
+        # Crack curves: interior horizontal segments near crack_y
+        crack_y = crack_path[0][1]
+        crack_x_max = max(pt[0] for pt in crack_path)
+        crack_curves = curves_on_bbox(0, crack_x_max + eps, crack_y - eps, crack_y + eps)
+        crack_curves = [c for c in crack_curves if c not in bot + right + top + left]
 
-            dist_field = gmsh.model.mesh.field.add("Distance")
-            gmsh.model.mesh.field.setNumbers(dist_field, "PointsList", [tip_pt])
+        gmsh.model.addPhysicalGroup(1, bot,   1, "bottom")
+        gmsh.model.addPhysicalGroup(1, right, 2, "right")
+        gmsh.model.addPhysicalGroup(1, top,   3, "top")
+        gmsh.model.addPhysicalGroup(1, left,  4, "left")
+        if crack_curves:
+            gmsh.model.addPhysicalGroup(1, crack_curves, 5, "crack")
 
-            thresh_field = gmsh.model.mesh.field.add("Threshold")
-            gmsh.model.mesh.field.setNumber(thresh_field, "InField", dist_field)
-            gmsh.model.mesh.field.setNumber(thresh_field, "SizeMin", mesh_config.tip_size)
-            gmsh.model.mesh.field.setNumber(thresh_field, "SizeMax", mesh_config.base_size)
-            gmsh.model.mesh.field.setNumber(thresh_field, "DistMin", 0.0)
-            gmsh.model.mesh.field.setNumber(thresh_field, "DistMax", mesh_config.tip_radius)
+        all_surfaces = [tag for _, tag in gmsh.model.getEntities(2)]
+        gmsh.model.addPhysicalGroup(2, all_surfaces, 10, "domain")
 
-        # Set background field
-        if geometry.tips:
-            min_field = gmsh.model.mesh.field.add("Min")
-            gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", list(range(1, len(geometry.tips) * 2 + 1, 2)))
-            gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
+        # Tip-refinement size field using crack tip coordinates
+        tip_pos = geometry.tips[0].position if geometry.tips else crack_path[-1]
+        dist_field = gmsh.model.mesh.field.add("Distance")
+        gmsh.model.mesh.field.setNumbers(dist_field, "PointsList",
+                                         [occ.addPoint(tip_pos[0], tip_pos[1], 0)])
+        occ.synchronize()
+        thresh_field = gmsh.model.mesh.field.add("Threshold")
+        gmsh.model.mesh.field.setNumber(thresh_field, "InField",  dist_field)
+        gmsh.model.mesh.field.setNumber(thresh_field, "SizeMin",  mesh_config.tip_size)
+        gmsh.model.mesh.field.setNumber(thresh_field, "SizeMax",  mesh_config.base_size)
+        gmsh.model.mesh.field.setNumber(thresh_field, "DistMin",  mesh_config.tip_size)
+        gmsh.model.mesh.field.setNumber(thresh_field, "DistMax",  mesh_config.tip_radius)
+        gmsh.model.mesh.field.setAsBackgroundMesh(thresh_field)
 
         # Generate mesh
         gmsh.model.mesh.generate(2)
 
         # Create DOLFINx mesh from Gmsh model
-        from dolfinx.io import gmshio
-        mesh, cell_markers, facet_markers = gmshio.model_to_mesh(
+        from dolfinx.io.gmsh import model_to_mesh
+        mesh_data = model_to_mesh(
             gmsh.model, MPI.COMM_WORLD, rank=0, gdim=2
         )
 
     finally:
         gmsh.finalize()
 
-    # Create mesh manager
-    mesh_manager = FEniCSManager(mesh=mesh, cell_markers=cell_markers, facet_markers=facet_markers)
+    # Create mesh manager — dolfinx 0.10 returns MeshData named tuple
+    mesh_manager = FEniCSManager(
+        mesh=mesh_data.mesh,
+        cell_markers=mesh_data.cell_tags,
+        facet_markers=mesh_data.facet_tags,
+    )
 
     # Set up physics
     material = MaterialProperties(E=E, nu=nu)
+    # crack_tip_x / crack_y tell the solver where to pre-initialize d=1
+    crack_tip_x_m = crack_len * config.domain_width  # absolute x in metres
+    crack_y_m = config.crack_y * config.domain_height
     pf_config = PhaseFieldConfig(
         G_c=G_c,
         l_0=config.l_0,
@@ -261,19 +278,28 @@ def generate_phase_field_sample(
         stagger_tol=config.stagger_tol,
         stagger_max_iter=config.stagger_max_iter,
         n_load_steps=config.n_load_steps,
+        crack_tip_x=crack_tip_x_m,
+        crack_y=crack_y_m,
     )
 
-    # Boundary conditions: fixed bottom, traction on top
+    # Displacement-controlled tension test: pure y-stretch, no x-constraints.
+    # Bottom: u_y = 0, Top: u_y = δ_max * load_factor. u_x free everywhere.
+    # Rigid-body x-translation is suppressed by symmetry of the Poisson effect;
+    # any residual rigid-body mode is killed by the PETSc near-null-space.
+    # δ_max = traction * H / E (elastic estimate of final displacement)
+    delta_max = traction * config.domain_height / E
     bcs = [
         BoundaryCondition(
             bc_type=BoundaryConditionType.DISPLACEMENT,
-            boundary_id=1,  # bottom
-            value=np.array([0.0, 0.0]),
+            boundary_id=1,  # bottom: u_y = 0
+            value=0.0,
+            direction=1,
         ),
         BoundaryCondition(
-            bc_type=BoundaryConditionType.TRACTION,
-            boundary_id=3,  # top
-            value=np.array([0.0, traction]),
+            bc_type=BoundaryConditionType.DISPLACEMENT,
+            boundary_id=3,  # top: u_y = delta_max (ramped by load_factor)
+            value=delta_max,
+            direction=1,
         ),
     ]
 
@@ -312,6 +338,7 @@ def generate_phase_field_sample(
             von_mises=result.solution_data.get("von_mises"),
             damage=result.solution_data.get("damage"),
             crack_path=result.solution_data.get("crack_path"),
+            elements=result.solution_data.get("elements"),
             metadata={
                 "geometry_type": config.geometry_type,
                 "n_load_steps": config.n_load_steps,

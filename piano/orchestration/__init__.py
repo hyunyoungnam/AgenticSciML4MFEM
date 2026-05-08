@@ -9,9 +9,12 @@ from piano.orchestration.adaptive import (
     AdaptiveOrchestrator,
     AdaptiveResult,
 )
+from piano.orchestration.debate import DebateOrchestrator, DebateResult
 
 __all__ = [
     "AdaptiveConfig",
     "AdaptiveOrchestrator",
     "AdaptiveResult",
+    "DebateOrchestrator",
+    "DebateResult",
 ]

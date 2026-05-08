@@ -13,6 +13,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from piano.data.zero_copy import numpy_to_tensor
+
 from .base import TransolverConfig, EnsembleConfig, SurrogateModel, CrackConfig
 from .transolver import TransolverModel
 from .ensemble import EnsembleModel
@@ -212,6 +214,18 @@ class SurrogateTrainer:
                 for o in test_outputs
             ]
 
+        # Pre-cast all arrays to float32 so the training hot loop can use
+        # torch.from_numpy() instead of torch.tensor() — eliminates the
+        # CPU→CPU copy that happens on every sample every epoch.
+        from piano.data.zero_copy import preallocate_float32
+        train_params  = train_params.astype(np.float32, copy=False)
+        test_params   = test_params.astype(np.float32, copy=False)
+        raw_train_params = raw_train_params.astype(np.float32, copy=False)
+        preallocate_float32(train_coords)
+        preallocate_float32(test_coords)
+        preallocate_float32(train_outputs)
+        preallocate_float32(test_outputs)
+
         return (
             train_params,
             train_coords,
@@ -303,11 +317,18 @@ class SurrogateTrainer:
             node_weights = None
             if self.config.tip_coords is not None and cfg.tip_weight > 0:
                 tip = self.config.tip_coords  # (2,)
-                ref_coords = train_coords[0]  # (N, coord_dim) — fixed mesh assumption
-                # Use only first 2 columns (x, y) when coords are enriched with extra features
-                r = np.linalg.norm(ref_coords[:, :2] - tip, axis=1) + 1e-8
-                w = 1.0 + cfg.tip_weight / r
-                w = w / w.mean()  # normalize: mean weight = 1 so loss scale is unchanged
+                ref_n = train_coords[0].shape[0]
+                same_topo = [c for c in train_coords if c.shape[0] == ref_n]
+                if len(same_topo) < len(train_coords):
+                    logger.warning(
+                        f"Mixed mesh sizes: {len(same_topo)}/{len(train_coords)} samples "
+                        f"share ref topology (N={ref_n}). Tip weighting uses matching samples only."
+                    )
+                avg_r = np.mean(
+                    [np.linalg.norm(c[:, :2] - tip, axis=1) for c in same_topo], axis=0
+                ) + 1e-8
+                w = 1.0 + cfg.tip_weight / avg_r
+                w = w / w.mean()
                 node_weights = torch.tensor(w, dtype=torch.float32, device=device)
 
             # Crack fracture PINO loss (optional)
@@ -318,7 +339,7 @@ class SurrogateTrainer:
             if (
                 cc is not None
                 and any(getattr(sc, k, 0.0) > 0
-                        for k in ["ki_weight", "bc_weight", "williams_weight", "j_weight"])
+                        for k in ["stress_intensity", "traction_free", "near_tip", "j_integral"])
             ):
                 crack_loss_fn = CrackFractureLoss(
                     tip_x=cc.tip_x,
@@ -328,10 +349,10 @@ class SurrogateTrainer:
                     r_williams=cc.r_williams,
                     r_j=cc.r_j,
                     crack_face_tol=cc.crack_face_tol,
-                    ki_weight=sc.ki_weight,
-                    bc_weight=sc.bc_weight,
-                    williams_weight=sc.williams_weight,
-                    j_weight=sc.j_weight,
+                    stress_intensity=sc.stress_intensity,
+                    traction_free=sc.traction_free,
+                    near_tip=sc.near_tip,
+                    j_integral=sc.j_integral,
                 ).to(device)
                 # Output normalizer stats as tensors for denormalization
                 if self._output_normalizer is not None:
@@ -342,137 +363,88 @@ class SurrogateTrainer:
                         self._output_normalizer.std, dtype=torch.float32, device=device
                     )
 
-            batch_size = cfg.batch_size
-            optimizer = create_optimizer(model, cfg)
-            scheduler = create_scheduler(optimizer, cfg)
-
             use_pino = (
                 output_dim >= 2
-                and (cfg.pino_weight > 0 or cfg.pino_eq_weight > 0)
+                and (cfg.energy > 0 or cfg.equilibrium > 0)
             )
-            # nu_param_idx: which column of raw_train_params holds Poisson's ratio
             _nu_col = cc.nu_param_idx if cc is not None else None
             pino_fn = (
                 PINOElasticityLoss(
                     nominal_nu=0.3,
-                    eq_weight=cfg.pino_eq_weight,
-                    energy_weight=cfg.pino_weight,
+                    eq_weight=cfg.equilibrium,
+                    energy_weight=cfg.energy,
                 ).to(device)
                 if use_pino
                 else None
             )
 
-            history = {'train_loss': [], 'test_loss': [], 'pino_loss': []}
-            best_test_loss = float('inf')
-            patience_counter = 0
-            best_state = None
+            if self.config.use_ensemble:
+                # Bootstrap resampling: each member trains on a different random
+                # subset so ensemble disagreement reflects data scarcity, not just
+                # random-seed noise.
+                boot_rng = np.random.default_rng(self.config.random_seed)
+                last_history = {'train_loss': [], 'test_loss': [], 'pino_loss': []}
+                member_best_losses = []
 
-            for epoch in range(self.config.surrogate_config.epochs):
-                model.train()
-                epoch_loss = 0.0
-                epoch_pino_loss = 0.0
-                indices = np.random.permutation(n_train)
+                for mi in range(self.config.n_ensemble):
+                    torch.manual_seed(42 + mi)
+                    boot_idx = boot_rng.choice(n_train, size=n_train, replace=True)
+                    b_params  = train_params[boot_idx]
+                    b_coords  = [train_coords[i] for i in boot_idx]
+                    b_outputs = [train_outputs[i] for i in boot_idx]
+                    b_raw     = raw_train_params[boot_idx]
 
-                optimizer.zero_grad()
-                accum = 0
-
-                for idx in indices:
-                    params_t = torch.tensor(
-                        train_params[idx:idx+1], dtype=torch.float32, device=device
+                    member = model._models[mi]
+                    h, best_m, best_s = self._run_epoch_loop(
+                        member, b_params, b_coords, b_outputs, b_raw,
+                        test_params, test_coords, test_outputs,
+                        cfg, device, node_weights, pino_fn,
+                        crack_loss_fn, out_std_t, out_mean_t, cc,
+                        callback if mi == 0 else None,
                     )
-                    coords_t = torch.tensor(
-                        train_coords[idx], dtype=torch.float32, device=device
-                    ).unsqueeze(0)  # (1, N_i, coord_dim)
-                    output_t = torch.tensor(
-                        train_outputs[idx], dtype=torch.float32, device=device
-                    ).unsqueeze(0)  # (1, N_i, output_dim)
+                    if best_s:
+                        member.load_state_dict(best_s)
+                        member.to(device)
+                    member._is_trained = True
+                    last_history = h
+                    member_best_losses.append(best_m)
 
-                    pred = model.forward(params_t, coords_t)
-                    data_loss = _weighted_mse(pred, output_t, node_weights) / batch_size
-                    # Slice to (x, y) only — coords may be enriched with extra features
-                    coords_xy = coords_t[0, :, :2]
-
-                    if pino_fn is not None:
-                        sample_nu = float(raw_train_params[idx][_nu_col]) if _nu_col is not None else None
-                        physics_loss = pino_fn(pred[0], output_t[0], coords_xy, nu=sample_nu) / batch_size
-                    else:
-                        physics_loss = torch.tensor(0.0, device=device)
-
-                    if crack_loss_fn is not None:
-                        # Denormalize prediction to physical units before crack loss
-                        u_phys = pred[0]
-                        if out_std_t is not None:
-                            u_phys = u_phys * out_std_t + out_mean_t
-                        raw_p = raw_train_params[idx]
-                        crack_phys_loss = crack_loss_fn(
-                            u_phys,
-                            coords_xy,
-                            K_I=float(raw_p[cc.ki_param_idx]),
-                            E=float(raw_p[cc.e_param_idx]),
-                            nu=float(raw_p[cc.nu_param_idx]),
-                        ) / batch_size
-                        physics_loss = physics_loss + crack_phys_loss
-
-                    loss = data_loss + physics_loss
-                    loss.backward()
-                    epoch_loss += data_loss.item() * batch_size
-                    epoch_pino_loss += physics_loss.item() * batch_size
-                    accum += 1
-
-                    if accum >= batch_size:
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        accum = 0
-
-                if accum > 0:
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-                train_loss = epoch_loss / n_train
-                history['train_loss'].append(train_loss)
-
-                # Test evaluation
+                # Evaluate ensemble mean on shared test set for final test loss
                 model.eval()
-                test_loss = 0.0
+                ens_test_loss = 0.0
                 with torch.no_grad():
                     for idx in range(n_test):
-                        params_t = torch.tensor(
-                            test_params[idx:idx+1], dtype=torch.float32, device=device
-                        )
-                        coords_t = torch.tensor(
-                            test_coords[idx], dtype=torch.float32, device=device
-                        ).unsqueeze(0)
-                        output_t = torch.tensor(
-                            test_outputs[idx], dtype=torch.float32, device=device
-                        ).unsqueeze(0)
-                        pred = model.forward(params_t, coords_t)
-                        test_loss += _weighted_mse(pred, output_t).item() / n_test
-                history['test_loss'].append(test_loss)
-                history['pino_loss'].append(epoch_pino_loss / n_train)
+                        pt = numpy_to_tensor(test_params[idx:idx+1], device)
+                        ct = numpy_to_tensor(test_coords[idx], device).unsqueeze(0)
+                        ot = numpy_to_tensor(test_outputs[idx], device).unsqueeze(0)
+                        pred = model.forward(pt, ct)
+                        ens_test_loss += _weighted_mse(pred, ot).item() / n_test
 
-                # Step scheduler (handle different scheduler types)
-                if scheduler is not None:
-                    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        scheduler.step(test_loss)
-                    else:
-                        scheduler.step()
+                history = last_history
+                best_test_loss = ens_test_loss
 
-                if test_loss < best_test_loss:
-                    best_test_loss = test_loss
-                    patience_counter = 0
-                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                else:
-                    patience_counter += 1
-
-                if patience_counter >= self.config.surrogate_config.patience:
-                    break
-
-                if callback:
-                    callback(epoch, train_loss)
-
-            if best_state:
-                model.load_state_dict(best_state)
-                model.to(device)
+                # Compute ensemble disagreement (mean std across test set)
+                ensemble_stds = []
+                model.eval()
+                with torch.no_grad():
+                    for idx in range(n_test):
+                        pt = numpy_to_tensor(test_params[idx:idx+1], device)
+                        ct = numpy_to_tensor(test_coords[idx], device).unsqueeze(0)
+                        member_preds = np.stack([
+                            m.forward(pt, ct).cpu().numpy() for m in model._models
+                        ], axis=0)
+                        ensemble_stds.append(float(member_preds.std(axis=0).mean()))
+                history['ensemble_std'] = float(np.mean(ensemble_stds)) if ensemble_stds else 0.0
+            else:
+                history, best_test_loss, best_state = self._run_epoch_loop(
+                    model, train_params, train_coords, train_outputs, raw_train_params,
+                    test_params, test_coords, test_outputs,
+                    cfg, device, node_weights, pino_fn,
+                    crack_loss_fn, out_std_t, out_mean_t, cc, callback,
+                )
+                if best_state:
+                    model.load_state_dict(best_state)
+                    model.to(device)
 
             model._is_trained = True
             self._model = model
@@ -487,12 +459,8 @@ class SurrogateTrainer:
             all_preds, all_targets = [], []
             with torch.no_grad():
                 for idx in range(n_test):
-                    params_t = torch.tensor(
-                        test_params[idx:idx+1], dtype=torch.float32, device=device
-                    )
-                    coords_t = torch.tensor(
-                        test_coords[idx], dtype=torch.float32, device=device
-                    ).unsqueeze(0)
+                    params_t = numpy_to_tensor(test_params[idx:idx+1], device)
+                    coords_t = numpy_to_tensor(test_coords[idx], device).unsqueeze(0)
                     pred = model.forward(params_t, coords_t)
                     all_preds.append(pred.cpu().numpy().flatten())
                     all_targets.append(test_outputs[idx].flatten())
@@ -520,6 +488,144 @@ class SurrogateTrainer:
                 success=False,
                 error_message=str(e),
             )
+
+    def _run_epoch_loop(
+        self,
+        model: nn.Module,
+        train_params: np.ndarray,
+        train_coords: List[np.ndarray],
+        train_outputs: List[np.ndarray],
+        raw_train_params: np.ndarray,
+        test_params: np.ndarray,
+        test_coords: List[np.ndarray],
+        test_outputs: List[np.ndarray],
+        cfg,
+        device,
+        node_weights,
+        pino_fn,
+        crack_loss_fn,
+        out_std_t,
+        out_mean_t,
+        cc,
+        callback,
+    ):
+        """Run the epoch training loop for a single model.
+
+        Returns (history dict, best_test_loss, best_state_dict).
+        Used by both the single-model and bootstrap-ensemble paths.
+        """
+        n_train = len(train_params)
+        n_test  = len(test_params)
+        _nu_col = cc.nu_param_idx if cc is not None else None
+
+        optimizer = create_optimizer(model, cfg)
+        scheduler = create_scheduler(optimizer, cfg)
+
+        history = {
+            'train_loss': [], 'test_loss': [], 'pino_loss': [],
+            'elasticity_loss': [], 'crack_loss': [],
+        }
+        best_test_loss = float('inf')
+        patience_counter = 0
+        best_state = None
+
+        for epoch in range(cfg.epochs):
+            model.train()
+            epoch_loss = 0.0
+            epoch_pino_loss = 0.0
+            epoch_elasticity_loss = 0.0
+            epoch_crack_loss = 0.0
+            indices = np.random.permutation(n_train)
+
+            optimizer.zero_grad()
+            accum = 0
+
+            for idx in indices:
+                params_t = numpy_to_tensor(train_params[idx:idx+1], device)
+                coords_t = numpy_to_tensor(train_coords[idx], device).unsqueeze(0)
+                output_t = numpy_to_tensor(train_outputs[idx], device).unsqueeze(0)
+
+                pred = model.forward(params_t, coords_t)
+                data_loss = _weighted_mse(pred, output_t, node_weights) / cfg.batch_size
+                coords_xy = coords_t[0, :, :2]
+
+                if pino_fn is not None:
+                    sample_nu = float(raw_train_params[idx][_nu_col]) if _nu_col is not None else None
+                    elasticity_component = pino_fn(pred[0], output_t[0], coords_xy, nu=sample_nu) / cfg.batch_size
+                else:
+                    elasticity_component = torch.tensor(0.0, device=device)
+
+                if crack_loss_fn is not None:
+                    u_phys = pred[0]
+                    if out_std_t is not None:
+                        u_phys = u_phys * out_std_t + out_mean_t
+                    raw_p = raw_train_params[idx]
+                    crack_component = crack_loss_fn(
+                        u_phys, coords_xy,
+                        K_I=float(raw_p[cc.ki_param_idx]),
+                        E=float(raw_p[cc.e_param_idx]),
+                        nu=float(raw_p[cc.nu_param_idx]),
+                    ) / cfg.batch_size
+                else:
+                    crack_component = torch.tensor(0.0, device=device)
+
+                physics_loss = elasticity_component + crack_component
+                loss = data_loss + physics_loss
+                loss.backward()
+                epoch_loss += data_loss.item() * cfg.batch_size
+                epoch_pino_loss += physics_loss.item() * cfg.batch_size
+                epoch_elasticity_loss += elasticity_component.item() * cfg.batch_size
+                epoch_crack_loss += crack_component.item() * cfg.batch_size
+                accum += 1
+
+                if accum >= cfg.batch_size:
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    accum = 0
+
+            if accum > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            train_loss = epoch_loss / n_train
+            history['train_loss'].append(train_loss)
+
+            model.eval()
+            test_loss = 0.0
+            with torch.no_grad():
+                for idx in range(n_test):
+                    params_t = numpy_to_tensor(test_params[idx:idx+1], device)
+                    coords_t = numpy_to_tensor(test_coords[idx], device).unsqueeze(0)
+                    output_t = numpy_to_tensor(test_outputs[idx], device).unsqueeze(0)
+                    pred = model.forward(params_t, coords_t)
+                    test_loss += _weighted_mse(pred, output_t).item() / n_test
+            history['test_loss'].append(test_loss)
+            history['pino_loss'].append(epoch_pino_loss / n_train)
+            history['elasticity_loss'].append(epoch_elasticity_loss / n_train)
+            history['crack_loss'].append(epoch_crack_loss / n_train)
+
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(test_loss)
+                else:
+                    scheduler.step()
+
+            if test_loss < best_test_loss:
+                best_test_loss = test_loss
+                patience_counter = 0
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                patience_counter += 1
+
+            if patience_counter >= cfg.patience:
+                break
+
+            if callback:
+                callback(epoch, train_loss)
+
+        return history, best_test_loss, best_state
 
     @property
     def model(self) -> Optional[SurrogateModel]:
@@ -594,7 +700,7 @@ class SurrogateTrainer:
 
         # Denormalize outputs
         if self._output_normalizer:
-            output_dim = predictions.shape[-1] if predictions.ndim > 2 else 1
+            output_dim = predictions.shape[-1] if predictions.ndim >= 2 else 1
             predictions = self._output_normalizer.inverse_transform(
                 predictions.reshape(-1, output_dim)
             ).reshape(predictions.shape)

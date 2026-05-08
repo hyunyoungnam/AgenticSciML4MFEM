@@ -83,6 +83,40 @@
 - Installed `pytest-asyncio` — was in `requirements.txt` but missing from environment
 - All 23 async agent tests now pass
 
+### ✅ 12. Active learning acquisition functions were dead code
+**Status**: Resolved  
+**Root cause**: Three-layer gap — `_acquisition_fn` was initialized but never used; `_suggest_new_parameters()` called `evaluator.suggest_samples()` (ignores acquisition functions); `evaluator.suggest_samples_active()` existed but was never called.  
+**Fix applied** (plan: compiled-beaming-lobster):
+- Fix 1 (`adaptive.py:367`): Replaced nonexistent `self.config.acquisition_strategy` with runtime expression using `self._acquisition_fn.name`
+- Fix 2 (`adaptive.py:620–631`): `_suggest_new_parameters()` now routes to `evaluator.suggest_samples_active()` when `_coordinates` is set
+- Fix 3 (`trainer.py:302–309`): `ref_coords = train_coords[0]` replaced with average over same-topology samples; warns when mixed mesh sizes are detected
+
+### ✅ 13. New agent system: 6 agents added (Knowledge, Data, Debug, Selector, Mesh, Budget)
+**Status**: Implemented (2026-05-07)  
+**Motivation**: AgenticSciML paper (Jiang & Karniadakis 2026) ablation: KB retrieval gives 2.3×–20× improvement over no-KB baseline. Paper architecture had 10+ agents; this project had 6 — missing KB retrieval, data analysis, debugger, selector ensemble, mesh strategy, and budget reasoning.  
+**Agents implemented**:
+- `KnowledgeRetrieverAgent` + `knowledge_base/` (6 entries: Williams expansion, XFEM, adaptive collocation, phase-field, J-integral, displacement decomposition) — wired into `DebateOrchestrator` before Round 1
+- `DataAnalystAgent` — pre-training EDA with persistent `data_analysis.md` report; wired into `AgentContext.knowledge_context`
+- `DebuggerAgent` — called by `EngineerAgent` on failure; diagnoses traceback + provides fix description; one retry attempt
+- `SelectorEnsembleAgent` — 3-LLM majority vote (claude-sonnet-4-6, 2×claude-haiku-4-5) replacing brief-training fallback in `AgenticSurrogateTrainer`
+- `MeshStrategyAgent` — r/h-refinement strategy for MFEM; activated via `use_mesh_strategy_agent=True` in `AdaptiveConfig`
+- `BudgetAgent` — active learning stopping criterion; replaces fixed `max_samples` heuristic when `use_budget_agent=True` in `AdaptiveConfig`
+
+---
+
+## Future Work
+
+### F1. Replace Williams enrichment with peridynamics in physics loss term
+**Status**: Planned  
+**Motivation**: The current PINO physics loss (`CrackFractureLoss`) uses the Williams asymptotic expansion to enforce near-tip displacement/stress fields. Williams is a local LEFM approximation that breaks down (a) for large-scale damage zones where the phase field `d > 0.1` extends well beyond the K-dominant zone, and (b) for crack-tip shielding and branching scenarios outside the mode-I plane.  
+**Direction**: Replace or augment the Williams-based B-matrix with a peridynamic correspondence formulation. Peridynamics (bond-based or state-based) defines equilibrium nonlocally — no singularity, no process-zone assumptions, and naturally handles discontinuities. The physics loss term would penalise violation of the peridynamic equation of motion at each collocation point instead of matching the Williams expansion coefficients.  
+**Key references**: Silling (2000) bond-based peridynamics; Silling & Lehoucq (2010) state-based; Haghighat et al. (2021) PINN+peridynamics.  
+**Implementation notes**:
+- Horizon δ ~ 3h (3 mesh spacings) defines the nonlocal interaction neighbourhood
+- Bond force density replaces the K_I extraction integral
+- B-matrix construction from Williams series (`crack_pino_loss.py`) can be replaced with a sparse peridynamic operator assembled from node neighbour lists
+- `PhysicistAgent` system prompt must be updated to describe the new loss terms
+
 ---
 
 ## Open Issues
@@ -93,11 +127,12 @@
 **Impact**: Demo loop does not converge to the best model when using MockLLMProvider.  
 **Fix**: Use `--use-real-llm` with `ANTHROPIC_API_KEY` set. The real critic reads the train/test gap and correctly diagnoses OVERFITTING, allowing the Architect to respond with dropout/weight-decay increases.
 
-### B. CrackFractureLoss weights still at 0.0
-**Status**: Known limitation  
-**Context**: `ki_weight`, `bc_weight`, `williams_weight`, `j_weight` are all 0.0 in the demo. The surrogate now predicts displacement `(N, 2)`, so the losses are technically compatible — the unit scale mismatch (O(1) normalised prediction vs O(1e12 Pa²) loss) is the remaining blocker.  
-**Proposed fix**: Normalise the crack loss terms by E² so they are dimensionless and comparable to the data loss, then expose the weights to the Physicist agent for tuning.  
-**Files to change**:
-- `piano/surrogate/crack_pino_loss.py`: divide each term by `E²` to make it dimensionless
-- `tests/test_agentic_sciml.py`: set non-zero initial crack weights once scale is fixed
-- `piano/agents/roles/physicist.py`: add crack loss weights to the tunable parameter list
+### ✅ B. CrackFractureLoss bc_weight scale mismatch
+**Status**: Resolved  
+**Root cause**: `_crack_face_bc` was dividing by `E²` (O(1e20 Pa²)), making the loss O(2.5e-7) — too small to matter. The other three terms (`ki_weight`, `williams_weight`, `j_weight`) were already dimensionless O(1) relative errors.  
+**Fix applied**:
+- `_crack_face_bc` now normalises by `K_I²/(2π·r_ki_min)` — characteristic stress² at the inner extraction radius — giving O(0.13), comparable to the data loss
+- `forward()` passes `K_I` to `_crack_face_bc`
+- Agent responsibility split: Physicist owns `bc_weight`, `ki_weight`, `williams_weight`, `j_weight`; Architect owns `pino_weight`, `pino_eq_weight`
+- Physicist enables terms sequentially: bc → ki → williams → j, one per round, only when training is stable
+- `detect_physics_issues()` stability heuristic fixed: `recent[-1] < 2.0 * min(recent)` (was `max < 3 * min`, which incorrectly flagged monotonically decreasing loss as unstable)

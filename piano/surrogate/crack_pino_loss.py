@@ -52,10 +52,10 @@ class CrackFractureLoss(nn.Module):
         r_williams:     Radius of Williams matching zone (r < r_williams)
         r_j:            Outer radius of J-integral domain
         crack_face_tol: Half-width tolerance for detecting crack-face elements
-        ki_weight:      Weight for K_I consistency loss
-        bc_weight:      Weight for crack face BC loss
-        williams_weight: Weight for Williams asymptotic loss
-        j_weight:       Weight for J-integral conservation loss
+        stress_intensity: Weight for K_I consistency loss
+        traction_free:    Weight for crack face BC loss
+        near_tip:         Weight for Williams asymptotic loss
+        j_integral:       Weight for J-integral conservation loss
     """
 
     def __init__(
@@ -67,10 +67,10 @@ class CrackFractureLoss(nn.Module):
         r_williams: float = 0.05,
         r_j: float = 0.15,
         crack_face_tol: float = 0.02,
-        ki_weight: float = 1.0,
-        bc_weight: float = 1.0,
-        williams_weight: float = 1.0,
-        j_weight: float = 1.0,
+        stress_intensity: float = 1.0,
+        traction_free: float = 1.0,
+        near_tip: float = 1.0,
+        j_integral: float = 1.0,
     ):
         super().__init__()
         self.tip_x = tip_x
@@ -80,10 +80,10 @@ class CrackFractureLoss(nn.Module):
         self.r_williams = r_williams
         self.r_j = r_j
         self.crack_face_tol = crack_face_tol
-        self.ki_weight = ki_weight
-        self.bc_weight = bc_weight
-        self.williams_weight = williams_weight
-        self.j_weight = j_weight
+        self.stress_intensity = stress_intensity
+        self.traction_free = traction_free
+        self.near_tip = near_tip
+        self.j_integral = j_integral
 
         # Mesh topology cache — computed once per unique coordinate set
         self._coords_hash: int = -1
@@ -231,6 +231,7 @@ class CrackFractureLoss(nn.Module):
     def _crack_face_bc(
         self,
         u_pred: torch.Tensor,  # (N, 2)
+        K_I: float,
         E: float,
         nu: float,
         device: torch.device,
@@ -239,7 +240,11 @@ class CrackFractureLoss(nn.Module):
         σ_yy = 0 and σ_xy = 0 on crack-face elements.
 
         Crack face: centroid satisfies |y_c - tip_y| < tol, x_c < tip_x.
-        Loss: Σ A_e(σ_yy² + σ_xy²) / (Σ A_e * E²)   [dimensionless]
+        Loss: Σ A_e(σ_yy² + σ_xy²) / (Σ A_e · σ_ref²)   [dimensionless]
+
+        σ_ref = K_I / √(2π r_ki_min) — characteristic stress at the inner
+        extraction radius. This gives O(1) loss when crack face stresses are
+        at the K_I-field scale, regardless of E.
         """
         cx = self._centroids[:, 0]
         cy = self._centroids[:, 1]
@@ -258,10 +263,10 @@ class CrackFractureLoss(nn.Module):
 
         a_cf = self._areas[mask]
         total_a = a_cf.sum().clamp(min=1e-30)
-        L_bc = (a_cf * (sig[:, 1] ** 2 + sig[:, 2] ** 2)).sum() / (
-            total_a * E ** 2
+        sig_ref_sq = K_I ** 2 / (2.0 * torch.pi * self.r_ki_min)
+        return (a_cf * (sig[:, 1] ** 2 + sig[:, 2] ** 2)).sum() / (
+            total_a * sig_ref_sq
         )
-        return L_bc
 
     # ------------------------------------------------------------------
     # Term 3: Williams Asymptotic Residual
@@ -398,23 +403,23 @@ class CrackFractureLoss(nn.Module):
 
         total = torch.tensor(0.0, device=device)
 
-        if self.ki_weight > 0.0:
-            total = total + self.ki_weight * self._ki_consistency(
+        if self.stress_intensity > 0.0:
+            total = total + self.stress_intensity * self._ki_consistency(
                 u_pred, coords, K_I, E, nu
             )
 
-        if self.bc_weight > 0.0:
-            total = total + self.bc_weight * self._crack_face_bc(
-                u_pred, E, nu, device
+        if self.traction_free > 0.0:
+            total = total + self.traction_free * self._crack_face_bc(
+                u_pred, K_I, E, nu, device
             )
 
-        if self.williams_weight > 0.0:
-            total = total + self.williams_weight * self._williams_residual(
+        if self.near_tip > 0.0:
+            total = total + self.near_tip * self._williams_residual(
                 u_pred, coords, K_I, E, nu
             )
 
-        if self.j_weight > 0.0:
-            total = total + self.j_weight * self._j_integral(
+        if self.j_integral > 0.0:
+            total = total + self.j_integral * self._j_integral(
                 u_pred, K_I, E, nu, device
             )
 

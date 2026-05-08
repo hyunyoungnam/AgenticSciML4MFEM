@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from .base import SurrogateModel, PredictionResult
+from ..data.zero_copy import numpy_to_tensor
 
 
 @dataclass
@@ -39,9 +40,13 @@ class DeepONetConfig:
     scheduler_type: str = "cosine"
     activation: str = "gelu"
     output_dim: int = 1       # 1 for scalar (von Mises), 2 for displacement
-    pino_weight: float = 0.0
-    pino_eq_weight: float = 0.1
+    energy: float = 0.0           # elastic energy norm loss weight
+    equilibrium: float = 0.0      # equilibrium PDE residual weight (∇·σ = 0)
     tip_weight: float = 0.0
+    stress_intensity: float = 0.0
+    traction_free: float = 0.0
+    near_tip: float = 0.0
+    j_integral: float = 0.0
     checkpoint_dir: Optional[str] = None
 
     def to_dict(self):
@@ -140,8 +145,8 @@ class DeepONetModel(SurrogateModel, nn.Module):
         if params.ndim == 1:
             params = params[np.newaxis, :]
         self.eval()
-        params_t = torch.tensor(params, dtype=torch.float32, device=self._device)
-        coords_t = torch.tensor(coords, dtype=torch.float32, device=self._device)
+        params_t = numpy_to_tensor(params, self._device)
+        coords_t = numpy_to_tensor(coords, self._device)
         if coords_t.ndim == 2:
             coords_t = coords_t.unsqueeze(0).expand(params_t.shape[0], -1, -1)
         with torch.no_grad():

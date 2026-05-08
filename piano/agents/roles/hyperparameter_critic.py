@@ -61,6 +61,8 @@ class TrainingHistory:
     test_losses: List[float] = field(default_factory=list)
     learning_rates: List[float] = field(default_factory=list)
     pino_losses: List[float] = field(default_factory=list)
+    pino_term_losses: Dict[str, List[float]] = field(default_factory=dict)
+    ensemble_std: float = 0.0
     epochs_completed: int = 0
     best_test_loss: float = float('inf')
     final_train_loss: float = float('inf')
@@ -101,6 +103,20 @@ class TrainingHistory:
             gap = late_test - late_train if late_train > 0 else 0
             lines.append(f"Train-test gap: {gap:.6f}")
 
+        # Per-term PINO losses
+        if self.pino_term_losses:
+            lines.append("\nPer-term PINO losses (initial → final epoch):")
+            for term, losses in self.pino_term_losses.items():
+                if losses:
+                    lines.append(f"  {term}: {losses[0]:.6f} → {losses[-1]:.6f}")
+
+        # Ensemble disagreement
+        if self.ensemble_std > 0:
+            ratio = self.ensemble_std / (self.final_test_loss + 1e-12)
+            variance_label = "high" if ratio > 0.5 else "low"
+            lines.append(f"\nEnsemble disagreement (mean std): {self.ensemble_std:.6f}")
+            lines.append(f"  Uncertainty/test-loss ratio: {ratio:.3f} ({variance_label} model variance)")
+
         # Add metrics
         if self.metrics:
             lines.append("\nEvaluation metrics:")
@@ -121,7 +137,27 @@ Your role is to analyze training curves and metrics to diagnose issues and recom
    - Identify convergence patterns
    - Detect plateaus and instabilities
 
-2. **Issue Diagnosis**
+2. **Per-Term PINO Loss Analysis**
+   When per-term PINO losses are provided, analyze them separately:
+   - `elasticity_loss`: PDE equilibrium + energy-norm residual. If high and not decreasing,
+     the model is not satisfying linear elasticity — consider increasing pino_weight or fixing
+     the physics loss formulation.
+   - `crack_loss`: Fracture mechanics terms (K_I, traction-free BC, Williams, J-integral).
+     If high relative to elasticity_loss, the model is violating fracture BCs specifically.
+     The Physicist agent owns these weights — flag for physics reconfiguration.
+   A term that stays flat (not decreasing) while data loss improves means it's too weak to
+   influence training — the weight needs to increase.
+
+3. **Ensemble Disagreement Analysis**
+   `ensemble_std` is the mean standard deviation across ensemble members on the test set.
+   - High uncertainty/loss ratio (> 0.5): Members disagree substantially — model has high
+     variance, likely due to insufficient data or too large a model for the dataset size.
+     Reduce capacity or increase regularization.
+   - Low uncertainty/loss ratio (< 0.1): Members agree but loss is still high — systematic
+     bias (underfitting) rather than variance. Increase capacity.
+   - Moderate ratio (0.1–0.5): Healthy ensemble diversity.
+
+4. **Issue Diagnosis**
    - OVERFITTING: Test loss increases while train loss decreases
    - UNDERFITTING: Both losses remain high, model not learning
    - SLOW_CONVERGENCE: Gradual improvement but far from optimal
@@ -133,14 +169,15 @@ Your role is to analyze training curves and metrics to diagnose issues and recom
    - INSUFFICIENT_CAPACITY: Underfitting despite long training
    - EXCESSIVE_CAPACITY: Quick overfitting, large train-test gap
 
-3. **Severity Assessment**
+5. **Severity Assessment**
    - critical: Training failing (NaN, diverging)
    - high: Significant issue requiring immediate fix
    - medium: Suboptimal performance, worth addressing
    - low: Minor issue or acceptable performance
 
-4. **Recommendations**
+6. **Recommendations**
    - Be specific about what to change and why
+   - Reference per-term PINO losses and ensemble std in your diagnosis
    - Consider trade-offs (capacity vs generalization)
    - Prioritize high-impact changes
 
@@ -159,6 +196,12 @@ HYPERPARAMETER_CRITIC_PROMPT = """## Training History Analysis
 Train losses: {train_losses_sample}
 Test losses: {test_losses_sample}
 
+**Per-Term PINO Losses (sampled, if available):**
+{pino_terms_section}
+
+**Ensemble Disagreement:**
+{ensemble_section}
+
 **Previous Attempts (if any):**
 {previous_attempts}
 
@@ -166,7 +209,7 @@ Test losses: {test_losses_sample}
 
 Analyze this training history and provide:
 
-1. **Diagnosis**: What issues do you observe?
+1. **Diagnosis**: What issues do you observe? Reference per-term PINO losses and ensemble std.
 2. **Primary Issue**: The main problem to address
 3. **Severity**: critical/high/medium/low
 4. **Recommendations**: Specific changes to hyperparameters
@@ -174,7 +217,7 @@ Analyze this training history and provide:
 
 Format your response as:
 ```
-DIAGNOSIS: [Your detailed diagnosis]
+DIAGNOSIS: [Your detailed diagnosis, including PINO term analysis and ensemble variance interpretation]
 PRIMARY_ISSUE: [OVERFITTING|UNDERFITTING|SLOW_CONVERGENCE|UNSTABLE_TRAINING|LOSS_PLATEAU|GRADIENT_EXPLOSION|LEARNING_RATE_TOO_HIGH|LEARNING_RATE_TOO_LOW|INSUFFICIENT_CAPACITY|EXCESSIVE_CAPACITY|NONE]
 SEVERITY: [critical|high|medium|low]
 RECOMMENDATIONS:
@@ -186,6 +229,8 @@ METRICS_ANALYSIS:
 - train_test_gap: [analysis]
 - convergence_rate: [analysis]
 - stability: [analysis]
+- pino_effectiveness: [which PINO terms are working / which are too weak]
+- ensemble_variance: [whether ensemble spread indicates variance or bias]
 ```
 """
 
@@ -229,6 +274,26 @@ class HyperparameterCriticAgent(BaseAgent[CritiqueResult]):
         train_sample = self._sample_losses(history.train_losses)
         test_sample = self._sample_losses(history.test_losses)
 
+        # Per-term PINO section
+        if history.pino_term_losses:
+            pino_lines = []
+            for term, losses in history.pino_term_losses.items():
+                sampled = self._sample_losses(losses)
+                pino_lines.append(f"  {term}: {sampled}")
+            pino_terms_section = "\n".join(pino_lines)
+        else:
+            pino_terms_section = "Not available (PINO not active or terms not tracked)"
+
+        # Ensemble section
+        if history.ensemble_std > 0:
+            ratio = history.ensemble_std / (history.final_test_loss + 1e-12)
+            ensemble_section = (
+                f"Mean ensemble std: {history.ensemble_std:.6f} | "
+                f"Uncertainty/test-loss ratio: {ratio:.3f}"
+            )
+        else:
+            ensemble_section = "Not available (single model or ensemble std not computed)"
+
         # Format previous attempts
         prev_str = "None"
         if previous_attempts:
@@ -242,6 +307,8 @@ class HyperparameterCriticAgent(BaseAgent[CritiqueResult]):
             training_summary=history.to_summary(),
             train_losses_sample=train_sample,
             test_losses_sample=test_sample,
+            pino_terms_section=pino_terms_section,
+            ensemble_section=ensemble_section,
             previous_attempts=prev_str,
         )
 
@@ -314,6 +381,27 @@ class HyperparameterCriticAgent(BaseAgent[CritiqueResult]):
         )
         if retrain_match:
             result.should_retrain = retrain_match.group(1).lower() == 'true'
+
+        # Semantic fallback: if structured PRIMARY_ISSUE regex failed, scan for keywords
+        if result.primary_issue == TrainingIssue.NONE:
+            text = response.lower()
+            if any(w in text for w in ('overfitting', 'over-fitting', 'memoriz', 'train-test gap')):
+                result.primary_issue = TrainingIssue.OVERFITTING
+                result.issues.append(TrainingIssue.OVERFITTING)
+            elif any(w in text for w in ('underfitting', 'under-fitting', 'insufficient capacity')):
+                result.primary_issue = TrainingIssue.UNDERFITTING
+                result.issues.append(TrainingIssue.UNDERFITTING)
+            elif any(w in text for w in ('plateau', 'stagnant', 'no improvement', 'not improving')):
+                result.primary_issue = TrainingIssue.LOSS_PLATEAU
+                result.issues.append(TrainingIssue.LOSS_PLATEAU)
+            elif any(w in text for w in ('slow convergence', 'converging slowly', 'too slow')):
+                result.primary_issue = TrainingIssue.SLOW_CONVERGENCE
+                result.issues.append(TrainingIssue.SLOW_CONVERGENCE)
+
+        # If LLM didn't explicitly set SHOULD_RETRAIN but diagnosed a real issue,
+        # infer it: any high/critical/medium issue warrants retraining.
+        if not retrain_match and result.primary_issue not in (TrainingIssue.NONE,):
+            result.should_retrain = result.severity in ('high', 'critical', 'medium')
 
         # Extract metrics analysis
         metrics_match = re.search(
@@ -464,3 +552,134 @@ class HyperparameterCriticAgent(BaseAgent[CritiqueResult]):
             return True
 
         return False
+
+    async def review_proposal(
+        self,
+        context: AgentContext,
+        proposal_changes: Dict[str, Any],
+        proposal_reasoning: str,
+        critique: "CritiqueResult",
+    ) -> Dict[str, Any]:
+        """
+        Review an Architect proposal for feasibility (debate round 2).
+
+        Returns dict with keys: feasible (bool), concerns (str), suggestion (str).
+        """
+        review_prompt = (
+            f"You previously diagnosed: {critique.primary_issue.name} (severity={critique.severity}).\n\n"
+            f"The Architect proposes these changes:\n"
+            + "\n".join(f"  - {k}: {v}" for k, v in proposal_changes.items())
+            + f"\n\nReasoning: {proposal_reasoning}\n\n"
+            "Does this proposal directly address the diagnosed issue?\n"
+            "Reply strictly in this format:\n"
+            "FEASIBLE: yes|no\n"
+            "CONCERNS: <one sentence — risks or gaps, or 'none'>\n"
+            "SUGGESTION: <one concrete improvement if needed, else 'none'>\n"
+        )
+        response = await self._llm_provider.generate(
+            system_prompt=HYPERPARAMETER_CRITIC_SYSTEM + "\nYou are now reviewing a proposed configuration for feasibility.",
+            user_prompt=review_prompt,
+        )
+        text = response.content
+
+        feasible = True
+        concerns = "none"
+        suggestion = "none"
+
+        fm = re.search(r'FEASIBLE:\s*(yes|no)', text, re.IGNORECASE)
+        if fm:
+            feasible = fm.group(1).lower() == "yes"
+        cm = re.search(r'CONCERNS:\s*(.*?)(?=SUGGESTION:|$)', text, re.DOTALL | re.IGNORECASE)
+        if cm:
+            concerns = cm.group(1).strip()
+        sm = re.search(r'SUGGESTION:\s*(.*?)$', text, re.DOTALL | re.IGNORECASE)
+        if sm:
+            suggestion = sm.group(1).strip()
+
+        return {"feasible": feasible, "concerns": concerns, "suggestion": suggestion}
+
+    # ── Debate Round 1: Observation ──────────────────────────────────────────
+
+    async def observe(
+        self,
+        context: AgentContext,
+        history: TrainingHistory,
+        config: Dict[str, Any],
+    ) -> str:
+        """Round 1: describe training state factually, no proposals."""
+        if self._llm_provider is None:
+            raise RuntimeError("LLM provider not set")
+        prompt = (
+            "ROUND 1 (OBSERVATION) — Describe only what you see. Do NOT recommend any changes.\n\n"
+            f"{history.to_summary()}\n\n"
+            "Describe ONLY what you observe:\n"
+            "- Loss trajectory: is it improving, stagnating, or worsening?\n"
+            "- Train/test gap magnitude?\n"
+            "- Any anomalies (NaN, sudden spikes, early plateau)?\n"
+            "- Severity of any performance issues?\n\n"
+            "3-4 sentences with specific numbers. Do not say 'you should' or suggest changes."
+        )
+        response = await self._llm_provider.generate(
+            system_prompt=HYPERPARAMETER_CRITIC_SYSTEM,
+            user_prompt=prompt,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=512,
+        )
+        return f"[CRITIC — Round 1]\n{response.content}"
+
+    def observe_sync(self, history: TrainingHistory, config: Dict[str, Any]) -> str:
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(self.observe(AgentContext(), history, config))
+        finally:
+            loop.close()
+
+    # ── Debate Round 4: Finalization ─────────────────────────────────────────
+
+    async def validate_proposals(
+        self,
+        arch_summary: str,
+        phys_summary: str,
+        debate_context: str,
+    ) -> str:
+        """Round 4: validate architect and physicist proposals before they are applied."""
+        if self._llm_provider is None:
+            raise RuntimeError("LLM provider not set")
+        prompt = (
+            "ROUND 4 (FINALIZATION) — Validate the proposals from the debate.\n\n"
+            f"## Full Debate History\n{debate_context}\n\n"
+            f"## Architect's Proposal\n{arch_summary}\n\n"
+            f"## Physicist's Proposal\n{phys_summary}\n\n"
+            "Check these proposals:\n"
+            "1. Capacity sanity: n_layers ≥ 2, d_model ≥ 32 (DeepONet: hidden_dim ≥ 32, n_basis ≥ 16)\n"
+            "2. Physics ordering: no crack terms (traction_free/stress_intensity/near_tip/j_integral)\n"
+            "   enabled before equilibrium has converged (test loss still decreasing).\n"
+            "3. Consistency: do the proposals address the actual issue identified in Rounds 1-2?\n\n"
+            "VALIDATION_STATUS: approved | concerns | rejected\n"
+            "CONCERNS: <specific issues with exact parameter names, or 'none'>"
+        )
+        response = await self._llm_provider.generate(
+            system_prompt=HYPERPARAMETER_CRITIC_SYSTEM,
+            user_prompt=prompt,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=512,
+        )
+        return f"[CRITIC — Round 4 Validation]\n{response.content}"
+
+    def validate_proposals_sync(
+        self,
+        arch_summary: str,
+        phys_summary: str,
+        debate_context: str,
+    ) -> str:
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                self.validate_proposals(arch_summary, phys_summary, debate_context)
+            )
+        finally:
+            loop.close()

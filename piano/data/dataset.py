@@ -376,7 +376,7 @@ class FEMDataset:
         return path
 
     @classmethod
-    def load(cls, path: Union[str, Path]) -> "FEMDataset":
+    def load(cls, path: Union[str, Path], mmap: bool = True) -> "FEMDataset":
         """
         Load dataset from disk.
 
@@ -410,38 +410,24 @@ class FEMDataset:
             metadata = json.load(f)
 
         arrays_dir = path / "arrays"
+        _mmap = 'r' if mmap else None
+
+        def _load(p: Path):
+            return np.load(p, mmap_mode=_mmap) if p.exists() else None
 
         # Load samples
         for sample_id in metadata["sample_order"]:
             sample_meta = metadata["samples"][sample_id]
             sample_dir = arrays_dir / sample_id
 
-            # Load arrays
-            coordinates = np.load(sample_dir / "coordinates.npy")
-
-            displacement = None
-            stress = None
-            temperature = None
-            von_mises = None
-            damage = None
-            crack_path = None
-
-            if (sample_dir / "displacement.npy").exists():
-                displacement = np.load(sample_dir / "displacement.npy")
-            if (sample_dir / "stress.npy").exists():
-                stress = np.load(sample_dir / "stress.npy")
-            if (sample_dir / "temperature.npy").exists():
-                temperature = np.load(sample_dir / "temperature.npy")
-            if (sample_dir / "von_mises.npy").exists():
-                von_mises = np.load(sample_dir / "von_mises.npy")
-            if (sample_dir / "damage.npy").exists():
-                damage = np.load(sample_dir / "damage.npy")
-            if (sample_dir / "crack_path.npy").exists():
-                crack_path = np.load(sample_dir / "crack_path.npy")
-
-            elements = None
-            if (sample_dir / "elements.npy").exists():
-                elements = np.load(sample_dir / "elements.npy")
+            coordinates  = np.load(sample_dir / "coordinates.npy", mmap_mode=_mmap)
+            displacement = _load(sample_dir / "displacement.npy")
+            stress       = _load(sample_dir / "stress.npy")
+            temperature  = _load(sample_dir / "temperature.npy")
+            von_mises    = _load(sample_dir / "von_mises.npy")
+            damage       = _load(sample_dir / "damage.npy")
+            crack_path   = _load(sample_dir / "crack_path.npy")
+            elements     = _load(sample_dir / "elements.npy")
 
             sample = FEMSample(
                 sample_id=sample_id,

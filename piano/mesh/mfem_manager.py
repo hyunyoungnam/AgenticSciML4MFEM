@@ -79,19 +79,12 @@ class MFEMManager(MeshManager):
     def _extract_mesh_data(self) -> None:
         """Extract node and element data from the MFEM mesh object."""
         mfem = _get_mfem()
+        from piano.data.zero_copy import mesh_vertices_to_numpy
 
-        # Extract vertices (nodes)
+        # Extract vertices — zero-copy fast path via GetVerticesArray()
         num_vertices = self._mesh.GetNV()
         self._node_ids = np.arange(num_vertices, dtype=np.int32)
-
-        # Get vertex coordinates
-        # GetVertex returns a raw double* (SwigPyObject); use ctypes to read it
-        self._nodes = np.zeros((num_vertices, self._space_dim), dtype=np.float64)
-        for i in range(num_vertices):
-            vertex = self._mesh.GetVertex(i)
-            ptr = ctypes.cast(int(vertex), ctypes.POINTER(ctypes.c_double))
-            for d in range(self._space_dim):
-                self._nodes[i, d] = ptr[d]
+        self._nodes = mesh_vertices_to_numpy(self._mesh, self._space_dim).copy()
 
         # Extract elements
         num_elements = self._mesh.GetNE()
@@ -191,20 +184,41 @@ class MFEMManager(MeshManager):
         nodes_gf = self._mesh.GetNodes()
 
         if nodes_gf is not None:
-            # High-order mesh: update the GridFunction
+            # High-order mesh: update GridFunction DOFs.
+            # Build DOF index arrays once per component, then bulk-write.
             fes = nodes_gf.FESpace()
-            for i in range(self._mesh.GetNV()):
+            n_verts = self._mesh.GetNV()
+            try:
+                dof_buf = nodes_gf.GetDataArray()
                 for d in range(self._space_dim):
-                    # For linear elements, vertex DOFs correspond directly
-                    dof = fes.DofToVDof(i, d)
-                    nodes_gf[dof] = self._nodes[i, d]
+                    dofs = np.array([fes.DofToVDof(i, d) for i in range(n_verts)], dtype=np.intp)
+                    dof_buf[dofs] = self._nodes[:, d]
+            except (AttributeError, Exception):
+                for i in range(n_verts):
+                    for d in range(self._space_dim):
+                        nodes_gf[fes.DofToVDof(i, d)] = self._nodes[i, d]
         else:
-            # Linear mesh: update vertices directly via ctypes
+            # Linear mesh: bulk-write vertices via ctypes (one frombuffer per vertex)
             for i in range(self._mesh.GetNV()):
                 vertex = self._mesh.GetVertex(i)
                 ptr = ctypes.cast(int(vertex), ctypes.POINTER(ctypes.c_double))
+                buf = (ctypes.c_double * self._space_dim).from_address(
+                    ctypes.addressof(ptr.contents)
+                )
                 for d in range(self._space_dim):
-                    ptr[d] = float(self._nodes[i, d])
+                    buf[d] = float(self._nodes[i, d])
+
+    def apply_uniform_refinement(self, n_levels: int = 1) -> None:
+        """
+        Apply uniform h-refinement (subdivide all elements).
+
+        Args:
+            n_levels: Number of refinement passes
+        """
+        for _ in range(n_levels):
+            self._mesh.UniformRefinement()
+        self._extract_mesh_data()
+        self._modified = True
 
     def save(self, output_path: Union[str, Path]) -> Path:
         """

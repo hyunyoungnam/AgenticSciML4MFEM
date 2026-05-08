@@ -1,9 +1,25 @@
 """
 Physicist Agent implementation.
 
-The Physicist Agent specializes in physics-informed loss configuration,
-understanding PDE constraints, singularities, and how to balance data-driven
-learning with physics enforcement.
+Manages all physics loss weights as soft regularization on top of clean FEA data.
+
+Philosophy
+----------
+Ground truth data comes from a reliable FEM solver — all physics is already
+embedded in the labels. Physics terms therefore do NOT add information; they
+add soft regularization that can improve generalization once the surrogate has
+saturated data-driven learning.
+
+Target: physics loss contribution ≈ 1–5% of data loss.
+  < 1%  → weight is irrelevant (too small to matter)
+  1–5%  → ideal regularization regime
+  > 10% → weight is overriding the data signal (reduce immediately)
+
+All 6 terms are always mathematically present; the physicist controls only
+their weights. Crack-specific terms (traction_free, stress_intensity, near_tip,
+j_integral) start at 0.0 and are enabled only once the base physics
+(equilibrium + energy) is stable in the 1-5% ratio range.
+Architecture and optimizer hyperparameters are the Architect's responsibility.
 """
 
 import re
@@ -16,14 +32,12 @@ from piano.agents.roles.hyperparameter_critic import CritiqueResult, TrainingIss
 
 
 class PhysicsIssue(Enum):
-    """Types of physics-related issues the physicist can diagnose."""
-    WEAK_PHYSICS_ENFORCEMENT = auto()      # Physics loss too low, not constraining
-    OVERLY_STRONG_PHYSICS = auto()         # Physics dominates, hurts data fit
-    SINGULARITY_NOT_CAPTURED = auto()      # 1/sqrt(r) or similar not learned
-    BOUNDARY_VIOLATION = auto()            # BC not satisfied
-    EQUILIBRIUM_IMBALANCE = auto()         # Force balance not achieved
-    ENERGY_INCONSISTENCY = auto()          # Strain energy errors
-    PHYSICS_DATA_CONFLICT = auto()         # Physics and data losses fighting
+    """Physics weight calibration states."""
+    TEST_LOSS_PLATEAUED = auto()       # Test loss stalled — good time to add physics
+    PHYSICS_RATIO_TOO_HIGH = auto()    # Physics > 10% of data loss — reduce weights
+    PHYSICS_RATIO_TOO_LOW = auto()     # Physics < 0.5% of data loss — can increase
+    NEXT_CRACK_TERM_READY = auto()     # General PINO stable — enable next crack term
+    PHYSICS_DESTABILIZING = auto()     # Loss spike after enabling a term — reduce
     NONE = auto()
 
 
@@ -34,11 +48,10 @@ class PhysicsProposal:
     reasoning: str = ""
     physics_diagnosis: str = ""
     expected_impact: str = ""
-    confidence: str = "medium"  # "low", "medium", "high"
+    confidence: str = "medium"
     raw_response: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "changes": self.changes,
             "reasoning": self.reasoning,
@@ -48,103 +61,129 @@ class PhysicsProposal:
         }
 
 
-PHYSICIST_SYSTEM = """You are an expert computational physicist specializing in physics-informed neural networks for solid mechanics.
+PHYSICIST_SYSTEM = """You are an expert computational physicist specializing in fracture mechanics and physics-informed neural networks for solid mechanics.
 
-Your role is to tune physics loss configurations based on training diagnostics, ensuring the neural operator respects physical laws while learning from data.
+Your role is to calibrate ALL physics loss weights for a surrogate trained on clean FEM data. The Architect handles neural network architecture and optimizer settings — you handle physics weights exclusively.
 
-## Physics-Informed Loss Components
+## Core Philosophy
 
-The PINO (Physics-Informed Neural Operator) loss has two main terms:
+The ground-truth data comes from a reliable FEM solver. All physics (equilibrium, BCs, stress field) is already embedded in the labels. Physics loss terms therefore act as **soft regularization** — they do not add new information, they nudge the surrogate toward physically consistent generalization.
 
-### 1. Equilibrium Residual (pino_eq_weight)
-- Enforces: div(sigma) = 0 (force balance at mesh nodes)
-- Label-free: No ground truth needed
-- Computed: Nodal force residual via B-matrix assembly
-- Effect: Ensures predicted displacement field satisfies equilibrium
+**Consequence**: Physics weights must be small. They should lightly shape the loss landscape, not compete with the data signal.
 
-### 2. Energy-Norm Error (pino_weight)
-- Enforces: Strain energy consistency with ground truth
-- With labels: Requires ground truth displacement
-- Computed: W(u_pred - u_true) / Volume
-- Effect: Physics-weighted H1 seminorm, penalizes strain errors
+**Target ratio**: physics loss contribution = 1–5% of data loss.
+- If physics/data > 10%: the surrogate is fitting physics instead of data — reduce weights.
+- If physics/data < 0.5%: the term has no effect — can increase slightly if test loss is plateauing.
+- If physics/data is 1–5%: ideal regime — hold unless test loss is degrading.
 
-## Physics Considerations for Fracture Mechanics
+**When to enable new terms**: Only when test loss has plateaued (< 2% improvement over the last 2 rounds). If the surrogate is still improving from data alone, adding physics adds noise.
 
-### Crack Tip Singularity (1/sqrt(r))
-- Near crack tip: stress ~ K_I / sqrt(2*pi*r)
-- Neural networks struggle with singularities
-- Higher physics weight can help enforce correct asymptotic behavior
-- But too high can destabilize training
+## Physics Loss Terms
 
-### Williams Expansion
-- Mode I: u_x, u_y ~ sqrt(r) * f(theta)
-- The sqrt(r) behavior is hard to learn from data alone
-- Physics loss helps by enforcing equilibrium even in singular region
+All 6 terms are always mathematically present in the loss — only weights are varied.
+Crack-specific terms start at 0.0 and are enabled only after base physics is stable.
 
-## Issue-to-Change Mapping
+### equilibrium — Equilibrium PDE Residual
+- Enforces: ∇·σ = 0 (balance of linear momentum)
+- Enable when: test loss has plateaued
+- Starting weight: 1e-3
 
-| Physics Issue | Recommended Changes |
-|---------------|---------------------|
-| WEAK_PHYSICS_ENFORCEMENT | Increase pino_weight and/or pino_eq_weight |
-| OVERLY_STRONG_PHYSICS | Reduce pino_weight, let data loss dominate initially |
-| SINGULARITY_NOT_CAPTURED | Increase pino_eq_weight, ensure equilibrium near tip |
-| BOUNDARY_VIOLATION | Add or increase boundary loss (future: pino_bc_weight) |
-| EQUILIBRIUM_IMBALANCE | Increase pino_eq_weight relative to pino_weight |
-| ENERGY_INCONSISTENCY | Increase pino_weight, check material parameters |
-| PHYSICS_DATA_CONFLICT | Reduce physics weights, train data-only first |
+### energy — Elastic Energy Norm
+- Enforces: displacement minimizes elastic strain energy
+- Enable when: equilibrium is active and ratio is in target range
+- Starting weight: 5e-4
 
-## Typical Weight Ranges
+### traction_free — Traction-Free Crack Faces
+- Enforces: σ_yy = σ_xy = 0 on crack/notch face elements
+- Enable when: equilibrium + energy ratio is already in 1–5% range
+- Starting weight: 1e-3
 
-- `pino_weight`: 0.01 to 1.0 (energy norm)
-- `pino_eq_weight`: 0.01 to 1.0 (equilibrium residual)
-- Start low (0.01-0.1) and increase if physics is violated
-- Ratio matters: eq_weight / pino_weight affects balance
+### stress_intensity — K_I Consistency
+- Enforces: extracted K_I from near-tip displacements matches ground truth K_I
+- Enable when: base physics ratio is in range and test loss plateaued
+- Starting weight: 1e-3
+
+### near_tip — Williams Asymptotic Residual
+- Enforces: near-tip displacement matches Mode I Williams expansion u ~ √r f(θ)
+- Enable when: base physics ratio is in range and test loss plateaued
+- Starting weight: 5e-4
+
+### j_integral — J-Integral Conservation
+- Enforces: domain J-integral = K_I²/E (plane stress)
+- Enable when: base physics ratio is in range and test loss plateaued
+- Starting weight: 2e-4
+
+## Weight Calibration Rules
+
+1. Compute current ratio = pino_loss[-1] / train_loss[-1]
+2. If ratio > 10%: reduce ALL active physics weights by 3–5× (top priority)
+3. If ratio > 5%: reduce the largest-weight active term by 2×
+4. If ratio < 0.5% AND test loss is plateauing: increase the lowest active weight by 2×
+5. If ratio is 1–5% AND test loss is still improving: hold all weights (data is doing the work)
+6. If ratio is 1–5% AND test loss plateaued: may enable one crack-specific term at 1e-3
+7. Never disable a term that was previously stable — only reduce its weight
+
+## Priority Order
+Weight recalibration > enabling new terms. Fix the ratio first, then add terms.
 
 Output your proposals in structured format."""
 
 
-PHYSICIST_PROMPT = """## Current Physics Configuration
-- pino_weight: {pino_weight}
-- pino_eq_weight: {pino_eq_weight}
+PHYSICIST_PROMPT = """## Current Physics Loss Configuration
+- equilibrium: {equilibrium}
+- energy: {energy}
+- traction_free: {traction_free}
+- stress_intensity: {stress_intensity}
+- near_tip: {near_tip}
+- j_integral: {j_integral}
+
+## Loss History (sampled)
+- Train losses (data only): {train_losses}
+- Test losses: {test_losses}
+- Physics losses: {pino_losses}
+
+## Current Physics/Data Ratio
+- Latest ratio: {physics_ratio:.1%}  (target: 1–5%; above 10% → reduce, below 0.5% → can increase)
+- Test loss trend: {test_trend}
 
 ## Training Diagnostics
 **Primary Issue**: {primary_issue}
 **Severity**: {severity}
 **Diagnosis**: {diagnosis}
 
-## Loss History (sampled)
-- Train losses: {train_losses}
-- Test losses: {test_losses}
-- PINO losses: {pino_losses}
-
 ## Problem Context
 - Problem type: {problem_type}
 - Dataset size: {dataset_size} samples
-- Has singularity: {has_singularity}
 
 ## Previous Physics Configs Tried
 {previous_configs}
 
 ## Your Task
 
-Analyze the training from a PHYSICS perspective and propose changes to the physics loss configuration.
+Calibrate physics loss weights to keep the physics/data ratio in the 1–5% range.
 
-Consider:
-1. Is the physics loss helping or hurting learning?
-2. Is there evidence of physics violation (high PINO loss)?
-3. For crack problems: is the singularity being captured?
-4. Are the equilibrium and energy terms balanced appropriately?
+Rules:
+1. If ratio > 10%: reduce weights — this is the top priority
+2. If ratio 1–5% and test loss improving: hold all weights (data is still learning)
+3. If ratio 1–5% and test loss plateaued: consider enabling one crack term at 1e-3
+4. If ratio < 0.5% and test loss plateaued: increase lowest active weight by 2×
+5. Crack terms (traction_free, stress_intensity, near_tip, j_integral) start at 0.0.
+   Enable only when equilibrium + energy ratio is already in the 1–5% range.
 
 Format your response as:
 ```
-PHYSICS_DIAGNOSIS: [Your physics-specific diagnosis]
+PHYSICS_DIAGNOSIS: [Current ratio assessment and what it means for training]
 
 CHANGES:
-- pino_weight: [value] (reason)
-- pino_eq_weight: [value] (reason)
+- equilibrium: [value] (reason)
+- energy: [value] (reason)
+- traction_free: [value] (reason)
+- stress_intensity: [value] (reason)
+- near_tip: [value] (reason)
+- j_integral: [value] (reason)
 
-REASONING: [Why these physics changes will help]
-EXPECTED_IMPACT: [What improvement you expect]
+REASONING: [Why these specific weight values]
+EXPECTED_IMPACT: [Expected effect on physics/data ratio and test loss]
 CONFIDENCE: [low|medium|high]
 ```
 
@@ -154,13 +193,11 @@ Only include parameters you want to change.
 
 class PhysicistAgent(BaseAgent[PhysicsProposal]):
     """
-    Physicist Agent for physics-informed loss configuration.
+    Physicist Agent for physics loss weight calibration.
 
-    Responsibilities:
-    1. Analyze training from physics perspective
-    2. Diagnose physics-specific issues (singularities, equilibrium, etc.)
-    3. Propose physics loss weight adjustments
-    4. Balance data-driven and physics-informed learning
+    Targets physics/data loss ratio of 1–5%.
+    Enforces crack term ordering (traction_free → stress_intensity → near_tip → j_integral)
+    for physical coherence, but uses small weights so physics acts as soft regularization.
     """
 
     def __init__(
@@ -185,70 +222,92 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
         training_history = kwargs.get("training_history", None)
         dataset_size: int = kwargs.get("dataset_size", 0)
         problem_type: str = kwargs.get("problem_type", "crack")
-        has_singularity: bool = kwargs.get("has_singularity", True)
         previous_configs: List[Dict] = kwargs.get("previous_configs", [])
+        debate_context: str = kwargs.get("debate_context", "")
 
-        # Extract loss history
-        train_losses = "[]"
-        test_losses = "[]"
-        pino_losses = "[]"
+        train_losses_raw = []
+        test_losses_raw = []
+        pino_losses_raw = []
 
         if training_history:
-            train_losses = self._sample_losses(
-                getattr(training_history, 'train_losses', [])
-            )
-            test_losses = self._sample_losses(
-                getattr(training_history, 'test_losses', [])
-            )
-            pino_losses = self._sample_losses(
-                getattr(training_history, 'pino_losses', [])
-            )
+            train_losses_raw = getattr(training_history, 'train_losses', [])
+            test_losses_raw = getattr(training_history, 'test_losses', [])
+            pino_losses_raw = getattr(training_history, 'pino_losses', [])
 
-        # Format previous configs
+        train_losses = self._sample_losses(train_losses_raw)
+        test_losses = self._sample_losses(test_losses_raw)
+        pino_losses = self._sample_losses(pino_losses_raw)
+
+        # Compute physics/data ratio from most recent values
+        physics_ratio = 0.0
+        if train_losses_raw and pino_losses_raw:
+            recent_data = train_losses_raw[-1]
+            recent_pino = pino_losses_raw[-1]
+            if recent_data > 1e-10:
+                physics_ratio = recent_pino / recent_data
+
+        # Describe test loss trend over last 3 rounds
+        test_trend = "unknown"
+        if len(test_losses_raw) >= 3:
+            recent = test_losses_raw[-3:]
+            improvement = (recent[0] - recent[-1]) / (recent[0] + 1e-10)
+            if improvement > 0.02:
+                test_trend = f"improving ({improvement:.1%} over last 3 epochs)"
+            elif improvement < -0.01:
+                test_trend = f"worsening ({-improvement:.1%} increase)"
+            else:
+                test_trend = f"plateaued (< 2% change over last 3 epochs)"
+
         prev_str = "None"
         if previous_configs:
+            _physics_keys = {"equilibrium", "energy", "traction_free", "stress_intensity",
+                             "near_tip", "j_integral"}
             prev_lines = []
             for i, cfg in enumerate(previous_configs):
-                physics_cfg = {
-                    k: v for k, v in cfg.get("config", {}).items()
-                    if k.startswith("pino")
-                }
+                phys_cfg = {k: v for k, v in cfg.get("config", {}).items() if k in _physics_keys}
                 result = cfg.get("result", "unknown")
-                prev_lines.append(f"  Attempt {i+1}: {physics_cfg} -> {result}")
+                prev_lines.append(f"  Attempt {i+1}: {phys_cfg} -> {result}")
             prev_str = "\n".join(prev_lines) if prev_lines else "None"
 
-        return PHYSICIST_PROMPT.format(
-            pino_weight=current_config.get("pino_weight", 0.1),
-            pino_eq_weight=current_config.get("pino_eq_weight", 0.1),
-            primary_issue=critique.primary_issue.name,
-            severity=critique.severity,
-            diagnosis=critique.diagnosis,
+        prompt = PHYSICIST_PROMPT.format(
+            equilibrium=current_config.get("equilibrium", 0.0),
+            energy=current_config.get("energy", 0.0),
+            traction_free=current_config.get("traction_free", 0.0),
+            stress_intensity=current_config.get("stress_intensity", 0.0),
+            near_tip=current_config.get("near_tip", 0.0),
+            j_integral=current_config.get("j_integral", 0.0),
             train_losses=train_losses,
             test_losses=test_losses,
             pino_losses=pino_losses,
+            physics_ratio=physics_ratio,
+            test_trend=test_trend,
+            primary_issue=critique.primary_issue.name,
+            severity=critique.severity,
+            diagnosis=critique.diagnosis,
             problem_type=problem_type,
             dataset_size=dataset_size,
-            has_singularity=has_singularity,
             previous_configs=prev_str,
         )
+        if debate_context:
+            debate_section = (
+                "\n## Debate Context (Agent Observations — Rounds 1-2)\n"
+                + debate_context
+                + "\nIMPORTANT: Your proposal MUST be consistent with the analysis above.\n"
+            )
+            prompt = debate_section + "\n" + prompt
+        return prompt
 
     def _sample_losses(self, losses: List[float], max_samples: int = 10) -> str:
-        """Sample losses for display."""
         if not losses:
             return "[]"
         if len(losses) <= max_samples:
             return str([round(l, 6) for l in losses])
-
-        # Sample at intervals
         step = len(losses) // max_samples
-        sampled = [round(losses[i * step], 6) for i in range(max_samples)]
-        return str(sampled)
+        return str([round(losses[i * step], 6) for i in range(max_samples)])
 
     def parse_response(self, response: str) -> PhysicsProposal:
-        """Parse the LLM response into a PhysicsProposal."""
         proposal = PhysicsProposal(raw_response=response)
 
-        # Extract physics diagnosis
         diag_match = re.search(
             r'PHYSICS_DIAGNOSIS:\s*(.*?)(?=CHANGES:|$)',
             response, re.DOTALL | re.IGNORECASE
@@ -256,16 +315,13 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
         if diag_match:
             proposal.physics_diagnosis = diag_match.group(1).strip()
 
-        # Extract changes
         changes_match = re.search(
             r'CHANGES:\s*(.*?)(?=REASONING:|$)',
             response, re.DOTALL | re.IGNORECASE
         )
         if changes_match:
-            changes_text = changes_match.group(1)
-            proposal.changes = self._parse_changes(changes_text)
+            proposal.changes = self._parse_changes(changes_match.group(1))
 
-        # Extract reasoning
         reasoning_match = re.search(
             r'REASONING:\s*(.*?)(?=EXPECTED_IMPACT:|$)',
             response, re.DOTALL | re.IGNORECASE
@@ -273,7 +329,6 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
         if reasoning_match:
             proposal.reasoning = reasoning_match.group(1).strip()
 
-        # Extract expected impact
         impact_match = re.search(
             r'EXPECTED_IMPACT:\s*(.*?)(?=CONFIDENCE:|$)',
             response, re.DOTALL | re.IGNORECASE
@@ -281,7 +336,6 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
         if impact_match:
             proposal.expected_impact = impact_match.group(1).strip()
 
-        # Extract confidence
         confidence_match = re.search(
             r'CONFIDENCE:\s*(low|medium|high)',
             response, re.IGNORECASE
@@ -292,21 +346,34 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
         return proposal
 
     def _parse_changes(self, text: str) -> Dict[str, Any]:
-        """Parse physics parameter changes from text."""
         changes = {}
-
-        # Physics parameters (all floats)
-        params = ['pino_weight', 'pino_eq_weight']
-
-        for param in params:
+        for param in ['equilibrium', 'energy', 'traction_free', 'stress_intensity',
+                      'near_tip', 'j_integral']:
             match = re.search(rf'{param}:\s*([0-9.e-]+)', text, re.IGNORECASE)
             if match:
                 try:
                     changes[param] = float(match.group(1))
                 except ValueError:
                     pass
-
         return changes
+
+    def _compute_physics_ratio(self, training_history) -> float:
+        """Latest pino_loss / train_loss ratio."""
+        train = getattr(training_history, 'train_losses', [])
+        pino = getattr(training_history, 'pino_losses', [])
+        if not train or not pino:
+            return 0.0
+        data_val = train[-1]
+        return pino[-1] / data_val if data_val > 1e-10 else 0.0
+
+    def _test_loss_plateaued(self, training_history, window: int = 3) -> bool:
+        """True if test loss improved < 2% over the last `window` entries."""
+        losses = getattr(training_history, 'test_losses', [])
+        if len(losses) < window:
+            return False
+        recent = losses[-window:]
+        improvement = (recent[0] - recent[-1]) / (recent[0] + 1e-10)
+        return improvement < 0.02
 
     def detect_physics_issues(
         self,
@@ -314,40 +381,62 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
         current_config: Dict[str, Any],
     ) -> List[PhysicsIssue]:
         """
-        Heuristic detection of physics issues (no LLM call).
+        Heuristic detection of physics weight calibration issues.
 
-        Used as a pre-filter to decide if physicist consultation is needed.
+        Priority order:
+        1. Instability (loss spike) → PHYSICS_DESTABILIZING
+        2. Ratio too high (> 10%) → PHYSICS_RATIO_TOO_HIGH
+        3. Test loss plateaued → TEST_LOSS_PLATEAUED (enable new term or adjust)
+        4. Ratio too low with plateau → PHYSICS_RATIO_TOO_LOW
         """
         issues = []
-
-        pino_losses = getattr(training_history, 'pino_losses', [])
         train_losses = getattr(training_history, 'train_losses', [])
-        test_losses = getattr(training_history, 'test_losses', [])
-
-        if not pino_losses or len(pino_losses) < 5:
+        if not train_losses or len(train_losses) < 5:
             return issues
 
-        # Check if PINO loss is not decreasing (physics not being learned)
-        early_pino = sum(pino_losses[:5]) / 5
-        late_pino = sum(pino_losses[-5:]) / 5
+        # 1. Instability: recent loss spiked
+        recent = train_losses[-5:]
+        is_unstable = recent[-1] >= 2.0 * min(recent) + 1e-12
 
-        if late_pino > 0.9 * early_pino:
-            # PINO loss barely decreased
-            issues.append(PhysicsIssue.WEAK_PHYSICS_ENFORCEMENT)
+        all_physics = [
+            current_config.get(k, 0.0)
+            for k in ["equilibrium", "energy", "traction_free",
+                      "stress_intensity", "near_tip", "j_integral"]
+        ]
+        if is_unstable and any(v > 0 for v in all_physics):
+            issues.append(PhysicsIssue.PHYSICS_DESTABILIZING)
+            return issues
 
-        # Check for physics-data conflict
-        if train_losses and test_losses:
-            train_improving = train_losses[-1] < train_losses[0] * 0.5
-            pino_worsening = late_pino > early_pino * 1.2
+        ratio = self._compute_physics_ratio(training_history)
+        plateaued = self._test_loss_plateaued(training_history)
 
-            if train_improving and pino_worsening:
-                issues.append(PhysicsIssue.PHYSICS_DATA_CONFLICT)
+        # 2. Physics overwhelming data
+        if ratio > 0.10:
+            issues.append(PhysicsIssue.PHYSICS_RATIO_TOO_HIGH)
+            return issues
 
-        # Check for overly strong physics (train loss stuck, pino very low)
-        pino_weight = current_config.get("pino_weight", 0.1)
-        if pino_weight > 0.5 and train_losses:
-            if train_losses[-1] > 0.8 * train_losses[0]:
-                issues.append(PhysicsIssue.OVERLY_STRONG_PHYSICS)
+        # 3. Test loss plateaued — consider enabling next crack term
+        if plateaued:
+            eq = current_config.get("equilibrium", 0.0)
+            en = current_config.get("energy", 0.0)
+            tf = current_config.get("traction_free", 0.0)
+            si = current_config.get("stress_intensity", 0.0)
+            nt = current_config.get("near_tip", 0.0)
+            ji = current_config.get("j_integral", 0.0)
+
+            # Can enable first physics terms (equilibrium/energy) or next crack term
+            if eq == 0.0 or en == 0.0 or (eq > 0 and en > 0 and tf == 0.0):
+                issues.append(PhysicsIssue.TEST_LOSS_PLATEAUED)
+            elif tf > 0 and si == 0.0:
+                issues.append(PhysicsIssue.NEXT_CRACK_TERM_READY)
+            elif si > 0 and nt == 0.0:
+                issues.append(PhysicsIssue.NEXT_CRACK_TERM_READY)
+            elif nt > 0 and ji == 0.0:
+                issues.append(PhysicsIssue.NEXT_CRACK_TERM_READY)
+
+        # 4. Ratio too low — weights have no effect
+        if ratio > 0 and ratio < 0.005 and plateaued:
+            issues.append(PhysicsIssue.PHYSICS_RATIO_TOO_LOW)
 
         return issues
 
@@ -356,13 +445,7 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
         training_history,
         current_config: Dict[str, Any],
     ) -> bool:
-        """
-        Determine if the physicist should be consulted.
-
-        Returns True if there are physics-specific issues to address.
-        """
-        issues = self.detect_physics_issues(training_history, current_config)
-        return len(issues) > 0
+        return len(self.detect_physics_issues(training_history, current_config)) > 0
 
     async def propose_physics_config(
         self,
@@ -374,23 +457,8 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
         problem_type: str = "crack",
         has_singularity: bool = True,
         previous_configs: Optional[List[Dict]] = None,
+        debate_context: str = "",
     ) -> PhysicsProposal:
-        """
-        Propose physics configuration changes based on training analysis.
-
-        Args:
-            context: Agent context
-            current_config: Current model config dict
-            critique: Critic's analysis results
-            training_history: Training history with losses
-            dataset_size: Number of training samples
-            problem_type: Type of physics problem
-            has_singularity: Whether problem has stress singularity
-            previous_configs: History of previous configurations
-
-        Returns:
-            PhysicsProposal with recommended physics parameter changes
-        """
         return await self.execute(
             context,
             current_config=current_config,
@@ -400,4 +468,58 @@ class PhysicistAgent(BaseAgent[PhysicsProposal]):
             problem_type=problem_type,
             has_singularity=has_singularity,
             previous_configs=previous_configs or [],
+            debate_context=debate_context,
         )
+
+    async def analyze(
+        self,
+        context: AgentContext,
+        current_config: Dict[str, Any],
+        training_history,
+        debate_context: str,
+    ) -> str:
+        """Round 2: analyze physics situation, no weight proposals."""
+        if self._llm_provider is None:
+            raise RuntimeError("LLM provider not set")
+        ratio = self._compute_physics_ratio(training_history)
+        plateaued = self._test_loss_plateaued(training_history)
+        active_terms = [k for k in ("equilibrium", "energy", "traction_free",
+                                    "stress_intensity", "near_tip", "j_integral")
+                        if current_config.get(k, 0.0) > 0]
+        prompt = (
+            "ROUND 2 (ANALYSIS) — Do NOT propose any weight values.\n\n"
+            f"## Round 1 Observations\n{debate_context}\n\n"
+            f"## Current Physics State\n"
+            f"  Active terms: {active_terms or ['none']}\n"
+            f"  Physics/data ratio: {ratio:.1%} (target: 1–5%)\n"
+            f"  Test loss plateaued: {plateaued}\n\n"
+            "Analyze the physics loss situation:\n"
+            "- Is the surrogate ready for additional physics terms? "
+            "(test loss must be clearly plateaued)\n"
+            "- Are active physics weights causing instability or dominating training?\n"
+            "- What does the current ratio suggest about the physics/data balance?\n\n"
+            "3-5 sentences. No proposed weight values."
+        )
+        response = await self._llm_provider.generate(
+            system_prompt=PHYSICIST_SYSTEM,
+            user_prompt=prompt,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=512,
+        )
+        return f"[PHYSICIST — Round 2]\n{response.content}"
+
+    def analyze_sync(
+        self,
+        current_config: Dict[str, Any],
+        training_history,
+        debate_context: str,
+    ) -> str:
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                self.analyze(AgentContext(), current_config, training_history, debate_context)
+            )
+        finally:
+            loop.close()

@@ -24,6 +24,7 @@ class ArchitectureProposal:
     expected_impact: str = ""
     trade_offs: str = ""
     confidence: str = "medium"  # "low", "medium", "high"
+    code_change_description: str = "none"
     raw_response: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -35,6 +36,7 @@ class ArchitectureProposal:
             "expected_impact": self.expected_impact,
             "trade_offs": self.trade_offs,
             "confidence": self.confidence,
+            "code_change_description": self.code_change_description,
         }
 
 
@@ -76,10 +78,6 @@ The Transolver is a transformer-based neural operator that learns mappings from 
 - `learning_rate`: (1e-4 to 1e-2). Lower = stable but slow, higher = fast but risky.
 - `scheduler_type`: plateau (adaptive), cosine (smooth decay), none.
 
-### Physics-Informed Loss (PINO)
-- `pino_weight`: Energy loss weight (0.0 to 1.0). Higher = more physics constraints.
-- `pino_eq_weight`: PDE residual weight (0.0 to 1.0).
-
 ### Training
 - `batch_size`: (8, 16, 32, 64). Larger = smoother gradients, more memory.
 - `epochs`: Max epochs.
@@ -91,12 +89,16 @@ The Transolver is a transformer-based neural operator that learns mappings from 
 2. **Address Root Cause**: Match changes to diagnosed issues.
 3. **One Major Change**: Prefer changing one major aspect at a time for interpretability.
 4. **Consider Data Size**: Small datasets need simpler models and more regularization.
+5. **Flag Code Issues**: If the problem cannot be fixed with hyperparameters (e.g., wrong
+   feature encoding, unnormalized loss term, missing physics term), set
+   CODE_CHANGE_DESCRIPTION to a precise description of the required source-code change.
+   An engineer agent with Claude Code CLI will implement it before retraining.
 
 ## Issue-to-Change Mapping
 
 | Issue | Primary Changes |
 |-------|-----------------|
-| OVERFITTING | Increase dropout, reduce d_model/n_layers, add PINO weight |
+| OVERFITTING | Increase dropout, reduce d_model/n_layers |
 | UNDERFITTING | Increase d_model/n_layers, reduce dropout, increase lr |
 | SLOW_CONVERGENCE | Increase lr, use cosine scheduler, reduce model size |
 | UNSTABLE_TRAINING | Reduce lr, use plateau scheduler, increase batch_size |
@@ -163,13 +165,16 @@ For transolver:
 - optimizer_type: [adamw|adam|sgd] (reason)
 - scheduler_type: [plateau|cosine|none] (reason)
 - activation: [gelu|relu|silu] (reason)
-- pino_weight: [value] (reason)
-- pino_eq_weight: [value] (reason)
 - batch_size: [value] (reason)
 
 EXPECTED_IMPACT: [What improvement you expect]
 TRADE_OFFS: [What trade-offs this configuration makes]
 CONFIDENCE: [low|medium|high]
+CODE_CHANGE_DESCRIPTION: none | [If hyperparameter changes alone cannot fix the issue,
+describe exactly what source-code change is needed — e.g. "The trunk feature encoding in
+piano/surrogate/deeponet.py should include log(r) relative to crack tip rather than raw
+distance" or "The elasticity PINO loss in piano/surrogate/pino_loss.py should normalize
+by domain area". Set to 'none' if config changes are sufficient.]
 ```
 
 Only include parameters relevant to the chosen arch_type.
@@ -210,6 +215,7 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
         critique: CritiqueResult = kwargs.get("critique", CritiqueResult())
         dataset_size: int = kwargs.get("dataset_size", 0)
         previous_configs: List[Dict] = kwargs.get("previous_configs", [])
+        debate_context: str = kwargs.get("debate_context", "")
 
         # Format current config
         config_dict = current_config.to_dict()
@@ -228,7 +234,7 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
                 prev_lines.append(f"  Attempt {i+1}: {changes} -> {result}")
             prev_str = "\n".join(prev_lines)
 
-        return ARCHITECT_PROMPT.format(
+        prompt = ARCHITECT_PROMPT.format(
             current_config=config_str,
             primary_issue=critique.primary_issue.name,
             severity=critique.severity,
@@ -238,6 +244,14 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
             n_attempts=len(previous_configs),
             previous_configs=prev_str,
         )
+        if debate_context:
+            debate_section = (
+                "\n## Debate Context (Agent Observations — Rounds 1-2)\n"
+                + debate_context
+                + "\nIMPORTANT: Your proposal MUST address the specific issues identified above.\n"
+            )
+            prompt = debate_section + "\n" + prompt
+        return prompt
 
     def parse_response(self, response: str) -> ArchitectureProposal:
         """Parse the LLM response into an ArchitectureProposal."""
@@ -284,6 +298,15 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
         if confidence_match:
             proposal.confidence = confidence_match.group(1).lower()
 
+        # Extract code change description
+        code_match = re.search(
+            r'CODE_CHANGE_DESCRIPTION:\s*(.*?)(?=\n```|$)',
+            response, re.DOTALL | re.IGNORECASE
+        )
+        if code_match:
+            raw = code_match.group(1).strip()
+            proposal.code_change_description = "none" if raw.lower() == "none" else raw
+
         return proposal
 
     def _parse_changes(self, text: str) -> Dict[str, Any]:
@@ -294,7 +317,7 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
         patterns = {
             'int': ['d_model', 'n_layers', 'n_heads', 'slice_num', 'batch_size', 'epochs',
                     'patience', 'hidden_dim', 'n_basis'],
-            'float': ['dropout', 'trunk_dropout', 'learning_rate', 'pino_weight', 'pino_eq_weight', 'mlp_ratio'],
+            'float': ['dropout', 'trunk_dropout', 'learning_rate', 'mlp_ratio'],
             'str': ['optimizer_type', 'scheduler_type', 'activation', 'arch_type'],
         }
 
@@ -333,6 +356,8 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
 
         if arch_type == "deeponet":
             base = base_config.to_dict() if isinstance(base_config, DeepONetConfig) else {}
+            # Preserve physics weights from existing config — the Physicist manages these
+            orig = base_config.to_dict() if hasattr(base_config, "to_dict") else {}
             return DeepONetConfig(
                 hidden_dim=changes.get("hidden_dim", base.get("hidden_dim", 64)),
                 n_basis=changes.get("n_basis", base.get("n_basis", 32)),
@@ -347,12 +372,22 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
                 scheduler_type=changes.get("scheduler_type", base.get("scheduler_type", "cosine")),
                 activation=changes.get("activation", base.get("activation", "gelu")),
                 output_dim=base_config.output_dim if hasattr(base_config, "output_dim") else 1,
+                energy=orig.get("energy", 0.0),
+                equilibrium=orig.get("equilibrium", 0.0),
+                tip_weight=orig.get("tip_weight", 0.0),
+                stress_intensity=orig.get("stress_intensity", 0.0),
+                traction_free=orig.get("traction_free", 0.0),
+                near_tip=orig.get("near_tip", 0.0),
+                j_integral=orig.get("j_integral", 0.0),
             )
 
-        # TransolverConfig path
+        # TransolverConfig path — Architect only changes NN/optimizer params
         config_dict = base_config.to_dict() if hasattr(base_config, "to_dict") else {}
+        _arch_keys = {"slice_num", "n_heads", "d_model", "n_layers", "mlp_ratio", "dropout",
+                      "learning_rate", "batch_size", "epochs", "patience",
+                      "optimizer_type", "scheduler_type", "activation"}
         for key, value in changes.items():
-            if key in config_dict:
+            if key in _arch_keys:
                 config_dict[key] = value
         return TransolverConfig(
             slice_num=config_dict.get("slice_num", 32),
@@ -366,8 +401,12 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
             epochs=config_dict.get("epochs", 1000),
             patience=config_dict.get("patience", 100),
             output_dim=config_dict.get("output_dim", 1),
-            pino_weight=config_dict.get("pino_weight", 0.0),
-            pino_eq_weight=config_dict.get("pino_eq_weight", 0.0),
+            energy=config_dict.get("energy", 0.0),
+            equilibrium=config_dict.get("equilibrium", 0.0),
+            stress_intensity=config_dict.get("stress_intensity", 0.0),
+            traction_free=config_dict.get("traction_free", 0.0),
+            near_tip=config_dict.get("near_tip", 0.0),
+            j_integral=config_dict.get("j_integral", 0.0),
             optimizer_type=config_dict.get("optimizer_type", "adamw"),
             scheduler_type=config_dict.get("scheduler_type", "plateau"),
             activation=config_dict.get("activation", "gelu"),
@@ -380,6 +419,7 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
         critique: CritiqueResult,
         dataset_size: int = 0,
         previous_configs: Optional[List[Dict]] = None,
+        debate_context: str = "",
     ) -> ArchitectureProposal:
         """
         Propose a new configuration based on critique.
@@ -390,6 +430,7 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
             critique: Critic's analysis results
             dataset_size: Number of training samples
             previous_configs: History of previous configurations
+            debate_context: Prior debate rounds (Rounds 1-2) for context
 
         Returns:
             ArchitectureProposal with new configuration
@@ -400,9 +441,45 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
             critique=critique,
             dataset_size=dataset_size,
             previous_configs=previous_configs or [],
+            debate_context=debate_context,
         )
 
-        # Apply changes to create the actual config
         proposal.config = self.apply_changes(current_config, proposal.changes)
-
         return proposal
+
+    async def analyze(
+        self,
+        context: AgentContext,
+        current_config: "TransolverConfig",
+        debate_context: str,
+    ) -> str:
+        """Round 2: analyze root cause of training issues, no proposals."""
+        if self._llm_provider is None:
+            raise RuntimeError("LLM provider not set")
+        config_str = "\n".join(f"  {k}: {v}" for k, v in current_config.to_dict().items())
+        prompt = (
+            "ROUND 2 (ANALYSIS) — Do NOT propose any hyperparameter values.\n\n"
+            f"## Round 1 Observations\n{debate_context}\n\n"
+            f"## Current Architecture\n{config_str}\n\n"
+            "Analyze the ROOT CAUSE of training issues seen in Round 1:\n"
+            "- Is this an architecture problem, optimizer problem, or data problem?\n"
+            "- What specific mechanism explains the observed loss behavior?\n"
+            "- Challenge any Round 1 observation you disagree with.\n\n"
+            "4-6 sentences. No proposed values."
+        )
+        response = await self._llm_provider.generate(
+            system_prompt=ARCHITECT_SYSTEM,
+            user_prompt=prompt,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=512,
+        )
+        return f"[ARCHITECT — Round 2]\n{response.content}"
+
+    def analyze_sync(self, current_config: "TransolverConfig", debate_context: str) -> str:
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(self.analyze(AgentContext(), current_config, debate_context))
+        finally:
+            loop.close()

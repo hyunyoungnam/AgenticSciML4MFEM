@@ -12,6 +12,14 @@ from .dataset import (
     DatasetStatistics,
 )
 from .loader import DatasetLoader, MFEMDataLoader
+from .zero_copy import (
+    mesh_vertices_to_numpy,
+    gridfunction_nodal_to_numpy,
+    scalar_gridfunction_to_numpy,
+    as_float32,
+    numpy_to_tensor,
+    preallocate_float32,
+)
 
 __all__ = [
     "FEMSample",
@@ -20,6 +28,13 @@ __all__ = [
     "DatasetStatistics",
     "DatasetLoader",
     "MFEMDataLoader",
+    # Zero-copy pipeline
+    "mesh_vertices_to_numpy",
+    "gridfunction_nodal_to_numpy",
+    "scalar_gridfunction_to_numpy",
+    "as_float32",
+    "numpy_to_tensor",
+    "preallocate_float32",
 ]
 
 # Conditionally import phase field generator (requires gmsh and dolfinx)
