@@ -1,4 +1,0 @@
-include LICENSE
-include README.md
-recursive-include piano/configs *.yaml *.md
-recursive-include piano/knowledge *.json

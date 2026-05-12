@@ -1,8 +1,7 @@
 """
-Tests for the 6 new agents added in the Knowledge-Augmented Agent System.
+tests/test_agents.py — LLM-free tests for all PIANO agent roles.
 
-All tests are LLM-free (no API calls) — they test parsing, heuristics, and
-KB mechanics only. Run with: pytest tests/test_new_agents.py -v
+Tests parse logic, heuristics, and KB mechanics — no API calls required.
 """
 
 import json
