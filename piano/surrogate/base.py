@@ -135,7 +135,7 @@ class EnsembleConfig:
 
     Attributes:
         n_members: Number of ensemble members
-        member_config: Configuration for each ensemble member (TransolverConfig or DeepONetConfig)
+        member_config: Configuration for each ensemble member (TransolverConfig)
     """
     n_members: int = 5
     member_config: Any = field(default_factory=TransolverConfig)

@@ -2,7 +2,7 @@
 Surrogate model module for adaptive learning.
 
 Provides surrogate model interfaces and training utilities for predicting
-FEM simulation outputs from input parameters using Transolver / DeepONet.
+FEM simulation outputs from input parameters using Transolver.
 
 Physics-informed loss functions live in piano.physics (not here).
 """
@@ -20,7 +20,6 @@ from .base import (
 # ── Model architectures ───────────────────────────────────────────────────────
 from .transolver import TransolverModel, PhysicsAttention
 from .ensemble import EnsembleModel
-from .deeponet import DeepONetConfig, DeepONetModel
 
 # ── Training ──────────────────────────────────────────────────────────────────
 from .trainer import SurrogateTrainer, TrainingConfig, TrainingResult
@@ -45,8 +44,6 @@ __all__ = [
     "TransolverModel",
     "PhysicsAttention",
     "EnsembleModel",
-    "DeepONetConfig",
-    "DeepONetModel",
     # Training
     "SurrogateTrainer",
     "TrainingConfig",

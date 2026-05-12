@@ -179,7 +179,7 @@ OUTPUT_SKEWNESS: high positive skew in both displacement components (skew ≈ 2.
 RECOMMENDATIONS:
 - Apply tip-weighted MSE (tip_weight=2.0)
 - Normalize outputs per-channel before training
-SUMMARY: Dataset is suitable for DeepONet training with moderate near-tip density."""
+SUMMARY: Dataset is suitable for Transolver training with moderate near-tip density."""
         result = agent.parse_response(raw)
         assert result.dataset_quality == "moderate"
         assert result.n_samples == 15
@@ -258,15 +258,15 @@ class TestDebuggerAgent:
         from piano.agents.roles.debugger import DebuggerAgent, DebugResult
         agent = DebuggerAgent.__new__(DebuggerAgent)
 
-        response = """ROOT_CAUSE: Missing import for `nn.functional` in piano/surrogate/deeponet.py line 42
-FIX: Add `import torch.nn.functional as F` at the top of piano/surrogate/deeponet.py
-FILES: piano/surrogate/deeponet.py
+        response = """ROOT_CAUSE: Missing import for `nn.functional` in piano/surrogate/transolver.py line 42
+FIX: Add `import torch.nn.functional as F` at the top of piano/surrogate/transolver.py
+FILES: piano/surrogate/transolver.py
 CONFIDENCE: high"""
 
         result = agent._parse(response, traceback="")
         assert "Missing import" in result.root_cause
         assert "torch.nn.functional" in result.fix_description
-        assert "deeponet.py" in result.files_to_change[0]
+        assert "transolver.py" in result.files_to_change[0]
         assert result.confidence == "high"
 
     def test_parse_extracts_files_from_traceback_fallback(self):
@@ -286,12 +286,12 @@ AttributeError: 'NoneType' object'''
         dr = DebugResult(
             root_cause="Missing import",
             fix_description="Add import statement",
-            files_to_change=["piano/surrogate/deeponet.py"],
+            files_to_change=["piano/surrogate/transolver.py"],
         )
         prompt = dr.to_engineer_prompt("original change")
         assert "ORIGINAL CHANGE" in prompt
         assert "Missing import" in prompt
-        assert "deeponet.py" in prompt
+        assert "transolver.py" in prompt
 
     def test_low_confidence_on_empty_response(self):
         from piano.agents.roles.debugger import DebuggerAgent

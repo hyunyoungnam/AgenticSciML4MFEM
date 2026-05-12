@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional
 from piano.agents.base import BaseAgent, AgentContext, AgentRole
 from piano.agents.roles.hyperparameter_critic import CritiqueResult
 from piano.surrogate.base import TransolverConfig
-from piano.surrogate.deeponet import DeepONetConfig
 
 
 @dataclass
@@ -46,16 +45,9 @@ Your role is to propose concrete model configurations based on training diagnost
 
 ## Model: Transolver
 
-The Transolver is a transformer-based neural operator that learns mappings from parameters to physical fields. Key hyperparameters:
+The Transolver is a Physics-Attention transformer-based neural operator that learns mappings from parameters to physical fields on unstructured meshes. Key hyperparameters:
 
-### Architecture Selection
-- `arch_type`: Neural architecture to use — **choose first, then set its hyperparameters**.
-  - `transolver`: Physics-Attention neural operator. Best for varied geometry or large datasets (>200 samples).
-  - `deeponet`: Branch-trunk operator. Best for **fixed geometry + small datasets (<100 samples)**.
-    Branch(params) x Trunk(x,y) separates parameter dependence from spatial basis learning.
-    Far fewer parameters than Transolver — generalises well with 20-50 samples.
-
-### Transolver Hyperparameters (when arch_type=transolver)
+### Transolver Hyperparameters
 - `d_model`: Hidden dimension (32, 64, 128, 256). Higher = more capacity.
 - `n_layers`: Transformer layers (2, 4, 6). More = deeper features, risk of overfitting.
 - `n_heads`: Attention heads (2, 4, 8). Must divide d_model evenly.
@@ -63,15 +55,6 @@ The Transolver is a transformer-based neural operator that learns mappings from 
 - `mlp_ratio`: FFN expansion (2.0, 4.0).
 - `dropout`: Regularization (0.0, 0.1, 0.2, 0.3).
 - `activation`: Activation function (gelu, relu, silu).
-
-### DeepONet Hyperparameters (when arch_type=deeponet)
-- `hidden_dim`: MLP width for branch and trunk (32, 64, 128).
-- `n_basis`: Number of shared basis functions (16, 32, 64). More = richer spatial representation.
-- `n_layers`: MLP depth for branch and trunk (2, 3, 4).
-- `dropout`: Branch MLP regularization (0.0, 0.1, 0.2). Branch encodes parameter→coefficient mapping; keep low.
-- `trunk_dropout`: Trunk MLP regularization (0.0, 0.05, 0.1, 0.2). Trunk learns spatial basis functions.
-  Higher values prevent oscillatory/swirling basis artifacts; lower values allow sharper spatial features.
-  Tune independently from branch dropout — overfitting trunk vs. branch requires different responses.
 
 ### Optimizer
 - `optimizer_type`: adamw (default, good regularization), adam, sgd (needs tuning).
@@ -143,19 +126,6 @@ Format your response as:
 REASONING: [Why you're making these changes]
 
 CHANGES:
-- arch_type: [transolver|deeponet] (reason — required if switching architecture)
-For deeponet:
-- hidden_dim: [value] (reason)
-- n_basis: [value] (reason)
-- n_layers: [value] (reason)
-- dropout: [value] (reason, branch MLP)
-- trunk_dropout: [value] (reason, trunk MLP)
-- learning_rate: [value] (reason)
-- optimizer_type: [adamw|adam|sgd] (reason)
-- scheduler_type: [plateau|cosine|none] (reason)
-- activation: [gelu|relu|silu] (reason)
-- batch_size: [value] (reason)
-For transolver:
 - d_model: [value] (reason)
 - n_layers: [value] (reason)
 - n_heads: [value] (reason)
@@ -171,13 +141,11 @@ EXPECTED_IMPACT: [What improvement you expect]
 TRADE_OFFS: [What trade-offs this configuration makes]
 CONFIDENCE: [low|medium|high]
 CODE_CHANGE_DESCRIPTION: none | [If hyperparameter changes alone cannot fix the issue,
-describe exactly what source-code change is needed — e.g. "The trunk feature encoding in
-piano/surrogate/deeponet.py should include log(r) relative to crack tip rather than raw
-distance" or "The elasticity PINO loss in piano/surrogate/pino_loss.py should normalize
+describe exactly what source-code change is needed — e.g. "The physics attention in
+piano/surrogate/transolver.py should include log(r) relative to crack tip rather than raw
+distance" or "The elasticity PINO loss in piano/physics/pino_loss.py should normalize
 by domain area". Set to 'none' if config changes are sufficient.]
 ```
-
-Only include parameters relevant to the chosen arch_type.
 """
 
 
@@ -315,10 +283,9 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
 
         # Patterns for different parameter types
         patterns = {
-            'int': ['d_model', 'n_layers', 'n_heads', 'slice_num', 'batch_size', 'epochs',
-                    'patience', 'hidden_dim', 'n_basis'],
-            'float': ['dropout', 'trunk_dropout', 'learning_rate', 'mlp_ratio'],
-            'str': ['optimizer_type', 'scheduler_type', 'activation', 'arch_type'],
+            'int': ['d_model', 'n_layers', 'n_heads', 'slice_num', 'batch_size', 'epochs', 'patience'],
+            'float': ['dropout', 'learning_rate', 'mlp_ratio'],
+            'str': ['optimizer_type', 'scheduler_type', 'activation'],
         }
 
         for param in patterns['int']:
@@ -345,43 +312,8 @@ class ArchitectAgent(BaseAgent[ArchitectureProposal]):
         self,
         base_config: Any,
         changes: Dict[str, Any],
-    ) -> Any:
-        """
-        Apply proposed changes to create a new config.
-
-        When changes contain arch_type='deeponet', returns a DeepONetConfig.
-        When changes contain arch_type='transolver' or base is TransolverConfig, returns TransolverConfig.
-        """
-        arch_type = changes.get("arch_type", getattr(base_config, "arch_type", "transolver"))
-
-        if arch_type == "deeponet":
-            base = base_config.to_dict() if isinstance(base_config, DeepONetConfig) else {}
-            # Preserve physics weights from existing config — the Physicist manages these
-            orig = base_config.to_dict() if hasattr(base_config, "to_dict") else {}
-            return DeepONetConfig(
-                hidden_dim=changes.get("hidden_dim", base.get("hidden_dim", 64)),
-                n_basis=changes.get("n_basis", base.get("n_basis", 32)),
-                n_layers=changes.get("n_layers", base.get("n_layers", 3)),
-                dropout=changes.get("dropout", base.get("dropout", 0.0)),
-                trunk_dropout=changes.get("trunk_dropout", base.get("trunk_dropout", 0.1)),
-                learning_rate=changes.get("learning_rate", base.get("learning_rate", 1e-3)),
-                batch_size=changes.get("batch_size", base.get("batch_size", 4)),
-                epochs=changes.get("epochs", base.get("epochs", 200)),
-                patience=changes.get("patience", base.get("patience", 50)),
-                optimizer_type=changes.get("optimizer_type", base.get("optimizer_type", "adamw")),
-                scheduler_type=changes.get("scheduler_type", base.get("scheduler_type", "cosine")),
-                activation=changes.get("activation", base.get("activation", "gelu")),
-                output_dim=base_config.output_dim if hasattr(base_config, "output_dim") else 1,
-                energy=orig.get("energy", 0.0),
-                equilibrium=orig.get("equilibrium", 0.0),
-                tip_weight=orig.get("tip_weight", 0.0),
-                stress_intensity=orig.get("stress_intensity", 0.0),
-                traction_free=orig.get("traction_free", 0.0),
-                near_tip=orig.get("near_tip", 0.0),
-                j_integral=orig.get("j_integral", 0.0),
-            )
-
-        # TransolverConfig path — Architect only changes NN/optimizer params
+    ) -> TransolverConfig:
+        """Apply proposed changes to the current TransolverConfig."""
         config_dict = base_config.to_dict() if hasattr(base_config, "to_dict") else {}
         _arch_keys = {"slice_num", "n_heads", "d_model", "n_layers", "mlp_ratio", "dropout",
                       "learning_rate", "batch_size", "epochs", "patience",

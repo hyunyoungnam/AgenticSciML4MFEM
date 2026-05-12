@@ -653,7 +653,7 @@ class HyperparameterCriticAgent(BaseAgent[CritiqueResult]):
             f"## Architect's Proposal\n{arch_summary}\n\n"
             f"## Physicist's Proposal\n{phys_summary}\n\n"
             "Check these proposals:\n"
-            "1. Capacity sanity: n_layers ≥ 2, d_model ≥ 32 (DeepONet: hidden_dim ≥ 32, n_basis ≥ 16)\n"
+            "1. Capacity sanity: n_layers ≥ 2, d_model ≥ 32\n"
             "2. Physics ordering: no crack terms (traction_free/near_tip/j_integral)\n"
             "   enabled before equilibrium has converged (test loss still decreasing).\n"
             "3. Consistency: do the proposals address the actual issue identified in Rounds 1-2?\n\n"

@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 _ENGINEER_SYSTEM = (
     "You are implementing a targeted code change inside an Agentic SciML framework "
-    "(piano/). The framework trains neural operators (DeepONet, Transolver) for physics "
+    "(piano/). The framework trains Transolver neural operators for physics "
     "simulations with PINO losses. Your task is precisely scoped — do NOT refactor "
     "unrelated code, do NOT add new features beyond what is requested, and do NOT remove "
     "existing functionality unless explicitly told to."

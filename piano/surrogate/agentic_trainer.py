@@ -495,7 +495,7 @@ class AgenticSurrogateTrainer:
             eng_result = self.engineer.implement_change_sync(
                 change_description=arch_proposal.code_change_description,
                 context_files=[
-                    "piano/surrogate/deeponet.py",
+                    "piano/surrogate/transolver.py",
                     "piano/physics/pino_loss.py",
                     "piano/physics/crack_pino_loss.py",
                     "piano/surrogate/trainer.py",
@@ -538,15 +538,13 @@ class AgenticSurrogateTrainer:
         self,
         arch_config: Any,
         physics_changes: Dict[str, Any],
-    ) -> Any:
+    ) -> TransolverConfig:
         """
         Merge architecture and physics proposals into a single config.
 
         The Physicist's changes override the arch config for all physics weights.
         The Architect owns only NN/optimizer params; it preserves but does not modify physics weights.
         """
-        from piano.surrogate.deeponet import DeepONetConfig
-
         _physics_keys = {"energy", "equilibrium", "traction_free", "stress_intensity",
                          "near_tip", "j_integral"}
 
@@ -554,30 +552,6 @@ class AgenticSurrogateTrainer:
         for key, value in physics_changes.items():
             if key in _physics_keys:
                 config_dict[key] = value
-
-        if config_dict.get("arch_type") == "deeponet":
-            return DeepONetConfig(
-                hidden_dim=config_dict.get('hidden_dim', 64),
-                n_basis=config_dict.get('n_basis', 32),
-                n_layers=config_dict.get('n_layers', 3),
-                dropout=config_dict.get('dropout', 0.0),
-                trunk_dropout=config_dict.get('trunk_dropout', 0.1),
-                learning_rate=config_dict.get('learning_rate', 1e-3),
-                batch_size=config_dict.get('batch_size', 4),
-                epochs=config_dict.get('epochs', 200),
-                patience=config_dict.get('patience', 50),
-                optimizer_type=config_dict.get('optimizer_type', 'adamw'),
-                scheduler_type=config_dict.get('scheduler_type', 'cosine'),
-                activation=config_dict.get('activation', 'gelu'),
-                output_dim=config_dict.get('output_dim', 1),
-                energy=config_dict.get('energy', 0.0),
-                equilibrium=config_dict.get('equilibrium', 0.0),
-                tip_weight=config_dict.get('tip_weight', 0.0),
-                stress_intensity=config_dict.get('stress_intensity', 0.0),
-                traction_free=config_dict.get('traction_free', 0.0),
-                near_tip=config_dict.get('near_tip', 0.0),
-                j_integral=config_dict.get('j_integral', 0.0),
-            )
 
         return TransolverConfig(
             slice_num=config_dict.get('slice_num', 32),

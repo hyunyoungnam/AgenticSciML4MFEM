@@ -18,7 +18,6 @@ from piano.data.zero_copy import numpy_to_tensor
 from .base import TransolverConfig, EnsembleConfig, SurrogateModel, CrackConfig
 from .transolver import TransolverModel
 from .ensemble import EnsembleModel
-from .deeponet import DeepONetConfig, DeepONetModel
 from piano.physics.pino_loss import PINOElasticityLoss
 from piano.physics.crack_pino_loss import CrackFractureLoss
 from piano.physics.peridynamic_loss import PeridynamicEquilibriumLoss
@@ -313,10 +312,7 @@ class SurrogateTrainer:
                 )
                 model = EnsembleModel(ensemble_config)
             else:
-                if isinstance(self.config.surrogate_config, DeepONetConfig):
-                    model = DeepONetModel(self.config.surrogate_config)
-                else:
-                    model = TransolverModel(self.config.surrogate_config)
+                model = TransolverModel(self.config.surrogate_config)
 
             model.build(n_params, coord_dim, num_points)
 

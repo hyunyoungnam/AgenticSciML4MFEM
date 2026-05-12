@@ -2,7 +2,7 @@
 PIANO: Physics-Informed Agentic Neural Operator
 
 A self-improving surrogate framework for computational mechanics that combines:
-- Transolver / DeepONet neural operators for learning FEM field predictions
+- Transolver neural operator for learning FEM field predictions on unstructured meshes
 - Physics-informed losses (PINO, CrackFractureLoss, PeridynamicEquilibriumLoss, Variational)
 - 6-agent HPO debate system for autonomous hyperparameter optimization
 - Active learning loop with FEniCS phase-field fracture simulations
