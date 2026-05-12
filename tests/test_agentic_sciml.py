@@ -84,10 +84,10 @@ class MockLLMProvider:
 
         if "training analyst" in system_prompt.lower():
             return MockLLMResponse(self._critic_response())
-        elif "architect" in system_prompt.lower():
-            return MockLLMResponse(self._architect_response())
         elif "physicist" in system_prompt.lower():
             return MockLLMResponse(self._physicist_response())
+        elif "architect" in system_prompt.lower():
+            return MockLLMResponse(self._architect_response())
         elif "scientific machine learning" in system_prompt.lower():
             return MockLLMResponse(self._proposer_response())
         else:
@@ -698,25 +698,25 @@ def test_physicist_detect_physics_issues():
 
     physicist = PhysicistAgent()
 
-    # Case 1: PINO loss not decreasing (weak enforcement)
+    # Case 1: Physics loss ratio too high (pino >> data loss)
     history = TrainingHistory(
         train_losses=[0.5, 0.3, 0.2, 0.15, 0.1],
         test_losses=[0.6, 0.4, 0.3, 0.25, 0.2],
-        pino_losses=[0.5, 0.48, 0.47, 0.46, 0.46],  # Barely decreasing
+        pino_losses=[0.2, 0.15, 0.12, 0.10, 0.05],  # ratio=0.05/0.1=0.5 > 10%
         epochs_completed=5,
     )
-    issues = physicist.detect_physics_issues(history, {"pino_weight": 0.1})
-    assert PhysicsIssue.WEAK_PHYSICS_ENFORCEMENT in issues
+    issues = physicist.detect_physics_issues(history, {"energy": 0.1})
+    assert PhysicsIssue.PHYSICS_RATIO_TOO_HIGH in issues
 
-    # Case 2: Overly strong physics (high pino_weight, train loss stuck)
+    # Case 2: Physics loss destabilizing training (loss spike with active physics)
     history2 = TrainingHistory(
-        train_losses=[0.5, 0.48, 0.47, 0.46, 0.45],  # Barely decreasing
+        train_losses=[0.1, 0.1, 0.1, 0.1, 0.5],  # spike at end
         test_losses=[0.6, 0.58, 0.57, 0.56, 0.55],
-        pino_losses=[0.1, 0.08, 0.06, 0.04, 0.02],  # PINO decreasing
+        pino_losses=[0.1, 0.08, 0.06, 0.04, 0.02],
         epochs_completed=5,
     )
-    issues2 = physicist.detect_physics_issues(history2, {"pino_weight": 0.6})
-    assert PhysicsIssue.OVERLY_STRONG_PHYSICS in issues2
+    issues2 = physicist.detect_physics_issues(history2, {"equilibrium": 0.1})
+    assert PhysicsIssue.PHYSICS_DESTABILIZING in issues2
 
 
 def test_physicist_should_consult():
@@ -735,14 +735,14 @@ def test_physicist_should_consult():
     )
     assert physicist.should_consult(history_bad, {"pino_weight": 0.1})
 
-    # Should not consult when no physics issues (PINO decreasing well)
+    # Should not consult when no physics issues (ratio < 10%, test loss improving)
     history_good = TrainingHistory(
         train_losses=[0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.18, 0.15, 0.12],
         test_losses=[0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3, 0.28, 0.25, 0.22],
-        pino_losses=[0.5, 0.4, 0.32, 0.25, 0.2, 0.15, 0.1, 0.08, 0.06, 0.04],  # Decreasing well
+        pino_losses=[0.05, 0.04, 0.032, 0.025, 0.02, 0.015, 0.01, 0.008, 0.006, 0.004],  # ratio=0.004/0.12≈3.3%
         epochs_completed=10,
     )
-    assert not physicist.should_consult(history_good, {"pino_weight": 0.1})
+    assert not physicist.should_consult(history_good, {"energy": 0.1})
 
 
 # =============================================================================
@@ -757,7 +757,7 @@ def test_transolver_config_all_tunable_params():
         d_model=256, n_layers=6, n_heads=8, slice_num=32,
         mlp_ratio=4.0, dropout=0.1, activation="silu",
         optimizer_type="adamw", learning_rate=1e-3, scheduler_type="cosine",
-        pino_weight=0.1, pino_eq_weight=0.1,
+        energy=0.1, equilibrium=0.1,
         batch_size=32, epochs=100, patience=50,
     )
 
